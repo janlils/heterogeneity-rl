@@ -1,0 +1,40 @@
+# Wyniki eksperymentów — duże pliki, nie wersjonować
+results/
+logs/
+
+# Wykresy — generowane automatycznie przez visualize.py
+plots/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Środowiska wirtualne
+venv/
+env/
+.venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Dane tymczasowe
+*.tmp
+*.bak
