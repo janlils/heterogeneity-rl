@@ -79,18 +79,19 @@ def _apply_zi_order(da, aid, act_i, signal, cfg):
     ref = da.ref_price
     T, M, F = cfg.env.limit_tight_offset, cfg.env.limit_med_offset, cfg.env.limit_far_offset
     if signal == "buy":
-        price = {cfg.env.ACTION_MARKET: ref,
-                 cfg.env.ACTION_LIMIT_TIGHT: ref - T,
-                 cfg.env.ACTION_LIMIT_MED:   ref - M,
-                 cfg.env.ACTION_LIMIT_FAR:   ref - F}.get(act_i, ref)
+        gap = max(0.0, p.valuation - da.ref_price)
+        price = {cfg.env.ACTION_MARKET:      p.valuation,
+                 cfg.env.ACTION_LIMIT_TIGHT: da.ref_price + gap * 0.67,
+                 cfg.env.ACTION_LIMIT_MED:   da.ref_price + gap * 0.33,
+                 cfg.env.ACTION_LIMIT_FAR:   da.ref_price}.get(act_i, p.valuation)
         price = min(price, p.max_affordable_bid())
         da.submit(aid, float(np.clip(price, 0.001, 0.999)), "bid")
     else:
-        price = {cfg.env.ACTION_MARKET: ref,
-                 cfg.env.ACTION_LIMIT_TIGHT: ref + T,
-                 cfg.env.ACTION_LIMIT_MED:   ref + M,
-                 cfg.env.ACTION_LIMIT_FAR:   ref + F}.get(act_i, ref)
-        price = max(price, p.valuation)
+        gap = max(0.0, da.ref_price - p.valuation)
+        price = {cfg.env.ACTION_MARKET:      p.valuation,
+                 cfg.env.ACTION_LIMIT_TIGHT: da.ref_price - gap * 0.67,
+                 cfg.env.ACTION_LIMIT_MED:   da.ref_price - gap * 0.33,
+                 cfg.env.ACTION_LIMIT_FAR:   da.ref_price}.get(act_i, p.valuation)
         da.submit(aid, float(np.clip(price, 0.001, 0.999)), "ask")
 
 

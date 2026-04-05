@@ -96,7 +96,7 @@ class EnvConfig:
     @property
     def n_obs(self) -> int:
         """Wymiar wektora obserwacji (stały = 12)."""
-        return 12
+        return 14
 
     def action_name(self, action_idx: int) -> str:
         """Nazwa akcji do logowania."""
