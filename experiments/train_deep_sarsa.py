@@ -187,7 +187,7 @@ def run_training(
     da.reset(diversity_score=diversity_score, seed=seed)
     agent_ids    = list(da.population.agents.keys())
     agent_gammas = np.array([
-        da.population.agents[aid].belief.gamma for aid in agent_ids
+        da.population.agents[aid].gamma for aid in agent_ids
     ])
 
     log.info(
@@ -305,7 +305,7 @@ def run_training(
             "mean_reward":           float(np.mean(list(round_rewards.values()))),
             "mean_epsilon":          pop_s["mean_epsilon"],
             "mean_td_error":         pop_s["mean_td_error"],
-            "mean_grad_norm":        pop_s["mean_grad_norm"],
+            "mean_grad_norm":        pop_s.get("mean_grad_norm", 0.0),
             "zi_baseline":           zi_baseline,
             "beats_zi":              avg_eff > zi_baseline,
         }

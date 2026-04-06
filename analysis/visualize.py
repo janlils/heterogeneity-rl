@@ -774,6 +774,157 @@ def plot_wealth_distribution(save: bool = True) -> None:
 # Pomocnicze
 # ===========================================================================
 
+# ===========================================================================
+# 9. Ewolucja cen i wycen przez rundy — continuous market dynamics
+# ===========================================================================
+
+def plot_price_valuation_evolution(
+    n_rounds:   int   = 150,
+    n_agents:   int   = 20,
+    save:       bool  = True,
+) -> None:
+    """
+    Pokazuje jak cena rynkowa i wyceny agentów ewoluują przez wiele rund
+    bez resetu — kluczowy wykres dla modelu continuous market dynamics.
+
+    Górny panel: ref_price przez rundy + pasmo ±1σ wycen
+    Środkowy panel: wyceny 5 wybranych agentów (HIGH/LOW/MID + 2 losowych)
+    Dolny panel: liczba transakcji per runda
+    """
+    cfg = _cfg(n_agents=n_agents)
+    rng = np.random.default_rng(42)
+
+    D_SHOW   = [0.3, 0.7, 1.0]
+    D_COLORS_3 = [COLORS["D0.2"], COLORS["D0.6"], COLORS["D1.0"]]
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    fig.suptitle(
+        "Ewolucja cen i wycen przez kolejne rundy handlowe\n(bez resetu ceny i wycen — continuous market dynamics)",
+        fontsize=13, fontweight="bold"
+    )
+
+    for col, (d, color) in enumerate(zip(D_SHOW, D_COLORS_3)):
+        da = DoubleAuction(cfg, seed=42)
+        da.reset(diversity_score=d, seed=42)
+
+        # Wybierz reprezentatywnych agentów do śledzenia
+        agents_by_val = sorted(
+            da.population.agents.items(), key=lambda x: x[1].valuation
+        )
+        tracked = {
+            "HIGH":  agents_by_val[-1][0],
+            "HIGH2": agents_by_val[-4][0],
+            "MID":   agents_by_val[len(agents_by_val)//2][0],
+            "LOW2":  agents_by_val[3][0],
+            "LOW":   agents_by_val[0][0],
+        }
+        track_colors = {
+            "HIGH":  "#B71C1C",
+            "HIGH2": "#E57373",
+            "MID":   "#455A64",
+            "LOW2":  "#64B5F6",
+            "LOW":   "#1A237E",
+        }
+
+        # Zbierz dane przez n_rounds rund
+        ref_prices  = [da.ref_price]
+        val_all     = [[p.valuation for p in da.population.agents.values()]]
+        val_tracked = {k: [da.population.agents[v].valuation] for k, v in tracked.items()}
+        trades_per_round = []
+
+        for rnd in range(n_rounds):
+            obs = da.reset_market_only()
+            step = 0
+            n_trades = 0
+            while not da.done and step < 30:
+                active = da.active_agents
+                if not active: break
+                actions = {a: cfg.env.ACTION_MARKET
+                           if da.population.agents[a].trade_signal(da.ref_price) != "none"
+                           else cfg.env.ACTION_PASS for a in active}
+                _, rewards, _, _ = da.parallel_step(actions)
+                n_trades += sum(1 for r in rewards.values() if r > 0)
+                step += 1
+
+            ref_prices.append(da.ref_price)
+            val_all.append([p.valuation for p in da.population.agents.values()])
+            for k, aid in tracked.items():
+                val_tracked[k].append(da.population.agents[aid].valuation)
+            trades_per_round.append(n_trades)
+
+        rounds = np.arange(len(ref_prices))
+        val_arr = np.array(val_all)
+        val_mean = val_arr.mean(axis=1)
+        val_std  = val_arr.std(axis=1)
+
+        # ── Panel górny: ref_price + pasmo wycen ──────────────────────
+        ax0 = axes[0, col]
+        ax0.fill_between(rounds,
+                         np.clip(val_mean - val_std, 0.05, 0.95),
+                         np.clip(val_mean + val_std, 0.05, 0.95),
+                         alpha=0.15, color=color, label="±1σ wycen")
+        ax0.plot(rounds, val_mean, color=color, lw=1.5, ls="--",
+                 alpha=0.7, label="Średnia wycena")
+        ax0.plot(rounds, ref_prices, color="#E65100", lw=2.5,
+                 label="Cena rynkowa")
+        ax0.axhline(0.5, color="gray", ls=":", lw=1, alpha=0.5, label="eq=0.5")
+
+        ax0.set_title(f"D={d:.1f} — Cena vs wyceny",
+                      fontsize=11, color=color, fontweight="bold")
+        ax0.set_ylabel("Cena / Wycena")
+        ax0.set_ylim(0.1, 0.9)
+        ax0.legend(fontsize=7, loc="upper right")
+        ax0.grid(True, alpha=0.3)
+
+        # ── Panel środkowy: wyceny 5 agentów ──────────────────────────
+        ax1 = axes[1, col]
+        for k, vals in val_tracked.items():
+            base = da.population.agents[tracked[k]].base_valuation
+            ax1.plot(rounds, vals, color=track_colors[k], lw=1.8,
+                     label=f"{k} (base={base:.2f})")
+        ax1.plot(rounds, ref_prices, color="#E65100", lw=1.5,
+                 ls="--", alpha=0.6, label="ref_price")
+
+        ax1.set_ylabel("Wycena agenta")
+        ax1.set_title(f"D={d:.1f} — Ewolucja wycen 5 agentów", fontsize=10)
+        ax1.set_ylim(0.1, 0.9)
+        ax1.legend(fontsize=7, loc="upper right")
+        ax1.grid(True, alpha=0.3)
+
+        # Adnotacja: czy kolejność się utrzymuje?
+        final_vals = {k: val_tracked[k][-1] for k in tracked}
+        order_ok = final_vals["HIGH"] > final_vals["MID"] > final_vals["LOW"]
+        ax1.text(0.02, 0.05,
+                 f"Kolejność HIGH>MID>LOW: {'✓' if order_ok else '✗'}",
+                 transform=ax1.transAxes, fontsize=8,
+                 color="#2E7D32" if order_ok else "#C62828",
+                 fontweight="bold")
+
+        # ── Panel dolny: transakcje ────────────────────────────────────
+        ax2 = axes[2, col]
+        rolling_trades = np.convolve(trades_per_round, np.ones(10)/10, mode="valid")
+        ax2.bar(range(len(trades_per_round)), trades_per_round,
+                color=color, alpha=0.3, width=1.0)
+        ax2.plot(range(len(rolling_trades)), rolling_trades,
+                 color=color, lw=2, label="Śr. krocząca (10)")
+        ax2.set_xlabel("Runda")
+        ax2.set_ylabel("Transakcji / runda")
+        ax2.set_title(f"D={d:.1f} — Aktywność rynku", fontsize=10)
+        ax2.legend(fontsize=8)
+        ax2.grid(True, alpha=0.3)
+
+        # Sprawdź czy rynek umiera
+        mean_early = np.mean(trades_per_round[:20]) if len(trades_per_round) >= 20 else 0
+        mean_late  = np.mean(trades_per_round[-20:]) if len(trades_per_round) >= 20 else 0
+        status = "aktywny ✓" if mean_late > 0.5 else "umiera ✗"
+        ax2.text(0.98, 0.95, f"{mean_early:.1f}→{mean_late:.1f} {status}",
+                 transform=ax2.transAxes, fontsize=8, ha="right", va="top",
+                 color="#2E7D32" if mean_late > 0.5 else "#C62828")
+
+    plt.tight_layout()
+    _save(fig, "09_price_valuation_evolution.png", save)
+
+
 def _save(fig, filename: str, save: bool) -> None:
     if save:
         path = PLOTS_DIR / filename
@@ -814,6 +965,9 @@ if __name__ == "__main__":
 
     print("[8/8] Rozkład majątku...")
     plot_wealth_distribution()
+
+    print("[9/9] Ewolucja cen i wycen...")
+    plot_price_valuation_evolution(n_rounds=150)
 
     print("\n" + "=" * 60)
     print(f"Wszystkie wykresy zapisane w: {PLOTS_DIR}")

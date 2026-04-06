@@ -61,80 +61,58 @@ class BeliefState:
     """
     Wewnętrzny model przekonań agenta o rynku.
 
-    Stałe cechy (losowane przy tworzeniu, nie zmieniają się w epizodzie):
-      update_speed   — jak szybko agent zmienia oczekiwania (alpha w EMA)
-      anchoring_bias — zakotwiczenie do pierwszej zaobserwowanej ceny
-      loss_aversion  — straty bolą X razy mocniej niż zyski (Kahneman 1979)
-      panic_factor   — przy gwałtownym spadku sprzedaje poniżej wyceny
-      patience       — przy spadku wstrzymuje zakupy (czeka na niższą cenę)
-      gamma          — indywidualny discount factor [0.5, 0.99]
+    Stałe cechy (losowane przy tworzeniu, nie zmieniają się w treningu):
+      update_speed   — jak szybko agent aktualizuje oczekiwania cenowe (alpha EMA)
+                        N(0.30, σ*D); value investor ≈ 0.05, momentum ≈ 0.80
+                        Barberis & Thaler (2003)
+      anchoring_bias — zakotwiczenie do pierwszej obserwowanej ceny
+                        Beta(2,5) skalowane; Tversky & Kahneman (1974)
+                        większość ma umiarkowane zakotwiczenie, nieliczni brak
+      loss_aversion  — λ w prospect theory: straty bolą λ× mocniej niż zyski
+                        LogNormal(log(2.25), 0.3) clip[1,5]
+                        Kahneman & Tversky (1979, 1992): mediana ≈ 2.25
+
+    Usunięte parametry (były martwym kodem):
+      panic_factor   — adjusted_aggressiveness() nigdy niewywoływana w parallel_step
+      patience       — j.w.
+      gamma          — duplikat AgentParams.gamma, zawsze identyczne
 
     Stan dynamiczny (aktualizowany po każdej zaobserwowanej transakcji):
       expected_price  — gdzie agent spodziewa się ceny (EMA z obserwacji)
-      price_trend     — szacowany kierunek zmiany (ostatnia delta EMA)
-      anchor_price    — pierwsza zaobserwowana cena (zakotwiczenie)
-      n_observations  — ile transakcji widział (rośnie pewność)
+      price_trend     — kierunek ostatniej zmiany EMA
+      anchor_price    — pierwsza zaobserwowana cena (kotwica zakotwiczenia)
     """
-    # Stałe cechy agenta
-    update_speed:   float = 0.30
-    anchoring_bias: float = 0.00
-    loss_aversion:  float = 1.00
-    panic_factor:   float = 0.00
-    patience:       float = 0.00
-    gamma:          float = 0.90
+    # Stałe cechy — heterogeniczne wymiary behawioralne
+    update_speed:   float = 0.30   # alpha EMA: jak szybko adaptuje oczekiwania
+    anchoring_bias: float = 0.00   # siła zakotwiczenia do pierwszej ceny
+    loss_aversion:  float = 2.25   # λ prospect theory (Kahneman-Tversky)
 
-    # Stan dynamiczny
+    # Stan dynamiczny (reset między rundami)
     expected_price: float = 0.50
     price_trend:    float = 0.00
     anchor_price:   float = 0.50
-    n_observations: int   = 0
 
     def reset_dynamic(self, ref_price: float = 0.50) -> None:
-        """Reset stanu dynamicznego przed nowym epizodem."""
+        """Reset stanu dynamicznego między rundami."""
         self.expected_price = ref_price
         self.price_trend    = 0.00
         self.anchor_price   = ref_price
-        self.n_observations = 0
 
     def observe_price(self, new_price: float) -> None:
-        """EMA aktualizacja oczekiwań po zaobserwowaniu transakcji."""
-        if self.n_observations == 0:
-            self.anchor_price   = new_price
-            self.expected_price = new_price
-            self.price_trend    = 0.0
-        else:
-            old               = self.expected_price
-            self.price_trend  = new_price - old
+        """EMA aktualizacja oczekiwań + zakotwiczenie po każdej transakcji."""
+        old              = self.expected_price
+        self.price_trend = new_price - old
+        self.expected_price = (
+            (1 - self.update_speed) * old + self.update_speed * new_price
+        )
+        # Zakotwiczenie Tversky-Kahneman: przyciągnij z powrotem do pierwszej ceny
+        if self.anchoring_bias > 0:
             self.expected_price = (
-                (1 - self.update_speed) * old + self.update_speed * new_price
+                (1 - self.anchoring_bias) * self.expected_price
+                + self.anchoring_bias * self.anchor_price
             )
-            # Zakotwiczenie: przyciągnij z powrotem do pierwszej ceny
-            if self.anchoring_bias > 0:
-                self.expected_price = (
-                    (1 - self.anchoring_bias) * self.expected_price
-                    + self.anchoring_bias * self.anchor_price
-                )
-        self.n_observations += 1
 
-    def adjusted_aggressiveness(
-        self, base_aggressiveness: float, is_buyer: bool
-    ) -> float:
-        """
-        Korekta agresywności oferty na podstawie biasów behawioralnych.
 
-        KUPUJĄCY przy spadającym trendzie (patience > 0):
-          → zmniejsz agresywność (poczekaj na niższą cenę)
-
-        SPRZEDAJĄCY przy gwałtownym spadku (panic_factor > 0):
-          → zwiększ agresywność (sprzedaj szybciej zanim cena spadnie dalej)
-        """
-        if is_buyer and self.price_trend < 0 and self.patience > 0:
-            reduction = abs(self.price_trend) * self.patience * 2
-            return float(np.clip(base_aggressiveness - reduction, 0.0, 1.0))
-        if not is_buyer and self.price_trend < -0.04 and self.panic_factor > 0:
-            boost = abs(self.price_trend) * self.panic_factor * 2
-            return float(np.clip(base_aggressiveness + boost, 0.0, 1.0))
-        return base_aggressiveness
 
     def subjective_surplus(self, raw_surplus: float) -> float:
         """Subiektywna wartość surplusa — straty bolą loss_aversion × mocniej."""
@@ -162,10 +140,15 @@ class AgentParams:
       Taki handel wynika z heterogenicznych przekonań — klasyczny wynik
       De Long et al. (1990) i Scheinkman & Xiong (2003).
     """
-    agent_id:      str
-    valuation:     float     # prywatna wycena fundamentalna [0, 1] — może dryfować
-    base_valuation:float     # bazowa wycena (stała) — do resetu między rundami
-    threshold:     float     # min |val - price| do handlu
+    agent_id:           str
+    valuation:          float  # prywatna wycena fundamentalna [0, 1] — dryfuje
+    base_valuation:     float  # bazowa wycena — kotwica do której powraca
+    belief_reversion:   float  # beta: jak mocno wraca do base_valuation per krok
+                                # 0.0=czysty drift (→śmierć), 1.0=pełny reset
+                                # Powiązanie z update_speed: momentum trader
+                                # ma niskie belief_reversion (chętnie dryfuje)
+                                # value investor ma wysokie (trzyma fundamenty)
+    threshold:          float  # min |val - price| do handlu
     gamma:      float = 0.90
     wealth:     float = 1.00 # ograniczenie budżetowe (aktywne!)
     belief:     BeliefState  = field(default_factory=BeliefState)
@@ -261,16 +244,17 @@ class AgentPopulation:
             aid    = f"agent_{i}"
             val    = float(valuations[i])
             gamma  = self._sample_gamma(d, cfg)
-            belief = self._sample_belief(d, cfg, gamma, eq)
+            belief = self._sample_belief(d, cfg, eq)
 
             self.agents[aid] = AgentParams(
-                agent_id       = aid,
-                valuation      = val,
-                base_valuation = val,   # kopia bazowa — używana do resetu per runda
-                threshold      = self._sample_threshold(d, cfg),
-                gamma          = gamma,
-                wealth         = self._sample_wealth(d, cfg),
-                belief         = belief,
+                agent_id         = aid,
+                valuation        = val,
+                base_valuation   = val,
+                belief_reversion = self._sample_belief_reversion(d, cfg, belief),
+                threshold        = self._sample_threshold(d, cfg),
+                gamma            = gamma,
+                wealth           = self._sample_wealth(d, cfg),
+                belief           = belief,
             )
 
     def _sample_gamma(self, d, cfg) -> float:
@@ -320,6 +304,31 @@ class AgentPopulation:
         high = base * (1.0 + 2.25 * d)
         return float(np.clip(self.rng.uniform(low, high), 0.01, 0.40))
 
+    def _sample_belief_reversion(self, d, cfg, belief: 'BeliefState') -> float:
+        """
+        Jak mocno agent wraca do swoich fundamentalnych przekonań per krok.
+
+        Powiązanie z update_speed (odwrotne):
+          Momentum trader (wysoki update_speed) → niskie belief_reversion
+            Szybko podąża za ceną, nie wraca do fundamentów
+          Value investor (niski update_speed) → wysokie belief_reversion
+            Wolno się adaptuje, mocno trzyma fundamenty
+
+        Zakres:
+          D=0: wszyscy = base_reversion (0.30)
+          D=1: losowane odwrotnie do update_speed
+               update_speed ∈ [0.05, 0.95] → reversion ∈ [0.05, 0.75]
+        """
+        base_reversion = 0.30  # domyślne zakotwiczenie
+        if d < 1e-6:
+            return base_reversion
+        # Odwrotna korelacja z update_speed:
+        # momentum trader (upd=0.95) → reversion=0.05
+        # value investor (upd=0.05)  → reversion=0.75
+        # (1 - update_speed) skalowane do [0.05, 0.75]
+        reversion = 0.05 + (1.0 - belief.update_speed) * 0.70
+        return float(np.clip(reversion, 0.05, 0.85))
+
     def _sample_wealth(self, d, cfg) -> float:
         if not cfg.wealth_spread or d < 1e-6:
             return 1.0
@@ -327,29 +336,50 @@ class AgentPopulation:
         raw = float(self.rng.pareto(1.5) + 1.0)
         return float(np.clip(raw * d + 1.0 * (1.0 - d), 0.05, 20.0))
 
-    def _sample_belief(self, d, cfg, gamma, eq) -> BeliefState:
+    def _sample_belief(self, d, cfg, eq) -> BeliefState:
         bc = self.belief_cfg
         if not cfg.belief_spread or d < 1e-6:
             return BeliefState(
-                update_speed=bc.update_speed_center, anchoring_bias=0.0,
-                loss_aversion=1.0, panic_factor=0.0, patience=0.0,
-                gamma=gamma, expected_price=eq, anchor_price=eq,
+                update_speed=bc.update_speed_center,
+                anchoring_bias=0.0,
+                loss_aversion=2.25,   # mediana Kahneman-Tversky przy D=0
+                expected_price=eq,
+                anchor_price=eq,
             )
 
         def clamp(x, lo, hi): return float(np.clip(x, lo, hi))
+
+        # loss_aversion: LogNormal(log(2.25), 0.3*d) clip[1, 5]
+        # Kahneman & Tversky (1992): mediana λ ≈ 2.25, rozkład skośny prawy
+        # LogNormal gwarantuje λ > 0, i jest skośny — zgodnie z empirią
+        # D skaluje odchylenie: D=0→wszyscy 2.25, D=1→pełny rozkład
+        la_sigma = 0.30 * d
+        if la_sigma > 1e-6:
+            la_raw = self.rng.lognormal(
+                mean=np.log(2.25) - la_sigma**2 / 2,  # żeby mediana = 2.25
+                sigma=la_sigma
+            )
+        else:
+            la_raw = 2.25
+        loss_av = clamp(la_raw, 1.0, 5.0)
+
+        # anchoring_bias: Beta(2,5) skalowane przez d * anchoring_spread
+        # Tversky & Kahneman (1974): zakotwiczenie jest powszechne (większość > 0)
+        # Beta(2,5): mediana ≈ 0.29, mało masy przy 0 — większość ma zakotwiczenie
+        # Skalujemy przez d: D=0→brak, D=1→pełny rozkład Beta
+        if d > 1e-6:
+            beta_raw = self.rng.beta(2, 5)  # ∈ [0,1], mediana≈0.29
+            anchor   = clamp(beta_raw * bc.anchoring_spread * d, 0.0, 1.0)
+        else:
+            anchor = 0.0
 
         return BeliefState(
             update_speed=clamp(
                 self.rng.normal(bc.update_speed_center, bc.update_speed_spread * d),
                 0.05, 0.95
             ),
-            anchoring_bias=clamp(self.rng.uniform(0, bc.anchoring_spread * d), 0, 1),
-            loss_aversion=clamp(
-                self.rng.uniform(1.0, 1.0 + bc.loss_aversion_spread * d), 1.0, 3.0
-            ),
-            panic_factor=clamp(self.rng.uniform(0, bc.panic_spread * d), 0, 0.5),
-            patience=clamp(self.rng.uniform(0, bc.patience_spread * d), 0, 0.5),
-            gamma=gamma,
+            anchoring_bias=anchor,
+            loss_aversion=loss_av,
             expected_price=eq,
             anchor_price=eq,
         )
@@ -629,13 +659,14 @@ class DoubleAuction:
         self.PASS_ACTION = cfg.env.pass_action
 
         # Stan epizodu
-        self._step:        int              = 0
-        self._done:        bool             = False
-        self._traded:      set              = set()
-        self._surplus:     Dict[str, float] = {}
-        self._rewards:     Dict[str, float] = {}
-        self._actions_log: List[dict]       = []  # historia akcji do wykresów
-        self._price_window: List[float]     = []
+        self._step:               int              = 0
+        self._done:               bool             = False
+        self._traded:             set              = set()
+        self._surplus:            Dict[str, float] = {}
+        self._rewards:            Dict[str, float] = {}
+        self._actions_log:        List[dict]       = []
+        self._price_window:       List[float]      = []
+        self._max_surplus_at_reset: float          = 1.0  # zapisywany przy resecie rundy
 
     # -----------------------------------------------------------------------
     # Reset
@@ -684,8 +715,15 @@ class DoubleAuction:
         self._actions_log = []
         self._price_window= []
 
+        # Zapisz max_surplus PRZED pierwszym krokiem (wyceny jeszcze nie dryftowały)
+        # Używane przez całą rundę do normalizacji reward — zapobiega /0 po drifcie
+        self._max_surplus_at_reset = max(
+            self.population.max_theoretical_surplus(), 1e-6
+        )
+
         _log.debug(
             f"RESET | D={diversity_score:.2f} | eq={self._eq_price:.3f} | "
+            f"max_surplus={self._max_surplus_at_reset:.3f} | "
             f"N={self.cfg.env.n_agents}"
         )
 
@@ -707,27 +745,32 @@ class DoubleAuction:
         """
         assert self.population is not None, "Wywołaj reset() przed reset_market_only()"
 
-        # Opcjonalnie: nowa cena równowagi (właściwość rynku, nie agentów)
-        md = self.cfg.market
-        if md.eq_spread > 1e-6:
-            self._eq_price = float(np.clip(
-                self.rng.uniform(md.eq_center - md.eq_spread,
-                                 md.eq_center + md.eq_spread),
-                0.15, 0.85
-            ))
-        # else: eq_price zostaje z poprzedniej rundy
+        # Cena rynkowa: NIE resetuje się — niesie pamięć historii handlu.
+        # ref_price zostaje z końca poprzedniej rundy.
+        # eq_price to tylko "prawdziwa" wartość fundamentalna (do metryk),
+        # ale rynek jej nie widzi bezpośrednio.
 
-        self._ref_price = self._eq_price
+        # Aktualizacja wycen: drift + zakotwiczenie w fundamentach + szum
+        #
+        # val_{t+1} = val_t
+        #           + update_speed × (ref_price - val_t)    [adaptacja do rynku]
+        #           + belief_reversion × (base_val - val_t)  [powrót do fundamentów]
+        #           + N(0, σ_info)                           [nowe prywatne info]
+        #
+        # Efekt: każdy agent WOLNO przesuwa wycenę w kierunku ceny rynkowej,
+        # ale jest "ciągnięty z powrotem" do swoich fundamentów.
+        # Agent z val=0.63 po dużym spadku ceny → val=0.57 (nie 0.50),
+        # agent z val=0.32 → val=0.38, ale NADAL val_high > val_low.
+        # Heterogeniczność utrzymana, rynek żyje przez cały trening.
+        sigma_info = 0.01  # szum prywatnych informacji (małe nowe dane per sesja)
+        current_price = self._ref_price
 
-        # Reset dynamicznego stanu przekonań i wycen do wartości bazowych.
-        # Wyceny są resetowane bo dryfowały w poprzednich rundach — bez resetu
-        # "stały agent" (Opcja B) po 500 epizodach miałby zupełnie inne parametry.
-        # Sieć musi uczyć się strategii dla STAŁEGO agenta, nie ewoluującego.
         for p in self.population.agents.values():
-            p.belief.reset_dynamic(self._eq_price)
-            # Resetuj valuation do wartości bazowej (sprzed driftu)
-            # base_valuation jest ustawiany przy generowaniu populacji
-            p.valuation = p.base_valuation
+            drift    = p.belief.update_speed   * (current_price - p.valuation)
+            anchor   = p.belief_reversion      * (p.base_valuation - p.valuation)
+            noise    = self.rng.normal(0, sigma_info)
+            p.valuation = float(np.clip(p.valuation + drift + anchor + noise, 0.05, 0.95))
+            p.belief.reset_dynamic(current_price)
 
         # Reset rynku
         self.order_book.reset()
@@ -738,6 +781,11 @@ class DoubleAuction:
         self._rewards     = {aid: 0.0 for aid in self.population.agents}
         self._actions_log = []
         self._price_window= []
+
+        # max_surplus po aktualizacji wycen (bieżące wyceny, nie bazowe)
+        self._max_surplus_at_reset = max(
+            self.population.max_theoretical_surplus(), 1e-6
+        )
 
         return {aid: self.get_observation(aid)
                 for aid in self.population.agents}
@@ -921,10 +969,34 @@ class DoubleAuction:
             self._ref_price = trade.price
 
         # Drift wycen — RAZ per krok z uśrednioną ceną wszystkich transakcji
-        # (nie per transakcję — zapobiega wielokrotnemu dryfowi w jednym kroku)
         if trades:
             avg_trade_price = float(np.mean([t.price for t in trades]))
             self._apply_valuation_drift(avg_trade_price)
+
+        # ── Order Flow Imbalance → Price Impact ──────────────────────────
+        # Niezrealizowane bidy/aski pushują cenę w kierunku nadmiaru popytu/podaży.
+        #
+        # Mechanizm: jeśli jest 8 kupców i 2 sprzedawców (imbalance = +0.6),
+        # sprzedawcy mają siłę przetargową → cena rośnie.
+        # Jeśli 8 sprzedawców i 2 kupców (imbalance = -0.6) → cena spada.
+        #
+        # price_impact = λ × imbalance
+        # gdzie imbalance = (n_unfilled_bids - n_unfilled_asks) / n_total ∈ [-1, +1]
+        #
+        # Interakcja z D:
+        #   D=0: wszyscy val=eq → tyle samo kupców co sprzedawców → imbalance≈0
+        #   D=1: duży spread wycen → wyraźna przewaga jednej strony → duży impact
+        #   → większa D = bardziej zmienna cena (realistyczne!)
+        lam = self.cfg.env.price_impact_lambda
+        if lam > 1e-6:
+            n_bids  = len(self.order_book.bids)
+            n_asks  = len(self.order_book.asks)
+            n_total = max(n_bids + n_asks, 1)
+            imbalance    = (n_bids - n_asks) / n_total
+            price_impact = lam * imbalance
+            self._ref_price = float(np.clip(
+                self._ref_price + price_impact, 0.05, 0.95
+            ))
 
         # Drift ceny równowagi (opcjonalnie)
         if self.cfg.market.drift_enabled:
@@ -963,16 +1035,16 @@ class DoubleAuction:
         self._surplus[trade.buyer_id]  = trade.buyer_surplus
         self._surplus[trade.seller_id] = trade.seller_surplus
 
-        # Reward = surplus znormalizowany przez max_theoretical_surplus ∈ [0, 1]
-        # Normalizacja jest kluczowa: bez niej reward przy D=1.0 jest ~3x większy
-        # niż przy D=0.3 → gradienty 3x większe → niestabilność TD error
-        # Znormalizowany reward umożliwia uczciwe porównanie między wartościami D.
-        max_s = max(self.population.max_theoretical_surplus(), 1e-6)
+        # Reward = surplus znormalizowany przez max_surplus Z POCZĄTKU RUNDY ∈ [0,1]
+        # KLUCZOWE: używamy _max_surplus_at_reset, nie bieżącego max_surplus!
+        # Po drifcie wyceny zbliżają się → max_surplus → 0 → normalizacja → ∞
+        # Przykład błędu: surplus=0.28, max_surplus_bieżący=0.001 → reward=280 !!!
+        norm = self._max_surplus_at_reset
         self._rewards[trade.buyer_id]  = buyer_p.belief.subjective_surplus(
-            trade.buyer_surplus / max_s
+            trade.buyer_surplus / norm
         )
         self._rewards[trade.seller_id] = seller_p.belief.subjective_surplus(
-            trade.seller_surplus / max_s
+            trade.seller_surplus / norm
         )
 
         for aid in (trade.buyer_id, trade.seller_id):

@@ -48,6 +48,9 @@ class EnvConfig:
                                          # 0.08 = agent handluje tylko gdy cena
                                          # odbiega o min 8% od jego wyceny
     discovery_threshold:  float = 0.05  # próg do price discovery metric
+    price_impact_lambda:  float = 0.012 # siła price impact od order flow imbalance
+                                         # 0.012: pełny imbalance pushuje cenę o ~1.2%
+                                         # 0.000: brak price impact (poprzedni model)
 
     # ── Nowa przestrzeń akcji: limit orders ───────────────────────────────
     # Zamiast 10 poziomów agresywności: 4 typy zleceń + PASS = 5 akcji
@@ -148,10 +151,10 @@ class BeliefConfig:
     """
     update_speed_center:  float = 0.3    # EMA alpha
     update_speed_spread:  float = 0.25
-    anchoring_spread:     float = 0.35   # zakotwiczenie do pierwszej ceny
-    loss_aversion_spread: float = 1.2    # straty bolą X razy mocniej (Kahneman)
-    panic_spread:         float = 0.12   # panika przy gwałtownym spadku
-    patience_spread:      float = 0.18   # czekanie na lepszą cenę
+    anchoring_spread:     float = 0.35   # max skala Beta(2,5) przy D=1
+                                           # Tversky & Kahneman (1974)
+    loss_aversion_spread: float = 0.30   # sigma LogNormal przy D=1
+                                           # Kahneman & Tversky (1992): mediana=2.25
 
 
 # ---------------------------------------------------------------------------
