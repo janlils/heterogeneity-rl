@@ -17,20 +17,13 @@ Kiedy warto wrócić do PyTorch:
 
 import numpy as np
 import logging
-from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import DeepSARSAConfig
 
 logger = logging.getLogger("htm.deep_sarsa")
-
-
-@dataclass
-class DeepSARSAConfig:
-    hidden_size:   int   = 32
-    lr:            float = 3e-3
-    epsilon_start: float = 0.35
-    epsilon_end:   float = 0.05
-    epsilon_decay: float = 0.993
-    grad_clip:     float = 1.0
 
 
 class NumpyMLP:
@@ -139,9 +132,9 @@ class DeepSARSAAgent:
 
     Maskowanie akcji (CT — Continuous Trading):
       obs[6]  = inventory_norm ∈ [-1,+1]
-      obs[7]  = cash_norm
-      can_buy  = inv_norm < 0.99 and cash_norm > 0.05
-      can_sell = inv_norm > 0.01   (long-only)
+      obs[6]  = position_norm ∈ [-1,+1]
+      can_buy  = position_norm < 0.99   (nie max long)
+      can_sell = position_norm > -0.99  (nie max short, symetrycznie)
     """
 
     def __init__(
@@ -167,25 +160,27 @@ class DeepSARSAAgent:
         self.total_updates:      int         = 0
 
     def _mask(self, obs: np.ndarray) -> Tuple[bool, bool]:
-        inv_n  = float(obs[6])
-        cash_n = float(obs[7])
-        return inv_n < 0.99 and cash_n > 0.05, inv_n > 0.01
+        # obs[5] = position_norm = position / max_position ∈ [-1, +1]
+        pos_norm = float(obs[5])
+        can_buy  = pos_norm < 0.99   # nie na maksimum long
+        can_sell = pos_norm > -0.99  # nie na maksimum short
+        return can_buy, can_sell
 
     def act(self, obs: np.ndarray, explore: bool = True) -> int:
         can_buy, can_sell = self._mask(obs)
 
         if not can_buy and not can_sell:
-            return 0  # HOLD
+            return 0  # HOLD (na granicy pozycji w obu kierunkach)
 
         if explore and self.rng.random() < self.epsilon:
             valid = [0]
-            if can_buy:  valid += [1, 3]
-            if can_sell: valid += [2, 4]
+            if can_buy:  valid += [1]   # BUY
+            if can_sell: valid += [2]   # SELL
             return int(self.rng.choice(valid))
 
         q = self.net.predict(obs)
-        if not can_buy:  q[1] = q[3] = -np.inf
-        if not can_sell: q[2] = q[4] = -np.inf
+        if not can_buy:  q[1] = -np.inf
+        if not can_sell: q[2] = -np.inf
         return int(np.argmax(q))
 
     def update(
@@ -209,13 +204,13 @@ class DeepSARSAAgent:
                 next_q = 0.0
             else:
                 q_next = self.net.predict(next_obs)
-                if not can_b: q_next[1] = q_next[3] = -np.inf
-                if not can_s: q_next[2] = q_next[4] = -np.inf
+                if not can_b: q_next[1] = -np.inf
+                if not can_s: q_next[2] = -np.inf
                 # on-policy: epsilon-greedy next action
                 if self.rng.random() < self.epsilon:
                     valid = [0]
-                    if can_b: valid += [1, 3]
-                    if can_s: valid += [2, 4]
+                    if can_b: valid += [1]
+                    if can_s: valid += [2]
                     next_a = int(self.rng.choice(valid))
                 else:
                     next_a = int(np.argmax(q_next))

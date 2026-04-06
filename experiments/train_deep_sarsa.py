@@ -35,7 +35,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from multiprocessing import Pool, cpu_count
 from config import HTMConfig, EnvConfig, MarketDynamics, LogConfig, DeepSARSAConfig
-from envs.double_auction import DoubleAuction, ZeroIntelligenceAgent
+from envs.double_auction import DoubleAuction, ZeroIntelligenceAgent, run_zi_baseline
 from agents.deep_sarsa import DeepSARSAMultiAgent
 
 # ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ logging.basicConfig(
         logging.FileHandler(PROJECT_ROOT / "logs" / "deep_sarsa.log", mode="w"),
     ],
 )
-UPDATE_EVERY = 2   # aktualizuj siec co ile krokow (speedup ~2x)
+UPDATE_EVERY = 1   # aktualizuj sieć co krok — przy batch=1 numpy jest wystarczająco szybki
 log = logging.getLogger("htm.train")
 
 
@@ -61,15 +61,14 @@ log = logging.getLogger("htm.train")
 
 DIVERSITY_SCORES = [0.0, 0.3, 0.5, 0.7, 1.0]   # wartości D do przetestowania
 N_AGENTS         = 20                             # liczba agentów
-N_EPISODES       = 500                            # epizodów (każdy = N_ROUNDS rund)
-N_ROUNDS         = 3                              # rund handlowych per epizod
-                                                  # aktualizacji per agent ≈ N_EP × N_ROUNDS × 2
+N_EPISODES       = 300                            # epizodów CT (każdy = 200 kroków)
+# N_ROUNDS usunięty — CT nie ma rund, epizod = T=200 kroków
 N_SEEDS          = 3                              # powtórzeń (dla std)
 N_WORKERS        = min(cpu_count(), N_SEEDS * len([0.0, 0.3, 0.5, 0.7, 1.0]))
                                                   # równoległe procesy (auto: liczba corów)
 LOG_EVERY        = 25                             # loguj co ile epizodów
 ROLLING_WINDOW   = 30                             # okno wygładzania krzywych
-ZI_EPISODES      = 100                            # epizodów do policzenia ZI baseline
+ZI_EPISODES      = 30                             # epizodów do policzenia ZI baseline (populacja nie resetuje się co ep)
 
 # Warunek rynkowy: stable / random_eq / drifting
 MARKET = MarketDynamics.stable()
@@ -77,7 +76,7 @@ MARKET = MarketDynamics.stable()
 # Hiperparametry sieci
 SARSA_CFG = DeepSARSAConfig(
     hidden_size   = 32,
-    lr            = 5e-3,
+    lr            = 1e-3,
     epsilon_start = 0.35,
     epsilon_end   = 0.05,
     epsilon_decay = 0.993,
@@ -96,57 +95,12 @@ def compute_zi_baseline(
     seed:            int = 42,
 ) -> float:
     """
-    Uruchamia ZI baseline i zwraca średnią efficiency.
-    To jest nasz punkt odniesienia — Deep SARSA musi go pobić.
+    Wrapper wokoł run_zi_baseline() z double_auction.py.
+    Zwraca mean allocative_efficiency jako float (punkt odniesienia dla SARSA).
     """
-    rng = np.random.default_rng(seed)
-    da  = DoubleAuction(cfg, seed=seed)
-    effs = []
-
-    for ep in range(n_episodes):
-        ep_seed = int(rng.integers(0, 100_000))
-        da.reset(diversity_score=diversity_score, seed=ep_seed)
-
-        zi = {
-            aid: ZeroIntelligenceAgent(p, cfg.env, seed=ep_seed + i)
-            for i, (aid, p) in enumerate(da.population.agents.items())
-        }
-
-        step = 0
-        max_steps = cfg.env.max_steps * 3
-        while not da.done and step < max_steps:
-            active = da.active_agents
-            if not active:
-                break
-            aid   = active[step % len(active)]
-            obs   = da.get_observation(aid)
-            act_i, signal = zi[aid].act(obs, da.ref_price)
-            p     = da.population.agents[aid]
-            if act_i != cfg.env.ACTION_PASS and signal != "none":
-                if signal == "buy":
-                    gap   = max(0.0, p.valuation - da.ref_price)
-                    price = {cfg.env.ACTION_MARKET:      p.valuation,
-                             cfg.env.ACTION_LIMIT_TIGHT: da.ref_price + gap * 0.67,
-                             cfg.env.ACTION_LIMIT_MED:   da.ref_price + gap * 0.33,
-                             cfg.env.ACTION_LIMIT_FAR:   da.ref_price}.get(act_i, p.valuation)
-                    price = min(price, p.max_affordable_bid())
-                    da.submit(aid, float(np.clip(price, 0.001, 0.999)), "bid")
-                else:
-                    gap   = max(0.0, da.ref_price - p.valuation)
-                    price = {cfg.env.ACTION_MARKET:      p.valuation,
-                             cfg.env.ACTION_LIMIT_TIGHT: da.ref_price - gap * 0.67,
-                             cfg.env.ACTION_LIMIT_MED:   da.ref_price - gap * 0.33,
-                             cfg.env.ACTION_LIMIT_FAR:   da.ref_price}.get(act_i, p.valuation)
-                    da.submit(aid, float(np.clip(price, 0.001, 0.999)), "ask")
-            else:
-                da._step += 1
-                if da._step >= cfg.env.max_steps:
-                    da._done = True
-            step += 1
-
-        effs.append(da.episode_metrics()["allocative_efficiency"])
-
-    return float(np.mean(effs))
+    result = run_zi_baseline(cfg, diversity_score=diversity_score,
+                             n_episodes=n_episodes, seed=seed)
+    return result["allocative_efficiency"]["mean"]
 
 
 # ---------------------------------------------------------------------------
@@ -156,39 +110,22 @@ def compute_zi_baseline(
 def run_training(
     diversity_score: float,
     n_episodes:      int,
-    n_rounds:        int,
     seed:            int,
     cfg:             HTMConfig,
     zi_baseline:     float,
 ) -> List[dict]:
     """
-    Trenuje Deep SARSA — Opcja B + multi-round.
+    Trenuje Deep SARSA — Continuous Trading.
 
-    Opcja B (stała populacja):
-      Jedna populacja 20 agentów na cały trening tego (D, seed).
-      Każda sieć uczy się strategii JEDNEGO konkretnego agenta
-      z niezmiennymi parametrami (valuation, gamma, wealth, threshold).
-      Sieć NIE uśrednia po różnych agentach — to byłby de facto model globalny.
-
-    Multi-round (Opcja 1):
-      Każdy "epizod" składa się z N_ROUNDS rund handlowych.
-      Po każdej rundzie rynek jest resetowany (order book, kto handlował),
-      ale agenci zostają. To daje ~N_ROUNDS × 2 aktualizacji per agent
-      per epizod zamiast 1-2 w poprzedniej wersji.
-
-    Łącznie aktualizacji per agent:
-      N_EPISODES × N_ROUNDS × ~2 = 500 × 5 × 2 = ~5000
-      vs. poprzednio: 500 × 1-2 = ~500-1000
+    Jeden epizod = T=200 kroków (wszyscy agenci aktywni przez cały czas).
+    Między epizodami: portfele resetowane, wyceny dryfują (pamięć rynku).
+    Gamma jest istotna w każdym kroku (done=True dopiero po T krokach).
     """
     da = DoubleAuction(cfg, seed=seed)
-
-    # ── Opcja B: stwórz populację RAZ przed pętlą epizodów ──────────────
-    # Ta sama populacja przez cały trening — każda sieć = jeden konkretny agent
     da.reset(diversity_score=diversity_score, seed=seed)
+
     agent_ids    = list(da.population.agents.keys())
-    agent_gammas = np.array([
-        da.population.agents[aid].gamma for aid in agent_ids
-    ])
+    agent_gammas = np.array([da.population.agents[aid].gamma for aid in agent_ids])
 
     log.info(
         f"  Populacja | N={len(agent_ids)} | "
@@ -197,136 +134,123 @@ def run_training(
         f"gamma=[{agent_gammas.min():.2f}, {agent_gammas.max():.2f}]"
     )
 
-    # Sieci tworzone RAZ — powiązane z konkretną populacją
     sarsa = DeepSARSAMultiAgent(
-        agent_ids    = agent_ids,
-        agent_gammas = agent_gammas,   # indywidualne gamma, niezmienne
-        n_obs        = cfg.env.n_obs,
-        n_actions    = cfg.env.n_actions,
-        cfg          = SARSA_CFG,
-        seed         = seed,
+        agent_ids=agent_ids, agent_gammas=agent_gammas,
+        n_obs=cfg.env.n_obs, n_actions=cfg.env.n_actions,
+        cfg=SARSA_CFG, seed=seed,
     )
 
-    records = []
-    t_start = time.time()
+    # Parametry populacji — stałe przez cały run, zapisywane do każdego rekordu
+    _ap = da.population.agents
+    pop_meta = {
+        "pop_mean_valuation":     float(np.mean([_ap[a].valuation     for a in agent_ids])),
+        "pop_std_valuation":      float(np.std( [_ap[a].valuation     for a in agent_ids])),
+        "pop_mean_gamma":         float(np.mean([_ap[a].gamma         for a in agent_ids])),
+        "pop_std_gamma":          float(np.std( [_ap[a].gamma         for a in agent_ids])),
+        "pop_mean_risk_aversion": float(np.mean([_ap[a].risk_aversion for a in agent_ids])),
+        "pop_mean_threshold":     float(np.mean([_ap[a].threshold     for a in agent_ids])),
+        "pop_mean_max_position":  float(np.mean([_ap[a].max_position  for a in agent_ids])),
+    }
+
+    records  = []
+    t_start  = time.time()
+
+    step_rng = np.random.default_rng(seed + 1000)
 
     for episode in range(n_episodes):
 
-        # ── Multi-round: N_ROUNDS rund w jednym epizodzie ───────────────
-        # Każda runda = nowa sesja handlowa, ci sami agenci
-        round_effs   = []
-        round_trades = []
-        round_rewards = {aid: 0.0 for aid in agent_ids}
-        round_actions_log = []
+        # Nowy epizod: reset portfeli, wyceny dryfują, cena zostaje
+        da.reset_episode()
+        ep_rewards = {aid: 0.0 for aid in agent_ids}
+        step = 0
 
-        for round_idx in range(n_rounds):
+        while not da.done:
+            # Sekwencyjne wykonanie — losowa kolejność agentów per krok
+            # Każdy agent obserwuje rynek ZAKTUALIZOWANY przez poprzedników
+            agent_order = step_rng.permutation(agent_ids)
+            obs_at_action  = {}
+            actions_taken  = {}
 
-            # Reset tylko rynku — agenci niezmienieni (Opcja B)
-            obs_dict = da.reset_market_only()
+            for aid in agent_order:
+                obs = da.get_observation(aid)          # aktualny stan rynku
+                obs_at_action[aid] = obs
+                action = sarsa.agents[aid].act(obs, explore=True)
+                actions_taken[aid] = action
+                da.execute_single_action(aid, action)  # natychmiastowe wykonanie
 
-            # ── Pętla kroków w rundzie ───────────────────────
-            step = 0
-            while not da.done:
-                active = da.active_agents
-                if not active:
-                    break
+            # Nagrody na końcu kroku (po wszystkich agentach)
+            rewards, dones = da.compute_step_rewards()
 
-                cur_obs = {
-                    aid: obs_dict[aid]
-                    for aid in active
-                    if aid in obs_dict
-                }
-                if not cur_obs:
-                    break
+            # Aktualizacja SARSA dla każdego agenta
+            for aid in agent_ids:
+                r = rewards.get(aid, 0.0)
+                ep_rewards[aid] += r
+                next_obs = da.get_observation(aid)
+                sarsa.agents[aid].update(
+                    obs      = obs_at_action[aid],
+                    action   = actions_taken[aid],
+                    reward   = r,
+                    next_obs = next_obs,
+                    done     = dones.get(aid, False),
+                )
 
-                # Deep SARSA: akcje epsilon-greedy
-                actions = sarsa.act(cur_obs, explore=True)
+            step += 1
 
-                # Równoległy krok
-                next_obs, rewards, dones, infos = da.parallel_step(actions)
-
-                # Aktualizacja sieci per agent
-                # UPDATE_EVERY: aktualizuj co N kroków — szybsze (~2x)
-                # Reward zawsze akumulowany, update tylko co UPDATE_EVERY
-                for aid in cur_obs:
-                    if aid not in actions:
-                        continue
-                    reward = rewards.get(aid, 0.0)
-                    round_rewards[aid] += reward
-
-                    if step % UPDATE_EVERY == 0:
-                        sarsa.agents[aid].update(
-                            obs      = cur_obs[aid],
-                            action   = actions[aid],
-                            reward   = reward,
-                            next_obs = next_obs.get(aid, cur_obs[aid]),
-                            done     = dones.get(aid, False),
-                        )
-
-                obs_dict = next_obs
-
-            # Metryki tej rundy
-            m = da.episode_metrics()
-            round_effs.append(m.get("allocative_efficiency", 0.0))
-            round_trades.append(m.get("n_trades", 0))
-            round_actions_log.append(m)
-
-        # ── Koniec epizodu (po wszystkich rundach) ───────────
-        # WAŻNE: zbierz statystyki PRZED end_episode()
-        # end_episode() resetuje episode_td_errors → stats byłyby zerowe
+        # Metryki epizodu
+        m     = da.episode_metrics()
         pop_s = sarsa.population_stats()
-
-        # Decay epsilon raz per epizod (nie per rundę)
         sarsa.end_episode()
 
-        # Metryki epizodu = średnia po rundach
-        avg_eff    = float(np.mean(round_effs))
-        avg_trades = float(np.mean(round_trades))
-        avg_eff_last = round_effs[-1]   # ostatnia runda (po "rozgrzewce")
-
-        # Proporcje akcji z ostatniej rundy
-        last_m = round_actions_log[-1]
+        mean_pnl       = m.get("mean_pnl", 0.0)
+        n_trades       = m.get("n_trades", 0)
+        eff            = m.get("allocative_efficiency", 0.0)
+        n_pos          = m.get("pnl_positive_agents", 0)
+        pnl_pos_frac   = n_pos / max(N_AGENTS, 1)
+        trade_acc      = m.get("trade_accuracy", 0.5)
 
         record = {
-            "episode":               episode,
-            "diversity_score":       diversity_score,
-            "seed":                  seed,
-            "algorithm":             "DeepSARSA",
-            "n_agents":              N_AGENTS,
-            "n_rounds":              n_rounds,
-            "eq_price":              last_m.get("eq_price", 0.5),
-            "allocative_efficiency": avg_eff,         # średnia po rundach
-            "eff_last_round":        avg_eff_last,    # ostatnia runda
-            "gini":                  last_m.get("gini_coefficient", 0.0),
-            "n_trades":              avg_trades,
-            "action_buy_frac":       last_m.get("action_buy_frac", 0.0),
-            "action_sell_frac":      last_m.get("action_sell_frac", 0.0),
-            "action_pass_frac":      last_m.get("action_pass_frac", 0.0),
-            "mean_reward":           float(np.mean(list(round_rewards.values()))),
-            "mean_epsilon":          pop_s["mean_epsilon"],
-            "mean_td_error":         pop_s["mean_td_error"],
-            "mean_grad_norm":        pop_s.get("mean_grad_norm", 0.0),
-            "zi_baseline":           zi_baseline,
-            "beats_zi":              avg_eff > zi_baseline,
+            "episode":           episode,
+            "diversity_score":   diversity_score,
+            "seed":              seed,
+            "algorithm":         "DeepSARSA_CT",
+            "n_agents":          N_AGENTS,
+            "eq_price":          m.get("eq_price", 0.5),
+            "ref_price_final":   m.get("ref_price_final", 0.5),
+            "mean_pnl":          mean_pnl,
+            "pnl_positive_frac": pnl_pos_frac,
+            "trade_accuracy":    trade_acc,        # GŁÓWNA METRYKA: > 0.5 = lepszy niż ZI
+            "n_trades":          n_trades,
+            "n_trades_closed":   m.get("n_trades_closed", 0),
+            "price_volatility":  m.get("price_volatility", 0.0),
+            "open_positions":    m.get("open_positions_end", 0),
+            "action_buy_frac":   m.get("action_buy_frac", 0.0),
+            "action_sell_frac":  m.get("action_sell_frac", 0.0),
+            "action_hold_frac":  m.get("action_hold_frac", 0.0),
+            "mean_reward":       float(np.mean(list(ep_rewards.values()))),
+            "mean_epsilon":      pop_s["mean_epsilon"],
+            "mean_td_error":     pop_s["mean_td_error"],
+            "mean_grad_norm":    pop_s.get("mean_grad_norm", 0.0),
+            "zi_baseline":       zi_baseline,
+            "beats_zi":          trade_acc > 0.5,  # bije ZI gdy trade_accuracy > 50%
+            "allocative_efficiency": eff,
+            "gini":              m.get("gini_pnl", 0.0),
+            **pop_meta,
         }
         records.append(record)
 
-        # Logowanie co LOG_EVERY epizodów
         if (episode + 1) % LOG_EVERY == 0:
-            recent  = records[-LOG_EVERY:]
-            r_eff   = np.mean([r["allocative_efficiency"] for r in recent])
-            r_gin   = np.mean([r["gini"]                  for r in recent])
-            eps     = pop_s["mean_epsilon"]
-            td_e    = pop_s["mean_td_error"]
+            recent     = records[-LOG_EVERY:]
+            r_tacc  = np.mean([r["trade_accuracy"]    for r in recent])
+            r_pnl   = np.mean([r["mean_pnl"]          for r in recent])
+            r_td    = np.mean([r["mean_td_error"]      for r in recent])
             elapsed = time.time() - t_start
-            beats   = "✓" if r_eff > zi_baseline else "✗"
-
             log.info(
                 f"  [D={diversity_score:.1f} s={seed}] "
                 f"ep={episode+1:4d}/{n_episodes} | "
-                f"eff={r_eff:.3f} {beats}ZI({zi_baseline:.3f}) | "
-                f"gini={r_gin:.3f} | "
-                f"eps={eps:.3f} | td={td_e:.4f} | "
+                f"acc={r_tacc:.3f} | "
+                f"pnl={r_pnl:.4f} | "
+                f"eps={pop_s['mean_epsilon']:.3f} | "
+                f"td={r_td:.5f} | "
                 f"t={elapsed:.0f}s"
             )
 
@@ -545,11 +469,11 @@ def _train_worker(args: tuple) -> list:
     Musi być funkcją modułu (nie lambda) żeby pickle działał.
     Każdy worker ma własny proces — brak konfliktów między sieciami.
     """
+    # numpy-only — brak zależności PyTorch, nic do konfigurowania
     diversity_score, seed, cfg, zi_baseline = args
     return run_training(
         diversity_score = diversity_score,
         n_episodes      = N_EPISODES,
-        n_rounds        = N_ROUNDS,
         seed            = seed,
         cfg             = cfg,
         zi_baseline     = zi_baseline,
@@ -560,8 +484,8 @@ def _train_worker(args: tuple) -> list:
 def main():
     log.info("=" * 65)
     log.info("HTM Benchmark — Deep SARSA (model spekulacyjny)")
-    log.info(f"N={N_AGENTS} | D={DIVERSITY_SCORES} | ep={N_EPISODES} | rounds/ep={N_ROUNDS} | seeds={N_SEEDS}")
-    log.info(f"Łączne rundy per agent per D: {N_EPISODES}×{N_ROUNDS}={N_EPISODES*N_ROUNDS} | ~aktualizacji: {N_EPISODES*N_ROUNDS*2}")
+    log.info(f"N={N_AGENTS} | D={DIVERSITY_SCORES} | ep={N_EPISODES} | steps/ep=200 | seeds={N_SEEDS}")
+    log.info(f"Łączne kroki per agent per D: {N_EPISODES}×200={N_EPISODES*200} | update_every={UPDATE_EVERY}")
     log.info(f"Market: eq±{MARKET.eq_spread} drift={MARKET.drift_enabled}")
     log.info("=" * 65)
 
@@ -577,7 +501,7 @@ def main():
     )
 
     log.info(cfg.summary())
-    log.info(f"max_steps={cfg.env.max_steps} | n_actions={cfg.env.n_actions}")
+    log.info(f"episode_steps={cfg.env.episode_steps} | n_actions={cfg.env.n_actions}")
 
     # 1. ZI baseline — raz przed treningiem
     log.info("\n--- Liczę ZI baseline ---")
@@ -639,23 +563,22 @@ def main():
     # 5. Podsumowanie w konsoli
     log.info("\n" + "=" * 65)
     log.info("PODSUMOWANIE — ostatnie 50 epizodów, uśrednione po seedach")
-    log.info(f"{'D':>5} | {'SARSA':>8} | {'ZI':>8} | {'Δ':>7} | {'Gini':>6} | {'Trades':>7}")
-    log.info("-" * 55)
+    log.info(f"{'D':>5} | {'acc (>0.5=good)':>16} | {'pnl':>8} | {'Trades':>7}")
+    log.info("-" * 48)
 
     final = df[df["episode"] >= N_EPISODES - 50]
     for d in DIVERSITY_SCORES:
         sub   = final[final["diversity_score"] == d]
         if sub.empty:
             continue
-        s_eff  = sub["allocative_efficiency"].mean()
-        zi     = zi_baselines.get(d, 0.0)
-        gini   = sub["gini"].mean()
-        trades = sub["n_trades"].mean()
-        delta  = s_eff - zi
-        sign   = "↑" if delta > 0 else "↓"
+        pos_frac = sub["pnl_positive_frac"].mean()
+        s_pnl    = sub["mean_pnl"].mean()
+        tacc     = sub["trade_accuracy"].mean()
+        zi       = zi_baselines.get(d, 0.0)
+        trades   = sub["n_trades"].mean()
+        sign     = "↑" if tacc > 0.5 else "↓"
         log.info(
-            f"{d:>5.1f} | {s_eff:>8.4f} | {zi:>8.4f} | "
-            f"{sign}{abs(delta):>6.4f} | {gini:>6.4f} | {trades:>7.1f}"
+            f"{d:>5.1f} | {tacc:>7.3f}{sign} | {s_pnl:>8.4f} | {trades:>7.1f}"
         )
 
     log.info(f"\nCałkowity czas: {time.time()-t_total:.0f}s")

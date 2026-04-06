@@ -141,17 +141,22 @@ class AgentParams:
       De Long et al. (1990) i Scheinkman & Xiong (2003).
     """
     agent_id:           str
-    valuation:          float  # prywatna wycena fundamentalna [0, 1] — dryfuje
-    base_valuation:     float  # bazowa wycena — kotwica do której powraca
-    belief_reversion:   float  # beta: jak mocno wraca do base_valuation per krok
-                                # 0.0=czysty drift (→śmierć), 1.0=pełny reset
-                                # Powiązanie z update_speed: momentum trader
-                                # ma niskie belief_reversion (chętnie dryfuje)
-                                # value investor ma wysokie (trzyma fundamenty)
-    threshold:          float  # min |val - price| do handlu
-    gamma:      float = 0.90
-    wealth:     float = 1.00 # ograniczenie budżetowe (aktywne!)
-    belief:     BeliefState  = field(default_factory=BeliefState)
+    valuation:          float  # prywatna wycena fundamentalna [0,1] — dryfuje
+    base_valuation:     float  # bazowa wycena — kotwica powrotu
+    belief_reversion:   float  # beta: zakotwiczenie do base_valuation
+    threshold:          float  # min |val-price| żeby mieć sygnał informacyjny
+    gamma:              float = 0.95  # discount factor
+    wealth:             float = 1.00  # kapitał (nie używany bezpośrednio w CT)
+    risk_aversion:      float = 1.00  # λ: kara za otwartą pozycję (heterogeniczne)
+    belief:             BeliefState = field(default_factory=BeliefState)
+
+    # ── Continuous Trading: ekspozycja rynkowa ────────────────────────────
+    max_position:       int   = 5      # max |position| (zależy od wealth)
+    position:           int   = 0      # bieżąca pozycja ∈ [-max, +max]
+    entry_price:        float = 0.0    # średni koszt wejścia (average cost basis)
+    realized_pnl:       float = 0.0    # zrealizowany P&L w epizodzie
+    n_trades_closed:    int   = 0      # liczba zamkniętych transakcji
+    n_trades_won:       int   = 0      # zamknięte z zyskiem (dla trade_accuracy)
 
     def trade_signal(self, ref_price: float) -> str:
         """
@@ -167,8 +172,16 @@ class AgentParams:
         return "none"
 
     def max_affordable_bid(self) -> float:
-        """Kupiec nie może licytować ponad min(valuation, wealth)."""
-        return float(np.clip(min(self.valuation, self.wealth), 0.01, 0.99))
+        """W modelu position brak cash constraint — liczymy tylko position limit."""
+        return float(np.clip(self.valuation, 0.01, 0.99))
+
+    def reset_position(self) -> None:
+        """Reset pozycji i P&L na początku epizodu."""
+        self.position        = 0
+        self.entry_price     = 0.0
+        self.realized_pnl    = 0.0
+        self.n_trades_closed = 0
+        self.n_trades_won    = 0
 
     def __repr__(self) -> str:
         return (
@@ -246,6 +259,9 @@ class AgentPopulation:
             gamma  = self._sample_gamma(d, cfg)
             belief = self._sample_belief(d, cfg, eq)
 
+            wealth  = self._sample_wealth(d, cfg)
+            max_pos = self._wealth_to_max_position(wealth, d)
+
             self.agents[aid] = AgentParams(
                 agent_id         = aid,
                 valuation        = val,
@@ -253,8 +269,10 @@ class AgentPopulation:
                 belief_reversion = self._sample_belief_reversion(d, cfg, belief),
                 threshold        = self._sample_threshold(d, cfg),
                 gamma            = gamma,
-                wealth           = self._sample_wealth(d, cfg),
+                wealth           = wealth,
+                risk_aversion    = self._sample_risk_aversion(d, cfg),
                 belief           = belief,
+                max_position     = max_pos,
             )
 
     def _sample_gamma(self, d, cfg) -> float:
@@ -329,12 +347,44 @@ class AgentPopulation:
         reversion = 0.05 + (1.0 - belief.update_speed) * 0.70
         return float(np.clip(reversion, 0.05, 0.85))
 
+    def _sample_risk_aversion(self, d, cfg) -> float:
+        """
+        Awersja do ryzyka pozycji — λ w: reward -= λ*(inv/max_inv)².
+
+        Interpretacja:
+          λ=0.0: agent ignoruje ryzyko — buduje max pozycję
+          λ=1.0: umiarkowana kara za dużą pozycję
+          λ=3.0: agent konserwatywny — unika dużych pozycji
+
+        Rozkład: LogNormal(log(1.0), 0.5*d) clip[0, 3]
+          D=0: wszyscy λ=1.0
+          D=1: zakres [0.1, 3.0] — od agresywnych do konserwatywnych
+        """
+        if not cfg.risk_aversion_spread or d < 1e-6:
+            return 1.0
+        sigma = 0.5 * d
+        raw = self.rng.lognormal(mean=-sigma**2/2, sigma=sigma)  # median=1.0
+        return float(np.clip(raw, 0.05, 3.0))
+
     def _sample_wealth(self, d, cfg) -> float:
         if not cfg.wealth_spread or d < 1e-6:
             return 1.0
         # Pareto(1.5): realistyczna nierówność majątku
         raw = float(self.rng.pareto(1.5) + 1.0)
         return float(np.clip(raw * d + 1.0 * (1.0 - d), 0.05, 20.0))
+
+    def _wealth_to_max_position(self, wealth: float, d: float) -> int:
+        """
+        Bogaty agent może trzymać większą pozycję.
+        D=0: wszyscy = env_cfg.max_position (domyślne 5)
+        D>0: max_pos = round(wealth × default), clip [1, default×2]
+        wealth=1.0 → max_pos=5 (bez zmiany)
+        wealth=2.0 → max_pos=10, wealth=0.5 → max_pos=2
+        """
+        base = self.env_cfg.max_position
+        if d < 1e-6:
+            return base
+        return max(1, min(base * 2, round(wealth * base)))
 
     def _sample_belief(self, d, cfg, eq) -> BeliefState:
         bc = self.belief_cfg
@@ -656,17 +706,16 @@ class DoubleAuction:
         self._eq_price  = cfg.market.eq_center
         self._ref_price = cfg.market.eq_center  # aktualizowany po transakcjach
 
-        self.PASS_ACTION = cfg.env.pass_action
 
         # Stan epizodu
         self._step:               int              = 0
         self._done:               bool             = False
-        self._traded:             set              = set()
-        self._surplus:            Dict[str, float] = {}
         self._rewards:            Dict[str, float] = {}
+        self._prev_price:         float            = 0.5
         self._actions_log:        List[dict]       = []
         self._price_window:       List[float]      = []
-        self._max_surplus_at_reset: float          = 1.0  # zapisywany przy resecie rundy
+        self._episode_pnl:        Dict[str, float] = {}
+        self._realized_this_step: Dict[str, float] = {}  # realized PnL per agent w bieżącym kroku
 
     # -----------------------------------------------------------------------
     # Reset
@@ -709,353 +758,312 @@ class DoubleAuction:
         self.order_book.reset()
         self._step        = 0
         self._done        = False
-        self._traded      = set()
-        self._surplus     = {aid: 0.0 for aid in self.population.agents}
-        self._rewards     = {aid: 0.0 for aid in self.population.agents}
         self._actions_log = []
         self._price_window= []
 
-        # Zapisz max_surplus PRZED pierwszym krokiem (wyceny jeszcze nie dryftowały)
-        # Używane przez całą rundę do normalizacji reward — zapobiega /0 po drifcie
-        self._max_surplus_at_reset = max(
-            self.population.max_theoretical_surplus(), 1e-6
-        )
+        # Reset portfeli agentów (cash, inventory, avg_entry)
+        for p in self.population.agents.values():
+            p.reset_position()
+
+        self._rewards    = {aid: 0.0 for aid in self.population.agents}
+        self._prev_price = self._ref_price
+        self._episode_pnl = {aid: 0.0 for aid in self.population.agents}
 
         _log.debug(
             f"RESET | D={diversity_score:.2f} | eq={self._eq_price:.3f} | "
-            f"max_surplus={self._max_surplus_at_reset:.3f} | "
-            f"N={self.cfg.env.n_agents}"
+f"N={self.cfg.env.n_agents}"
         )
 
         return {aid: self.get_observation(aid)
                 for aid in self.population.agents}
 
-    def reset_market_only(self) -> Dict[str, np.ndarray]:
+    def reset_episode(self) -> Dict[str, np.ndarray]:
         """
-        Reset tylko rynku — order book, kroki, kto handlował.
-        Populacja agentów zostaje bez zmian (te same wyceny, gamma, wealth).
+        Reset na nowy epizod (T=200 kroków) — ta sama populacja, nowe portfele.
 
-        Używane w multi-round training (Opcja B + 1):
-          - Jedna stała populacja przez cały trening danego (D, seed)
-          - Każda runda = nowa sesja handlowa, ci sami agenci
-          - Sieć uczy się strategii dla konkretnego agenta, nie uśrednionej
-
-        Eq_price może się losowo zmienić (jeśli MarketDynamics.eq_spread > 0)
-        — to jest właściwość rynku, nie agentów.
+        Continuous Trading: każdy epizod = 200 kroków.
+        Między epizodami: portfele resetowane, wyceny dryfują (pamięć rynku).
+        Cena rynkowa (ref_price) NIE resetuje się — ciągłość historii.
         """
-        assert self.population is not None, "Wywołaj reset() przed reset_market_only()"
+        assert self.population is not None, "Wywołaj reset() przed reset_episode()"
 
-        # Cena rynkowa: NIE resetuje się — niesie pamięć historii handlu.
-        # ref_price zostaje z końca poprzedniej rundy.
-        # eq_price to tylko "prawdziwa" wartość fundamentalna (do metryk),
-        # ale rynek jej nie widzi bezpośrednio.
-
-        # Aktualizacja wycen: drift + zakotwiczenie w fundamentach + szum
-        #
-        # val_{t+1} = val_t
-        #           + update_speed × (ref_price - val_t)    [adaptacja do rynku]
-        #           + belief_reversion × (base_val - val_t)  [powrót do fundamentów]
-        #           + N(0, σ_info)                           [nowe prywatne info]
-        #
-        # Efekt: każdy agent WOLNO przesuwa wycenę w kierunku ceny rynkowej,
-        # ale jest "ciągnięty z powrotem" do swoich fundamentów.
-        # Agent z val=0.63 po dużym spadku ceny → val=0.57 (nie 0.50),
-        # agent z val=0.32 → val=0.38, ale NADAL val_high > val_low.
-        # Heterogeniczność utrzymana, rynek żyje przez cały trening.
-        sigma_info = 0.01  # szum prywatnych informacji (małe nowe dane per sesja)
-        current_price = self._ref_price
-
+        # Wyceny: drift + zakotwiczenie + szum informacyjny
+        sigma_info = 0.01
         for p in self.population.agents.values():
-            drift    = p.belief.update_speed   * (current_price - p.valuation)
-            anchor   = p.belief_reversion      * (p.base_valuation - p.valuation)
-            noise    = self.rng.normal(0, sigma_info)
+            drift  = p.belief.update_speed * (self._ref_price - p.valuation)
+            anchor = p.belief_reversion    * (p.base_valuation - p.valuation)
+            noise  = self.rng.normal(0, sigma_info)
             p.valuation = float(np.clip(p.valuation + drift + anchor + noise, 0.05, 0.95))
-            p.belief.reset_dynamic(current_price)
+            p.belief.reset_dynamic(self._ref_price)
 
-        # Reset rynku
+        # Reset rynku i portfeli
         self.order_book.reset()
         self._step        = 0
         self._done        = False
-        self._traded      = set()
-        self._surplus     = {aid: 0.0 for aid in self.population.agents}
-        self._rewards     = {aid: 0.0 for aid in self.population.agents}
         self._actions_log = []
         self._price_window= []
 
-        # max_surplus po aktualizacji wycen (bieżące wyceny, nie bazowe)
-        self._max_surplus_at_reset = max(
-            self.population.max_theoretical_surplus(), 1e-6
-        )
+        for p in self.population.agents.values():
+            p.reset_position()
 
-        return {aid: self.get_observation(aid)
-                for aid in self.population.agents}
+        self._rewards             = {aid: 0.0 for aid in self.population.agents}
+        self._prev_price          = self._ref_price
+        self._episode_pnl         = {aid: 0.0 for aid in self.population.agents}
+        self._realized_this_step  = {}
+
+        return {aid: self.get_observation(aid) for aid in self.population.agents}
+
+    # backward compat alias
+    def reset_market_only(self) -> Dict[str, np.ndarray]:
+        return self.reset_episode()
 
     # -----------------------------------------------------------------------
     # Parallel step — główny interfejs dla RL
     # -----------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------
+    # Sekwencyjne wykonanie — właściwy interfejs dla RL
+    # -----------------------------------------------------------------------
+
+    def execute_single_action(self, agent_id: str, action_idx: int) -> Optional[Trade]:
+        """
+        Natychmiastowe wykonanie akcji jednego agenta.
+
+        Używane w sekwencyjnym training loop:
+          for aid in random_permutation(agents):
+              obs = da.get_observation(aid)   # aktualny stan rynku
+              action = agent.act(obs)
+              da.execute_single_action(aid, action)
+          rewards, dones = da.compute_step_rewards()
+
+        Każdy następny agent widzi rynek ZAKTUALIZOWANY przez poprzedników.
+        To jest realistyczne: w prawdziwym rynku oferty przetwarzane są sekwencyjnie.
+        """
+        if self._done or agent_id not in self.population.agents:
+            return None
+
+        params = self.population.agents[agent_id]
+        BUY_M  = self.cfg.env.ACTION_BUY_MARKET
+        SELL_M = self.cfg.env.ACTION_SELL_MARKET
+
+        self._actions_log.append({
+            "step":       self._step,
+            "agent_id":   agent_id,
+            "action":     action_idx,
+            "action_name":self.cfg.env.action_name(action_idx),
+            "position":   params.position,
+            "valuation":  params.valuation,
+            "ref_price":  self._ref_price,
+        })
+
+        ref   = self._ref_price
+        order = None
+
+        if action_idx == BUY_M:
+            if params.position >= params.max_position:
+                return None
+            price = float(np.clip(min(ref, params.max_affordable_bid()), 0.001, 0.999))
+            order = Order(agent_id=agent_id, order_type="bid",
+                         price=price, valuation=params.valuation)
+
+        elif action_idx == SELL_M:
+            if params.position <= -params.max_position:
+                return None
+            order = Order(agent_id=agent_id, order_type="ask",
+                         price=float(np.clip(ref, 0.001, 0.999)),
+                         valuation=params.valuation)
+
+        if order is None:
+            return None  # HOLD
+
+        # Natychmiastowe matchowanie (sequential — nie batch)
+        trade = self.order_book.submit(order)
+
+        if trade is not None:
+            buy_r, sell_r = self._settle_ct(trade)
+            self._update_beliefs(trade.price)
+            self._price_window.append(trade.price)
+            if len(self._price_window) > 20:
+                self._price_window.pop(0)
+            self._ref_price = trade.price
+            # Akumuluj realized PnL dla końca kroku
+            if buy_r != 0.0:
+                self._realized_this_step[trade.buyer_id] = (
+                    self._realized_this_step.get(trade.buyer_id, 0.0) + buy_r
+                )
+            if sell_r != 0.0:
+                self._realized_this_step[trade.seller_id] = (
+                    self._realized_this_step.get(trade.seller_id, 0.0) + sell_r
+                )
+
+        return trade
+
+    def compute_step_rewards(
+        self,
+    ) -> Tuple[Dict[str, float], Dict[str, bool]]:
+        """
+        Oblicza nagrody na końcu kroku dla wszystkich agentów.
+
+        Reward = realized_pnl_this_step + valuation_alignment_signal
+
+        realized_pnl: niezerowa suma (gains from trade z heterogenicznych wycen)
+        valuation_alignment: ciągły sygnał który uczy kiedy wycena agenta jest wiarygodna
+          signal > 0 gdy agent ma pozycję zgodną z własną wyceną (long gdy val>price)
+          Skala: mała (0.005) — nie dominuje nad realized ale daje gradient przy HOLD
+
+        Order flow imbalance i drift aplikowane raz per krok (nie per agent).
+        """
+        # Order flow imbalance → price impact
+        lam = self.cfg.env.price_impact_lambda
+        if lam > 1e-6:
+            n_b = len(self.order_book.bids)
+            n_a = len(self.order_book.asks)
+            imbalance = (n_b - n_a) / max(n_b + n_a, 1)
+            self._ref_price = float(np.clip(
+                self._ref_price + lam * imbalance, 0.05, 0.95
+            ))
+
+        # Drift wycen (raz per krok)
+        if self._ref_price != self._prev_price:
+            self._apply_valuation_drift(self._ref_price)
+
+        if self.cfg.market.drift_enabled:
+            self._apply_drift()
+
+        # Nagrody
+        rewards: Dict[str, float] = {}
+        for aid, p in self.population.agents.items():
+            # Realized PnL z zamkniętych pozycji w tym kroku
+            realized = self._realized_this_step.get(aid, 0.0)
+
+            # Valuation alignment — non-zero-sum, ciągły sygnał
+            # Nagradza za posiadanie pozycji zgodnej z prywatną wyceną
+            val_gap = p.valuation - self._ref_price
+            alignment = float(
+                np.clip(val_gap / max(p.threshold, 0.001), -1.0, 1.0)
+            ) * p.position * 0.005
+
+            reward = realized + alignment
+            rewards[aid] = reward
+            # episode_pnl śledzi tylko realized (nie alignment) — metryka artykułu
+            self._episode_pnl[aid] = self._episode_pnl.get(aid, 0.0) + realized
+
+        self._prev_price = self._ref_price
+        self._realized_this_step = {}
+
+        self._step += 1
+        T    = self.cfg.env.episode_steps
+        done = self._step >= T
+        if done:
+            self._done = True
+
+        dones = {aid: done for aid in self.population.agents}
+        return rewards, dones
 
     def parallel_step(
         self,
         actions: Dict[str, int],
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, bool], Dict[str, dict]]:
         """
-        Wszyscy aktywni agenci działają jednocześnie.
-
-        Mapowanie akcji na oferty (NOWE — relatywne do własnej wyceny):
-
-          Kupujący (valuation > ref_price + threshold):
-            aggressiveness = action / (N-1)  ∈ [0, 1]
-            bid = ref_price + (valuation - ref_price) × aggressiveness
-            action=0: bid = ref_price  (niska oferta, może nie trafić)
-            action=N-1: bid = valuation (maksymalnie ile da, gwarantuje trafienie)
-
-          Sprzedający (valuation < ref_price - threshold):
-            aggressiveness = action / (N-1)  ∈ [0, 1]
-            ask = ref_price - (ref_price - valuation) × aggressiveness
-            action=0: ask = ref_price  (wysoka żądana cena)
-            action=N-1: ask = valuation (minimum co przyjmie, gwarantuje trafienie)
-
-          PASS (action == pass_action):
-            Brak oferty. Reward = 0. Agent dalej aktywny (może handlować później).
+        Wrapper dla ZI baseline i visualize — sekwencyjne wykonanie z losową kolejnością.
+        Training loop SARSA używa execute_single_action + compute_step_rewards bezpośrednio.
         """
         if self._done:
             all_agents = list(self.population.agents.keys())
-            obs   = {aid: self.get_observation(aid) for aid in all_agents}
-            rew   = {aid: 0.0 for aid in all_agents}
-            dones = {aid: True for aid in all_agents}
-            return obs, rew, dones, {}
+            return (
+                {aid: self.get_observation(aid) for aid in all_agents},
+                {aid: 0.0 for aid in all_agents},
+                {aid: True for aid in all_agents},
+                {},
+            )
 
-        # Stałe akcji z konfiguracji
-        ACT_PASS   = self.cfg.env.ACTION_PASS
-        ACT_MARKET = self.cfg.env.ACTION_MARKET
-        ACT_TIGHT  = self.cfg.env.ACTION_LIMIT_TIGHT
-        ACT_MED    = self.cfg.env.ACTION_LIMIT_MED
-        ACT_FAR    = self.cfg.env.ACTION_LIMIT_FAR
+        # Losowa kolejność — każdy agent widzi rynek zaktualizowany przez poprzedników
+        agent_list = list(actions.keys())
+        self.rng.shuffle(agent_list)
+        for aid in agent_list:
+            if aid in actions:
+                self.execute_single_action(aid, actions[aid])
 
-        # Offsety cen dla limit orderów
-        TIGHT = self.cfg.env.limit_tight_offset
-        MED   = self.cfg.env.limit_med_offset
-        FAR   = self.cfg.env.limit_far_offset
-
-        orders = []
-
-        for agent_id, action_idx in actions.items():
-            if agent_id in self._traded:
-                continue
-            if agent_id not in self.population.agents:
-                continue
-
-            params = self.population.agents[agent_id]
-            signal = params.trade_signal(self._ref_price)
-
-            # Zaloguj akcję
-            self._actions_log.append({
-                "step":      self._step,
-                "agent_id":  agent_id,
-                "action":    action_idx,
-                "action_name": self.cfg.env.action_name(action_idx),
-                "is_pass":   action_idx == ACT_PASS,
-                "signal":    signal,
-                "valuation": params.valuation,
-                "ref_price": self._ref_price,
-            })
-
-            # PASS lub brak sygnału → nie handluj
-            if action_idx == ACT_PASS or signal == "none":
-                continue
-
-            is_buyer = (signal == "buy")
-
-            # ── Nowe mapowanie akcji: limit orders ──────────────────────
-            #
-            # MARKET:      wykonaj natychmiast po ref_price
-            #              → gwarantuje transakcję jeśli jest kontrpartner
-            #              → agent rezygnuje z price improvement
-            #
-            # LIMIT_TIGHT: postaw zlecenie ±TIGHT od ref_price
-            #              → małe oczekiwanie na lepszą cenę
-            #              → trafi jeśli rynek się lekko poruszy
-            #
-            # LIMIT_MED:   postaw zlecenie ±MED od ref_price
-            #              → umiarkowane oczekiwanie
-            #
-            # LIMIT_FAR:   postaw zlecenie ±FAR od ref_price
-            #              → duże oczekiwanie, agent bardzo cierpliwy
-            #              → gwarantuje sporą marżę jeśli wykona
-            #
-            # Połączenie z gamma:
-            #   niska gamma → niecierpliwy → MARKET (chce nagrody teraz)
-            #   wysoka gamma → cierpliwy  → LIMIT_FAR (czeka na lepszą cenę)
-            #
-            # Połączenie z threshold:
-            #   duży threshold → agent handluje rzadko, ale gdy handluje
-            #   sygnał jest silny → stać go na LIMIT (i tak trafi)
-
-            if is_buyer:
-                # Hybrydowe mapowanie cen — interpolacja między val i ref_price:
-                #
-                #   MARKET      (agg=1.0): bid = valuation
-                #     → płacę pełną moją wycenę, gwarantuję trafienie
-                #   LIMIT_TIGHT (agg=0.67): bid = ref + (val-ref)*0.67
-                #     → blisko rynku, ale z małym marginem
-                #   LIMIT_MED   (agg=0.33): bid = ref + (val-ref)*0.33
-                #     → czekam na umiarkowany ruch w moją stronę
-                #   LIMIT_FAR   (agg=0.0):  bid = ref_price
-                #     → kupię gdy rynek dotrze do obecnego poziomu
-                #
-                # Interpretacja ekonomiczna:
-                #   MARKET: "płacę tyle ile warte, chcę transakcji teraz"
-                #   LIMIT_FAR: "czekam cierpliwie, rynek musi do mnie przyjść"
-                #   Pośrednie: interpolacja — im wyższa agresywność tym bliżej val
-                #
-                # Brak pułapki koordynacyjnej: każda kombinacja akcji może trafić
-                # gdy val_buyer > val_seller (co jest warunkiem sygnału trade_signal)
-                gap = max(0.0, params.valuation - self._ref_price)
-                if action_idx == ACT_MARKET:
-                    price = params.valuation              # agg=1.0
-                elif action_idx == ACT_TIGHT:
-                    price = self._ref_price + gap * 0.67  # agg=0.67
-                elif action_idx == ACT_MED:
-                    price = self._ref_price + gap * 0.33  # agg=0.33
-                elif action_idx == ACT_FAR:
-                    price = self._ref_price               # agg=0.0
-                else:
-                    continue
-
-                price = min(price, params.max_affordable_bid())
-                price = float(np.clip(price, 0.001, 0.999))
-
-                orders.append(Order(
-                    agent_id=agent_id, order_type="bid",
-                    price=price, valuation=params.valuation,
-                ))
-
-            else:  # seller
-                # MARKET      (agg=1.0): ask = valuation
-                # LIMIT_TIGHT (agg=0.67): ask = ref - (ref-val)*0.67
-                # LIMIT_MED   (agg=0.33): ask = ref - (ref-val)*0.33
-                # LIMIT_FAR   (agg=0.0):  ask = ref_price
-                #
-                # LIMIT_FAR seller = "sprzedam gdy rynek wróci do tego poziomu"
-                gap = max(0.0, self._ref_price - params.valuation)
-                if action_idx == ACT_MARKET:
-                    price = params.valuation
-                elif action_idx == ACT_TIGHT:
-                    price = self._ref_price - gap * 0.67
-                elif action_idx == ACT_MED:
-                    price = self._ref_price - gap * 0.33
-                elif action_idx == ACT_FAR:
-                    price = self._ref_price
-                else:
-                    continue
-
-                price = float(np.clip(price, 0.001, 0.999))
-
-                orders.append(Order(
-                    agent_id=agent_id, order_type="ask",
-                    price=price, valuation=params.valuation,
-                ))
-
-        # Matchowanie wszystkich ofert jednocześnie
-        trades = self.order_book.submit_batch(orders)
-
-        # Rozliczenie transakcji
-        for trade in trades:
-            self._settle(trade)
-            self._update_beliefs(trade.price)  # EMA beliefs per transakcja
-            self._price_window.append(trade.price)
-            if len(self._price_window) > 20:
-                self._price_window.pop(0)
-            self._ref_price = trade.price
-
-        # Drift wycen — RAZ per krok z uśrednioną ceną wszystkich transakcji
-        if trades:
-            avg_trade_price = float(np.mean([t.price for t in trades]))
-            self._apply_valuation_drift(avg_trade_price)
-
-        # ── Order Flow Imbalance → Price Impact ──────────────────────────
-        # Niezrealizowane bidy/aski pushują cenę w kierunku nadmiaru popytu/podaży.
-        #
-        # Mechanizm: jeśli jest 8 kupców i 2 sprzedawców (imbalance = +0.6),
-        # sprzedawcy mają siłę przetargową → cena rośnie.
-        # Jeśli 8 sprzedawców i 2 kupców (imbalance = -0.6) → cena spada.
-        #
-        # price_impact = λ × imbalance
-        # gdzie imbalance = (n_unfilled_bids - n_unfilled_asks) / n_total ∈ [-1, +1]
-        #
-        # Interakcja z D:
-        #   D=0: wszyscy val=eq → tyle samo kupców co sprzedawców → imbalance≈0
-        #   D=1: duży spread wycen → wyraźna przewaga jednej strony → duży impact
-        #   → większa D = bardziej zmienna cena (realistyczne!)
-        lam = self.cfg.env.price_impact_lambda
-        if lam > 1e-6:
-            n_bids  = len(self.order_book.bids)
-            n_asks  = len(self.order_book.asks)
-            n_total = max(n_bids + n_asks, 1)
-            imbalance    = (n_bids - n_asks) / n_total
-            price_impact = lam * imbalance
-            self._ref_price = float(np.clip(
-                self._ref_price + price_impact, 0.05, 0.95
-            ))
-
-        # Drift ceny równowagi (opcjonalnie)
-        if self.cfg.market.drift_enabled:
-            self._apply_drift()
-
-        self._step += 1
-        if self._step >= self.cfg.env.max_steps or not self.active_agents:
-            self._done = True
+        rewards, dones = self.compute_step_rewards()
 
         all_agents = list(self.population.agents.keys())
         obs   = {aid: self.get_observation(aid) for aid in all_agents}
-        rew   = {aid: self._rewards.get(aid, 0.0) for aid in all_agents}
-        dones = {aid: self._done for aid in all_agents}
         infos = {
             aid: {
-                "traded":    aid in self._traded,
                 "n_trades":  len(self.order_book.trade_history),
                 "ref_price": self._ref_price,
+                "position":  self.population.agents[aid].position,
             }
             for aid in all_agents
         }
+        return obs, rewards, dones, infos
 
-        # Reset rewards po zebraniu (nie kumuluj)
-        self._rewards = {aid: 0.0 for aid in all_agents}
 
-        return obs, rew, dones, infos
+    def _settle_ct(self, trade: Trade) -> Tuple[float, float]:
+        """
+        Rozliczenie transakcji z śledzeniem realized PnL.
 
-    def _settle(self, trade: Trade):
-        """Oblicza surplusy i usuwa obu z rynku."""
-        buyer_p  = self.population.agents[trade.buyer_id]
-        seller_p = self.population.agents[trade.seller_id]
+        Używa average cost basis:
+          - Otwierasz: entry_price = trade_price
+          - Zwiększasz: entry_price = średnia ważona pozycjami
+          - Zamykasz: realized = (trade_price - entry_price) × zamknięte_jednostki
+          - Odwracasz (np. long→short): realizujesz całość, otwierasz nową stronę
 
-        trade.buyer_surplus  = max(0.0, trade.buyer_val  - trade.price)
-        trade.seller_surplus = max(0.0, trade.price - trade.seller_val)
+        Zwraca (buyer_realized, seller_realized).
+        """
+        buyer  = self.population.agents[trade.buyer_id]
+        seller = self.population.agents[trade.seller_id]
+        p      = trade.price
+        buy_r  = sell_r = 0.0
 
-        self._surplus[trade.buyer_id]  = trade.buyer_surplus
-        self._surplus[trade.seller_id] = trade.seller_surplus
+        # ── Kupujący: position += 1 ──────────────────────────────────────
+        old_b = buyer.position
+        if old_b < 0:
+            # Zamknięcie shorta (lub przejście na long)
+            buy_r = buyer.entry_price - p          # profit: sprzedałeś drogo, odkupujesz tanio
+            buyer.n_trades_closed += 1
+            if buy_r > 0:
+                buyer.n_trades_won += 1
+            if old_b + 1 == 0:
+                buyer.entry_price = 0.0            # pozycja neutralna
+            elif old_b + 1 > 0:
+                buyer.entry_price = p              # odwrócenie: nowy long po tej cenie
+            # else: nadal short ale mniejszy — entry_price bez zmian
+        elif old_b == 0:
+            buyer.entry_price = p                  # otwierasz long
+        else:
+            # Zwiększasz long — average cost
+            buyer.entry_price = (buyer.entry_price * old_b + p) / (old_b + 1)
 
-        # Reward = surplus znormalizowany przez max_surplus Z POCZĄTKU RUNDY ∈ [0,1]
-        # KLUCZOWE: używamy _max_surplus_at_reset, nie bieżącego max_surplus!
-        # Po drifcie wyceny zbliżają się → max_surplus → 0 → normalizacja → ∞
-        # Przykład błędu: surplus=0.28, max_surplus_bieżący=0.001 → reward=280 !!!
-        norm = self._max_surplus_at_reset
-        self._rewards[trade.buyer_id]  = buyer_p.belief.subjective_surplus(
-            trade.buyer_surplus / norm
-        )
-        self._rewards[trade.seller_id] = seller_p.belief.subjective_surplus(
-            trade.seller_surplus / norm
-        )
+        buyer.position  += 1
+        buyer.realized_pnl += buy_r
 
-        for aid in (trade.buyer_id, trade.seller_id):
-            self._traded.add(aid)
-            self.order_book.remove_agent(aid)
+        # ── Sprzedający: position -= 1 ───────────────────────────────────
+        old_s = seller.position
+        if old_s > 0:
+            # Zamknięcie longa (lub przejście na short)
+            sell_r = p - seller.entry_price        # profit: kupiłeś tanio, sprzedajesz drogo
+            seller.n_trades_closed += 1
+            if sell_r > 0:
+                seller.n_trades_won += 1
+            if old_s - 1 == 0:
+                seller.entry_price = 0.0
+            elif old_s - 1 < 0:
+                seller.entry_price = p             # odwrócenie: nowy short po tej cenie
+        elif old_s == 0:
+            seller.entry_price = p                 # otwierasz short
+        else:
+            # Zwiększasz short — average cost
+            seller.entry_price = (seller.entry_price * abs(old_s) + p) / (abs(old_s) + 1)
+
+        seller.position -= 1
+        seller.realized_pnl += sell_r
 
         _log.debug(
-            f"  SETTLE {trade.buyer_id}(v={trade.buyer_val:.3f}) × "
-            f"{trade.seller_id}(v={trade.seller_val:.3f}) @ {trade.price:.3f} | "
-            f"surplus={trade.total_surplus:.4f}"
+            f"  SETTLE {trade.buyer_id}(pos:{old_b}→{buyer.position} r={buy_r:.4f}) × "
+            f"{trade.seller_id}(pos:{old_s}→{seller.position} r={sell_r:.4f}) @ {p:.3f}"
         )
+        return buy_r, sell_r
 
     def _update_beliefs(self, price: float):
         """
@@ -1063,8 +1071,8 @@ class DoubleAuction:
         UWAGA: drift wycen jest aplikowany raz per krok w _apply_valuation_drift(),
         nie tu — żeby uniknąć wielokrotnego driftu gdy jest N transakcji w kroku.
         """
-        for aid in self.active_agents:
-            self.population.agents[aid].belief.observe_price(price)
+        for agent in self.population.agents.values():
+            agent.belief.observe_price(price)
 
     def _apply_valuation_drift(self, avg_price: float):
         """
@@ -1111,7 +1119,7 @@ class DoubleAuction:
 
     def submit(self, agent_id: str, price: float, order_type: str) -> Optional[Trade]:
         """Sekwencyjne składanie oferty. Używane przez ZI baseline."""
-        if self._done or agent_id in self._traded:
+        if self._done:
             return None
 
         params = self.population.agents[agent_id]
@@ -1134,7 +1142,7 @@ class DoubleAuction:
             self._ref_price = trade.price
 
         self._step += 1
-        if self._step >= self.cfg.env.max_steps or not self.active_agents:
+        if self._step >= self.cfg.env.episode_steps:
             self._done = True
 
         return trade
@@ -1145,76 +1153,68 @@ class DoubleAuction:
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        14D wektor obserwacji dla agenta.
+        15D wektor obserwacji — Continuous Trading (position model).
 
-        Zmiany względem poprzedniej wersji (12D):
-          - [3,4,5] best_bid/ask/spread USUNIĘTE — nieinformatywne przy parallel_step
-            (order book jest pusty między krokami)
-          - [3] last_trade_price — cena ostatniej transakcji (0.5 jeśli brak)
-          - [4] price_volatility — std ostatnich 5 cen transakcji (0 jeśli <2)
-          - [5] steps_since_trade — ile kroków temu była transakcja / max_steps
-          - [12] threshold_norm — próg decyzji agenta (znorm. do [0,1])
-            (agent z threshold=0.02 i threshold=0.20 widzieli identyczną obserwację!)
-          - [13] base_val_norm — odległość bieżącej wyceny od bazowej (drift indicator)
-            (sieć może nauczyć się handlować szybciej gdy drift jest duży)
+          [0]  valuation         prywatna wycena fundamentalna
+          [1]  ref_price         ostatnia cena rynkowa
+          [2]  value_signal      siła sygnału: 0=strong sell, 0.5=neutral, 1=strong buy
+          [3]  last_trade_price  cena ostatniej transakcji
+          [4]  price_volatility  std ostatnich 5 cen / eq_price
+          [5]  price_trend       kierunek trendu (znorm.)
+          [6]  position_norm     position / max_position ∈ [-1, +1]
+          [7]  position_util     |position| / max_position ∈ [0, 1]
+          [8]  time_remaining    (T - step) / T
+          [9]  gamma             discount factor agenta
+          [10] risk_aversion_n   risk_aversion / 3.0
+          [11] expected_price    EMA oczekiwań cenowych
+          [12] threshold_norm    threshold / 0.40
+          [13] val_drift         |val - base_val| / 0.5
+          [14] ep_pnl_norm       kumulatywny P&L epizodu (znorm.)
 
-        Pełny wektor:
-          [0]  valuation          bieżąca wycena (może dryfować)
-          [1]  ref_price          ostatnia cena transakcyjna
-          [2]  value_signal       znorm. siła sygnału: 0=strong sell, 0.5=none, 1=strong buy
-          [3]  last_trade_price   cena ostatniej transakcji
-          [4]  price_volatility   zmienność cen (std/0.5)
-          [5]  steps_no_trade     frakcja kroków bez transakcji od początku rundy
-          [6]  frac_traded        ułamek agentów którzy już handlowali
-          [7]  gamma              własny discount factor
-          [8]  wealth_norm        majątek znorm.
-          [9]  expected_price     oczekiwana cena wg EMA
-          [10] price_trend        trend (znorm.)
-          [11] price_momentum     momentum (znorm.)
-          [12] threshold_norm     własny próg handlowy (znorm. do [0,1])
-          [13] val_drift          |val - base_val| / 0.5 — jak bardzo wycena zdryftowała
+        Usunięte (vs 18D inventory model):
+          cash_norm, unrealized_pnl, avg_entry_norm — nie ma cash/inventory tracking
         """
-        p  = self.population.agents[agent_id]
-        n  = len(self.population.agents)
+        p    = self.population.agents[agent_id]
+        T    = self.cfg.env.episode_steps
+        MPOS = max(p.max_position, 1)   # per-agent (zależy od wealth)
 
-        # ── value_signal: znormalizowana siła sygnału ─────────────────────
         thr          = max(p.threshold, 0.001)
-        raw_signal   = (p.valuation - self._ref_price) / thr
-        value_signal = float(np.clip(raw_signal / 6.0 + 0.5, 0.0, 1.0))
+        value_signal = float(np.clip((p.valuation - self._ref_price) / thr / 6.0 + 0.5, 0, 1))
 
-        # ── Historia cen (zamiast best_bid/ask/spread) ────────────────────
         pw = self._price_window
-        last_price = float(pw[-1]) if pw else self._ref_price
-        if len(pw) >= 2:
-            volatility = float(np.std(pw[-5:])) / max(self._eq_price, 0.01)
-            diffs      = np.diff(pw[-5:])
-            momentum   = float(np.mean(diffs))
+        volatility = float(np.std(pw[-5:])) / max(self._eq_price, 0.01) if len(pw) >= 2 else 0.0
+
+        pos_norm  = float(np.clip(p.position / MPOS, -1, 1))
+        time_rem  = float(np.clip(1.0 - self._step / max(T, 1), 0, 1))
+        val_drift = float(np.clip(abs(p.valuation - p.base_valuation) / 0.5, 0, 1))
+        ep_pnl    = float(np.clip(self._episode_pnl.get(agent_id, 0.0) / 5.0, -1, 1))
+
+        # Unrealized P&L: ile zyskałby agent gdyby zamknął teraz pozycję
+        # Kluczowe dla decyzji CLOSE: "czy teraz jest dobry moment na wyjście?"
+        if p.position != 0 and p.entry_price > 0:
+            unrealized = float(np.clip(
+                (self._ref_price - p.entry_price) * p.position / max(self.cfg.env.price_norm, 0.01),
+                -1, 1
+            ))
         else:
-            volatility = 0.0
-            momentum   = 0.0
-
-        # Ile kroków od ostatniej transakcji (0=właśnie była, 1=od dawna nie)
-        last_trade_step = (self._step - len(pw)) if pw else self._step
-        steps_no_trade  = float(np.clip(last_trade_step / max(self.cfg.env.max_steps, 1), 0, 1))
-
-        # ── Drift indicator ───────────────────────────────────────────────
-        val_drift = float(np.clip(abs(p.valuation - p.base_valuation) / 0.5, 0.0, 1.0))
+            unrealized = 0.0
 
         return np.array([
-            p.valuation,                                              # [0]
-            self._ref_price,                                          # [1]
-            value_signal,                                             # [2]
-            float(np.clip(last_price, 0.0, 1.0)),                    # [3] last trade price
-            float(np.clip(volatility, 0.0, 1.0)),                    # [4] price volatility
-            steps_no_trade,                                           # [5] steps since trade
-            len(self._traded) / max(n, 1),                           # [6] frac traded
-            p.gamma,                                                  # [7]
-            float(np.clip(p.wealth / 20.0, 0.0, 1.0)),              # [8]
-            p.belief.expected_price,                                  # [9]
-            float(np.clip(p.belief.price_trend + 0.5, 0.0, 1.0)),   # [10] trend znorm.
-            float(np.clip(momentum + 0.5, 0.0, 1.0)),               # [11] momentum znorm.
-            float(np.clip(p.threshold / 0.40, 0.0, 1.0)),           # [12] threshold_norm
-            val_drift,                                                # [13] drift od bazy
+            p.valuation,                                            # [0]  prywatna wycena
+            self._ref_price,                                        # [1]  cena rynkowa
+            value_signal,                                           # [2]  siła sygnału
+            float(np.clip(p.belief.price_trend + 0.5, 0, 1)),     # [3]  trend ceny
+            float(np.clip(volatility, 0, 1)),                      # [4]  zmienność
+            pos_norm,                                               # [5]  pozycja ∈ [-1,+1]
+            unrealized,                                             # [6]  niezrealizowany P&L ← nowe
+            time_rem,                                               # [7]  czas do końca
+            p.gamma,                                                # [8]  discount factor
+            float(np.clip(p.risk_aversion / 3.0, 0, 1)),          # [9]  awersja do ryzyka
+            float(np.clip(p.belief.expected_price, 0, 1)),         # [10] oczekiwana cena
+            float(np.clip(p.threshold / 0.40, 0, 1)),              # [11] próg decyzji
+            val_drift,                                              # [12] odchylenie wyceny od bazy
+            ep_pnl,                                                 # [13] kumulatywny P&L epizodu
+            float(p.position != 0),                                 # [14] czy masz otwartą pozycję
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -1227,7 +1227,8 @@ class DoubleAuction:
 
     @property
     def active_agents(self) -> List[str]:
-        return [a for a in self.population.agents if a not in self._traded]
+        """W CT wszyscy agenci są aktywni przez cały epizod."""
+        return list(self.population.agents.keys()) if self.population else []
 
     @property
     def ref_price(self) -> float:
@@ -1242,46 +1243,62 @@ class DoubleAuction:
     # -----------------------------------------------------------------------
 
     def episode_metrics(self) -> dict:
-        """Kompletne metryki ekonomiczne po epizodzie."""
-        achieved = sum(self._surplus.values())
-        max_s    = self.population.max_theoretical_surplus()
-        eff      = float(np.clip(achieved / max_s, 0, 1)) if max_s > 1e-9 else 0.0
+        """Metryki epizodu — Continuous Trading."""
+        trades  = self.order_book.trade_history
+        prices  = self.order_book.price_history
 
-        prices   = self.order_book.price_history
+        # Realized P&L agentów (z zamkniętych pozycji)
+        pnls     = self._episode_pnl   # realized PnL per agent
+        pnl_vals = [v for v in pnls.values()]
+        mean_pnl = float(np.mean(pnl_vals)) if pnl_vals else 0.0
+        positive_pnl = sum(1 for v in pnls.values() if v > 0)
+
+        # Trade accuracy: ile zamkniętych transakcji było zyskownych
+        total_closed = sum(p.n_trades_closed for p in self.population.agents.values())
+        total_won    = sum(p.n_trades_won    for p in self.population.agents.values())
+        trade_accuracy = float(total_won / max(total_closed, 1))
+
+        # Zmienność cen
+        price_volatility = float(np.std(prices)) if len(prices) >= 2 else 0.0
         mean_dev = (
             float(np.mean(np.abs(np.array(prices) - self._eq_price)))
             if prices else float(abs(self._ref_price - self._eq_price))
         )
 
-        trades     = self.order_book.trade_history
-        profitable = sum(1 for t in trades if t.is_profitable)
+        # Aktywność handlowa
+        n_buy  = sum(1 for a in self._actions_log if a.get("action") in (1,3))
+        n_sell = sum(1 for a in self._actions_log if a.get("action") in (2,4))
+        n_hold = sum(1 for a in self._actions_log if a.get("action") == 0)
+        n_acts = max(len(self._actions_log), 1)
 
-        # Histogram akcji
-        n_buy  = sum(1 for a in self._actions_log if a["signal"] == "buy"  and not a["is_pass"])
-        n_sell = sum(1 for a in self._actions_log if a["signal"] == "sell" and not a["is_pass"])
-        n_pass = sum(1 for a in self._actions_log if a["is_pass"])
-        n_none = sum(1 for a in self._actions_log if a["signal"] == "none" and not a["is_pass"])
+        # Pozycja na koniec epizodu
+        final_pos   = {aid: p.position for aid, p in self.population.agents.items()}
+        mean_pos    = float(np.mean(list(final_pos.values())))
+        open_pos    = sum(1 for v in final_pos.values() if v != 0)
 
         return {
-            "allocative_efficiency":   eff,
-            "gini_coefficient":        _gini(list(self._surplus.values())),
-            "n_trades":                len(trades),
-            "n_profitable_trades":     profitable,
-            "price_discovery_steps":   _price_disc(
-                prices, self._eq_price, self.cfg.env.discovery_threshold
-            ),
-            "mean_price_deviation":    mean_dev,
-            "total_surplus":           float(achieved),
-            "max_theoretical_surplus": float(max_s),
-            "diversity_score":         self.population.diversity_score,
-            "eq_price":                self._eq_price,
-            "ref_price_final":         self._ref_price,
-            "n_agents":                self.cfg.env.n_agents,
-            "n_steps":                 self._step,
-            "action_buy_frac":         n_buy  / max(len(self._actions_log), 1),
-            "action_sell_frac":        n_sell / max(len(self._actions_log), 1),
-            "action_pass_frac":        n_pass / max(len(self._actions_log), 1),
-            "action_none_frac":        n_none / max(len(self._actions_log), 1),
+            "mean_pnl":            mean_pnl,
+            "pnl_positive_agents": positive_pnl,
+            "gini_pnl":            _gini([max(0, v) for v in pnls.values()]),
+            "trade_accuracy":      trade_accuracy,   # główna metryka (> 0.5 = lepszy niż losowy)
+            "n_trades_closed":     total_closed,
+            "n_trades":            len(trades),
+            "price_volatility":    price_volatility,
+            "mean_price_deviation":mean_dev,
+            "ref_price_final":     self._ref_price,
+            "eq_price":            self._eq_price,
+            "diversity_score":     self.population.diversity_score,
+            "n_agents":            self.cfg.env.n_agents,
+            "n_steps":             self._step,
+            "open_positions_end":  open_pos,
+            "mean_position_end":   mean_pos,
+            "action_buy_frac":     n_buy  / n_acts,
+            "action_sell_frac":    n_sell / n_acts,
+            "action_hold_frac":    n_hold / n_acts,
+            # Backward compat alias
+            "allocative_efficiency": float(np.clip(
+                positive_pnl / max(self.cfg.env.n_agents, 1), 0, 1
+            )),
         }
 
     def agent_metrics(self) -> Dict[str, dict]:
@@ -1290,12 +1307,15 @@ class DoubleAuction:
                 "valuation":       p.valuation,
                 "threshold":       p.threshold,
                 "gamma":           p.gamma,
-                "wealth":          p.wealth,
-                "surplus":         self._surplus.get(aid, 0.0),
-                "traded":          aid in self._traded,
-                "signal":          p.trade_signal(self._eq_price),
+                "risk_aversion":   p.risk_aversion,
+                "position":        p.position,
+                "entry_price":     p.entry_price,
+                "ep_pnl":          self._episode_pnl.get(aid, 0.0),
+                "realized_pnl":    p.realized_pnl,
+                "n_trades_closed": p.n_trades_closed,
+                "n_trades_won":    p.n_trades_won,
+                "trade_accuracy":  float(p.n_trades_won / max(p.n_trades_closed, 1)),
                 "update_speed":    p.belief.update_speed,
-                "anchoring_bias":  p.belief.anchoring_bias,
                 "loss_aversion":   p.belief.loss_aversion,
             }
             for aid, p in self.population.agents.items()
@@ -1308,15 +1328,10 @@ class DoubleAuction:
 
 class ZeroIntelligenceAgent:
     """
-    Baseline spekulacyjny — losowa agresywność, kierunek z sygnału.
+    ZI baseline dla Continuous Trading.
 
-    Różnica od G&S ZI:
-    - G&S ZI: losuj cenę w [0, valuation] (tylko kupujący) lub [cost, 1]
-    - Tu ZI: najpierw sprawdź sygnał (val vs price), potem losuj agresywność
-    - Jeśli brak sygnału: PASS
-
-    To jest WYŻSZY baseline niż G&S bo agent przynajmniej handluje w dobrym
-    kierunku. Ale nie optymalizuje agresywności — to zadanie dla RL.
+    Strategia: losuj akcję spośród dostępnych (respektuje maskowanie portfolio).
+    Odpowiednik G&S ZI: handluje losowo ale w dozwolonym kierunku.
     """
 
     def __init__(self, params: AgentParams, env_cfg: EnvConfig,
@@ -1325,96 +1340,50 @@ class ZeroIntelligenceAgent:
         self.env_cfg = env_cfg
         self.rng     = np.random.default_rng(seed)
 
-    def act(self, obs: np.ndarray, ref_price: float) -> Tuple[int, str]:
-        """
-        Returns (action_idx, signal).
-        action_idx = pass_action jeśli brak sygnału.
-        """
-        signal = self.params.trade_signal(ref_price)
-
-        if signal == "none":
-            return self.env_cfg.ACTION_PASS, "none"
-
-        # ZI losuje jeden z 4 typów zleceń (bez PASS)
-        # MARKET=1, LIMIT_TIGHT=2, LIMIT_MED=3, LIMIT_FAR=4
-        action = int(self.rng.integers(
-            self.env_cfg.ACTION_MARKET,
-            self.env_cfg.ACTION_LIMIT_FAR + 1
-        ))
-        return action, signal
+    def act(self, obs: np.ndarray) -> int:
+        # obs[5] = position_norm ∈ [-1,+1]
+        pos_norm = float(obs[5])
+        can_buy  = pos_norm < 0.99   # nie na max long
+        can_sell = pos_norm > -0.99  # nie na max short
+        valid = [0]  # HOLD zawsze
+        if can_buy:  valid += [1]    # BUY
+        if can_sell: valid += [2]    # SELL
+        return int(self.rng.choice(valid))
 
 
 def run_zi_baseline(
     cfg:             HTMConfig,
     diversity_score: float = 0.5,
-    n_episodes:      int   = 100,
+    n_episodes:      int   = 30,
     seed:            int   = 42,
 ) -> dict:
     """
-    ZI baseline — walidacja środowiska.
-    Cel: sensowna efficiency (> 0.4 dla D=0.5, wzrost z D).
+    ZI baseline dla CT.
+
+    Populacja tworzona RAZ — reset_episode() między epizodami zamiast reset().
+    reset() co epizod tworzył nową AgentPopulation (sampling z rozkładów) — ~10x wolniej.
+    Wyceny dryfują naturalnie przez reset_episode(), więc estymata jest stabilna.
     """
-    rng = np.random.default_rng(seed)
-    da  = DoubleAuction(cfg, seed=seed)
-    all_m = []
+    da = DoubleAuction(cfg, seed=seed)
+    da.reset(diversity_score=diversity_score, seed=seed)
+
+    # ZI agenci tworzeni raz dla tej populacji
+    zi = {
+        aid: ZeroIntelligenceAgent(p, cfg.env, seed=seed + i)
+        for i, (aid, p) in enumerate(da.population.agents.items())
+    }
+
+    all_m: List[dict] = []
+    agent_ids = list(da.population.agents.keys())
 
     for ep in range(n_episodes):
-        ep_seed = int(rng.integers(0, 100_000))
-        da.reset(diversity_score=diversity_score, seed=ep_seed)
-
-        zi = {
-            aid: ZeroIntelligenceAgent(p, cfg.env, seed=ep_seed + i)
-            for i, (aid, p) in enumerate(da.population.agents.items())
-        }
-
-        step = 0
-        max_steps = cfg.env.max_steps * 3  # limit bezpieczeństwa
-        while not da.done and step < max_steps:
-            active = da.active_agents
-            if not active: break
-            aid = active[step % len(active)]
-            obs = da.get_observation(aid)
-
-            action_idx, signal = zi[aid].act(obs, da.ref_price)
-
-            if action_idx != cfg.env.ACTION_PASS and signal != "none":
-                p    = da.population.agents[aid]
-                ref  = da.ref_price
-                TIGHT = cfg.env.limit_tight_offset
-                MED   = cfg.env.limit_med_offset
-                FAR   = cfg.env.limit_far_offset
-
-                if signal == "buy":
-                    gap = max(0.0, p.valuation - da.ref_price)
-                    if action_idx == cfg.env.ACTION_MARKET:
-                        price = p.valuation
-                    elif action_idx == cfg.env.ACTION_LIMIT_TIGHT:
-                        price = da.ref_price + gap * 0.67
-                    elif action_idx == cfg.env.ACTION_LIMIT_MED:
-                        price = da.ref_price + gap * 0.33
-                    else:
-                        price = da.ref_price
-                    price = min(price, p.max_affordable_bid())
-                    da.submit(aid, float(np.clip(price, 0.001, 0.999)), "bid")
-                else:
-                    gap = max(0.0, da.ref_price - p.valuation)
-                    if action_idx == cfg.env.ACTION_MARKET:
-                        price = p.valuation
-                    elif action_idx == cfg.env.ACTION_LIMIT_TIGHT:
-                        price = da.ref_price - gap * 0.67
-                    elif action_idx == cfg.env.ACTION_LIMIT_MED:
-                        price = da.ref_price - gap * 0.33
-                    else:
-                        price = da.ref_price
-                    da.submit(aid, float(np.clip(price, 0.001, 0.999)), "ask")
-            else:
-                # PASS lub brak sygnału — inkrementuj ręcznie
-                da._step += 1
-                if da._step >= cfg.env.max_steps:
-                    da._done = True
-
-            step += 1
-
+        obs_dict = da.reset_episode()
+        T = cfg.env.episode_steps
+        for step in range(T):
+            if da.done:
+                break
+            actions  = {aid: zi[aid].act(obs_dict[aid]) for aid in agent_ids}
+            obs_dict, _, _, _ = da.parallel_step(actions)
         all_m.append(da.episode_metrics())
 
     keys = [k for k, v in all_m[0].items() if isinstance(v, (int, float))]
@@ -1423,12 +1392,6 @@ def run_zi_baseline(
             "std":  float(np.std( [m[k] for m in all_m]))}
         for k in keys
     }
-    eff = result["allocative_efficiency"]
-    _log.info(
-        f"ZI | D={diversity_score:.2f} | "
-        f"eff={eff['mean']:.3f}±{eff['std']:.3f} | "
-        f"trades={result['n_trades']['mean']:.1f}"
-    )
     return result
 
 
@@ -1475,11 +1438,11 @@ if __name__ == "__main__":
     for d in [0.0, 0.3, 0.6, 1.0]:
         r = run_zi_baseline(cfg, diversity_score=d, n_episodes=25, seed=42)
         eff   = r["allocative_efficiency"]
-        gini  = r["gini_coefficient"]
+        gini  = r["gini_pnl"]
         trades= r["n_trades"]
-        pfrac = r["action_pass_frac"]
+        hfrac = r["action_hold_frac"]
         print(
             f"D={d:.1f} | eff={eff['mean']:.3f}±{eff['std']:.3f} | "
             f"gini={gini['mean']:.3f} | trades={trades['mean']:.1f} | "
-            f"pass%={pfrac['mean']*100:.0f}%"
+            f"hold%={hfrac['mean']*100:.0f}%"
         )

@@ -29,82 +29,42 @@ for _d in [LOGS_DIR, PLOTS_DIR, RESULTS_DIR]:
 @dataclass
 class EnvConfig:
     """
-    Parametry rynku spekulacyjnego.
+    Parametry środowiska — Continuous Trading.
 
-    n_agents zastępuje n_buyers + n_sellers — brak stałych ról.
-    max_steps = round_multiplier × n_agents (auto-skalowanie).
-
-    n_aggression_levels: ile poziomów agresywności oferty.
-      Łączna przestrzeń akcji = n_aggression_levels + 1 (PASS).
-      Przykład: 10 poziomów + PASS = 11 akcji.
-
-    trade_threshold_base: minimalna różnica |valuation - price|
-      żeby agent w ogóle rozważał handel (przy D=0).
-      Przy D>0 każdy agent ma swój własny próg.
+    Każdy agent handluje przez T=episode_steps kroków.
+    Nikt nie 'wychodzi' po transakcji — agenci zarządzają portfolio.
+    Reward = mark-to-market (Δwartość portfela) - kara za ryzyko pozycji.
     """
-    n_agents:             int   = 20
-    round_multiplier:     float = 2.0    # max_steps = round_multiplier × n_agents
-    trade_threshold_base: float = 0.06  # min |val - price| żeby handlować
-                                         # 0.08 = agent handluje tylko gdy cena
-                                         # odbiega o min 8% od jego wyceny
-    discovery_threshold:  float = 0.05  # próg do price discovery metric
-    price_impact_lambda:  float = 0.012 # siła price impact od order flow imbalance
-                                         # 0.012: pełny imbalance pushuje cenę o ~1.2%
-                                         # 0.000: brak price impact (poprzedni model)
+    n_agents:               int   = 20
+    episode_steps:          int   = 200    # T: długość epizodu
+    max_position:           int   = 5      # domyślne max |position| (może być nadpisane przez wealth)
+    risk_aversion_base:     float = 1.0    # bazowa kara za otwartą pozycję
 
-    # ── Nowa przestrzeń akcji: limit orders ───────────────────────────────
-    # Zamiast 10 poziomów agresywności: 4 typy zleceń + PASS = 5 akcji
-    #
-    # Interpretacja ekonomiczna:
-    #   PASS        — nie handluj w tym kroku
-    #   MARKET      — zlecenie rynkowe, wykonaj natychmiast po ref_price
-    #   LIMIT_TIGHT — zlecenie z limitem ±TIGHT od ref_price, czekaj chwilę
-    #   LIMIT_MED   — zlecenie z limitem ±MED, bardziej cierpliwy
-    #   LIMIT_FAR   — zlecenie z limitem ±FAR, bardzo cierpliwy
-    #
-    # Połączenie z gamma: agent z niską gamma (niecierpliwy) wybiera MARKET,
-    # agent z wysoką gamma (cierpliwy) woli LIMIT_FAR i czeka na lepszą cenę.
-    #
-    # Połączenie z threshold: agent z wysokim threshold (konserwatywny)
-    # handluje rzadko ale wtedy woli MARKET bo sygnał jest już silny.
+    trade_threshold_base:   float = 0.06   # min |val - price| żeby mieć sygnał
+    discovery_threshold:    float = 0.05
+    price_impact_lambda:    float = 0.012
 
-    limit_tight_offset: float = 0.02   # ±2% od ref_price
-    limit_med_offset:   float = 0.05   # ±5% od ref_price
-    limit_far_offset:   float = 0.10   # ±10% od ref_price
+    # Normalizacja MtM reward (dawne limit_offset)
+    price_norm:             float = 0.03
 
-    # Stałe indeksów akcji (używaj tych nazw w kodzie, nie magic numbers)
-    ACTION_PASS:        int = 0
-    ACTION_MARKET:      int = 1
-    ACTION_LIMIT_TIGHT: int = 2
-    ACTION_LIMIT_MED:   int = 3
-    ACTION_LIMIT_FAR:   int = 4
+    # Kara za otwartą pozycję na koniec epizodu (wymusza zamknięcie pozycji)
+    closing_penalty_lambda: float = 0.05
 
-    @property
-    def n_agents_per_side(self) -> int:
-        return self.n_agents // 2
-
-    @property
-    def max_steps(self) -> int:
-        return int(self.round_multiplier * self.n_agents)
+    # Indeksy akcji — 3 (usunięte limit orders dla prostoty)
+    ACTION_HOLD:        int = 0
+    ACTION_BUY_MARKET:  int = 1
+    ACTION_SELL_MARKET: int = 2
 
     @property
     def n_actions(self) -> int:
-        """5 akcji: PASS + MARKET + 3 poziomy LIMIT."""
-        return 5
-
-    @property
-    def pass_action(self) -> int:
-        return self.ACTION_PASS
+        return 3   # HOLD / BUY / SELL
 
     @property
     def n_obs(self) -> int:
-        """Wymiar wektora obserwacji (stały = 12)."""
-        return 14
+        return 15
 
-    def action_name(self, action_idx: int) -> str:
-        """Nazwa akcji do logowania."""
-        names = {0: "PASS", 1: "MARKET", 2: "LIMIT_TIGHT", 3: "LIMIT_MED", 4: "LIMIT_FAR"}
-        return names.get(action_idx, f"?{action_idx}")
+    def action_name(self, idx: int) -> str:
+        return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +131,7 @@ class DiversityConfig:
     threshold_spread:    bool = True   # różne progi decyzji o handlu
     gamma_spread:        bool = True   # horyzonty czasowe
     wealth_spread:       bool = True   # majątek (Pareto)
+    risk_aversion_spread:bool = True   # awersja do ryzyka pozycji
     belief_spread:       bool = True   # parametry behawioralne
 
     @classmethod
@@ -281,8 +242,8 @@ class HTMConfig:
     def summary(self) -> str:
         return (
             f"HTM-Speculative | N={self.env.n_agents} | "
-            f"actions={self.env.n_actions} (PASS+MARKET+3×LIMIT) | "
-            f"max_steps={self.env.max_steps} | "
+            f"actions={self.env.n_actions} | "
+            f"episode_steps={self.env.episode_steps} | "
             f"eq={self.market.eq_center}±{self.market.eq_spread}"
             f"{'+drift' if self.market.drift_enabled else ''}"
         )
