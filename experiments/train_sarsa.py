@@ -28,14 +28,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import (
+from codes.config import (
     HTMConfig, EnvConfig, LogConfig, ExpConfig,
     MarketDynamics, DiversityConfig
 )
-from envs.double_auction import (
+from codes.double_auction import (
     DoubleAuction, ZeroIntelligenceAgent, run_zi_baseline
 )
 from agents.sarsa_agent import SARSAMultiAgent, SARSAConfig

@@ -5,15 +5,15 @@ Centralna konfiguracja. Wszystkie parametry żyją tutaj.
 
 Kluczowa zmiana względem G&S:
   Model spekulacyjny — brak stałych ról kupiec/sprzedawca.
-  Każdy agent ma prywatną wycenę (valuation) aktywa.
-  Rola (buy/sell/pass) wynika z porównania wyceny z ceną rynkową.
+  Każdy agent ma subiektywną oczekiwaną cenę/fair price aktywa.
+  Rola (buy/sell/hold) wynika z porównania oczekiwania z ceną rynkową.
 """
 
 from dataclasses import dataclass, field
 from typing import List
 from pathlib import Path
 
-ROOT_DIR    = Path(__file__).parent
+ROOT_DIR    = Path(__file__).resolve().parent.parent
 LOGS_DIR    = ROOT_DIR / "logs"
 PLOTS_DIR   = ROOT_DIR / "plots"
 RESULTS_DIR = ROOT_DIR / "results"
@@ -33,22 +33,35 @@ class EnvConfig:
 
     Każdy agent handluje przez T=episode_steps kroków.
     Nikt nie 'wychodzi' po transakcji — agenci zarządzają portfolio.
-    Reward = mark-to-market (Δwartość portfela) - kara za ryzyko pozycji.
+    Reward = realized_pnl_this_step + alignment - risk_penalty.
     """
     n_agents:               int   = 20
     episode_steps:          int   = 200    # T: długość epizodu
-    max_position:           int   = 5      # domyślne max |position| (może być nadpisane przez wealth)
+    max_position:           int   = 3      # domyślne max |position| (może być nadpisane przez wealth)
     risk_aversion_base:     float = 1.0    # bazowa kara za otwartą pozycję
 
-    trade_threshold_base:   float = 0.06   # min |val - price| żeby mieć sygnał
-    discovery_threshold:    float = 0.05
-    price_impact_lambda:    float = 0.012
+    trade_threshold_base:   float = 0.06   # min |expected_price - price| żeby mieć sygnał
 
-    # Normalizacja MtM reward (dawne limit_offset)
+    # Market maker / dealer execution
+    use_market_maker:       bool  = True
+    half_spread:            float = 0.0008
+    temp_impact:            float = 0.000
+    perm_impact:            float = 0.0016
+    p_min:                  float = 0.05
+    p_max:                  float = 0.95
+    alignment_scale:        float = 0.000   # 0.0 = pomocniczy sygnał alignment wyłączony
+    risk_penalty_kappa:     float = 0.001
+    auto_liquidate_end:     bool  = True
+
+    # Deprecated: kept for older scripts, no longer used in the main path.
+    discovery_threshold:    float = 0.05
+    price_impact_lambda:    float = 0.0
+
+    # Normalizacja unrealized PnL w obserwacji (dawne limit_offset)
     price_norm:             float = 0.03
 
-    # Kara za otwartą pozycję na koniec epizodu (wymusza zamknięcie pozycji)
-    closing_penalty_lambda: float = 0.05
+    # Deprecated: terminal positions are liquidated instead of penalized.
+    closing_penalty_lambda: float = 0.0
 
     # Indeksy akcji — 3 (usunięte limit orders dla prostoty)
     ACTION_HOLD:        int = 0
@@ -127,7 +140,7 @@ class DiversityConfig:
     Co D kontroluje. Każdy wymiar można włączyć/wyłączyć osobno
     (eksperymenty ablacyjne: który wymiar heterogeniczności jest kluczowy).
     """
-    valuation_spread:    bool = True   # główny nowy wymiar: prywatne wyceny
+    valuation_spread:    bool = True   # historyczna nazwa: rozrzut expected_price
     threshold_spread:    bool = True   # różne progi decyzji o handlu
     gamma_spread:        bool = True   # horyzonty czasowe
     wealth_spread:       bool = True   # majątek (Pareto)
@@ -202,7 +215,7 @@ class ExpConfig:
     n_seeds:            int  = 30
     n_train_episodes:   int  = 1000
     n_eval_episodes:    int  = 100
-    base_seed:          int  = 42
+    base_seed:          int  = 45
 
     @classmethod
     def quick_test(cls) -> "ExpConfig":

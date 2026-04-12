@@ -1,20 +1,20 @@
 """
-analysis/visualize.py — Wykresy diagnostyczne HTM (model spekulacyjny CT)
+codes/visualize.py — Wykresy diagnostyczne HTM (model spekulacyjny CT)
 =========================================================================
 Wersja zsynchronizowana z aktualnym API:
   - Sekwencyjne wykonanie: execute_single_action + compute_step_rewards
-  - Realized PnL jako reward (nie MtM)
-  - trade_accuracy jako glowna metryka (>0.5 = lepszy niz ZI)
-  - 3 akcje: HOLD/BUY/SELL (bez limit orders)
+  - Realized PnL jako główny składnik rewardu
+  - trade_accuracy jako glowna metryka, porownywana z empirycznym ZI
+  - 3 akcje: HOLD/BUY/SELL
   - Position model: position in [-max_pos, +max_pos]
-  - obs[5] = position_norm (zmienione z obs[6])
+  - obs[5] = position_norm
 
 Wykresy:
-  01  Rozklady wycen agentow przy roznych D
+  01  Rozklady oczekiwanych cen agentow przy roznych D
   02  Parametry heterogenicznosci (gamma, threshold, risk_aversion, beliefs)
   03  Emergencja rol BUY/SELL/HOLD jako funkcja D
   04  Dynamika ceny rynkowej w jednym epizodzie
-  05  Valuation vs realized P&L (kolorowany trade_accuracy per agent)
+  05  Expected price vs realized P&L (kolorowany trade_accuracy per agent)
   06  ZI baseline walidacja srodowiska (trade_accuracy, pos_agents, trades, hold_frac)
   07  Heatmapa akcji per agent (CT, 3 akcje)
   08  Rozklad majatku agentow (Pareto -> max_position)
@@ -27,9 +27,17 @@ Wykresy:
 """
 
 import sys
+import os
+import argparse
 import logging
 from pathlib import Path
 from typing import List, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".matplotlib_cache"))
+os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_ROOT / ".cache"))
+(PROJECT_ROOT / ".matplotlib_cache").mkdir(exist_ok=True)
+(PROJECT_ROOT / ".cache").mkdir(exist_ok=True)
 
 import numpy as np
 import matplotlib
@@ -37,10 +45,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import HTMConfig, EnvConfig, MarketDynamics, LogConfig
-from envs.double_auction import (
+from codes.config import HTMConfig, EnvConfig, MarketDynamics, LogConfig
+from codes.double_auction import (
     DoubleAuction, AgentPopulation, ZeroIntelligenceAgent,
     run_zi_baseline, _gini,
 )
@@ -117,16 +126,61 @@ def _tight():
         pass
 
 
+def _load_results_csv(csv_path: Optional[str] = None, quick: bool = False):
+    try:
+        import pandas as pd
+    except ImportError:
+        print("  [!] pandas nie dostepny")
+        return None, None
+
+    if csv_path is None:
+        candidates = []
+        if quick:
+            candidates.append(PROJECT_ROOT / "results" / "deep_sarsa_quick_results.csv")
+        else:
+            candidates.extend([
+                PROJECT_ROOT / "results" / "deep_sarsa_results.csv",
+                PROJECT_ROOT / "results" / "deep_sarsa_quick_results.csv",
+            ])
+        existing = [p for p in candidates if p.exists()]
+        if not existing:
+            print("  [!] Brak CSV treningu. Uruchom najpierw train_deep_sarsa.")
+            return None, None
+        path = max(existing, key=lambda p: p.stat().st_mtime)
+    else:
+        path = Path(csv_path)
+        if not path.exists():
+            print(f"  [!] Brak CSV: {path}")
+            return None, None
+
+    return pd.read_csv(path), path
+
+
+def _result_colors(d_vals):
+    cmap = plt.cm.coolwarm
+    return {d: cmap(i / max(len(d_vals) - 1, 1)) for i, d in enumerate(d_vals)}
+
+
+def _baseline_by_d(df):
+    if "zi_baseline_trade_accuracy" not in df.columns:
+        print("  [!] Brak zi_baseline_trade_accuracy w CSV — pomijam linię ZI.")
+        return {}
+    return {
+        d: float(v)
+        for d, v in df.groupby("diversity_score")["zi_baseline_trade_accuracy"].first().items()
+    }
+
+
 # ===========================================================================
 # 01. Rozklady wycen agentow przy roznych D
 # ===========================================================================
 
 def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
-    """Rozklad prywatnych wycen — glowna cecha modelu spekulacyjnego."""
+    """Rozklad expected_price — glowna cecha modelu spekulacyjnego."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     fig.suptitle(
-        "Rozklad prywatnych wycen agentow — model spekulacyjny\n"
-        "(handel wynika z roznych wycen, nie stalych rol)",
+        "Rozklad expected_price agentow — model spekulacyjny\n"
+        "(handel wynika z roznych oczekiwan, nie stalych rol)",
         fontsize=13, fontweight="bold", y=1.01,
     )
     cfg = _cfg(n_agents=n_agents)
@@ -140,7 +194,7 @@ def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
                 diversity_cfg=cfg.diversity, belief_cfg=cfg.beliefs,
                 env_cfg=cfg.env, eq_price=eq, seed=s,
             )
-            vals.extend(p.valuation for p in pop.agents.values())
+            vals.extend(p.expected_price for p in pop.agents.values())
         vals = np.array(vals)
 
         ax.hist(vals, bins=25, color=color, alpha=0.75, density=True,
@@ -159,7 +213,7 @@ def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
         ax.text(0.25, 0.82, "SPRZEDAJ", transform=ax.transAxes,
                 color=COLORS["sell"], fontsize=9, fontweight="bold", ha="center")
         ax.set_title(f"D = {d:.1f}", fontsize=12, color=color, fontweight="bold")
-        ax.set_xlabel("Prywatna wycena aktywa")
+        ax.set_xlabel("Expected/fair price aktywa")
         ax.set_ylabel("Gestosc" if ax in axes[:, 0] else "")
         ax.set_xlim(0, 1)
         ax.legend(fontsize=8)
@@ -329,13 +383,13 @@ def plot_price_dynamics(diversity_scores: List[float] = None) -> None:
             if da.done:
                 break
             prices.append(da.ref_price)
-            prev_n = len(da.order_book.trade_history)
+            prev_n = da.episode_metrics()["n_trades"]
             order = rng.permutation(agent_ids)
             for aid in order:
                 obs = da.get_observation(aid)
                 da.execute_single_action(aid, zi[aid].act(obs))
             _, dones = da.compute_step_rewards()
-            if len(da.order_book.trade_history) > prev_n:
+            if da.episode_metrics()["n_trades"] > prev_n:
                 trade_steps.append(step)
             if dones.get(agent_ids[0], False):
                 break
@@ -362,14 +416,14 @@ def plot_price_dynamics(diversity_scores: List[float] = None) -> None:
 
 
 # ===========================================================================
-# 05. Valuation vs realized P&L (kolorowany trade_accuracy)
+# 05. Expected price vs realized P&L (kolorowany trade_accuracy)
 # ===========================================================================
 
 def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
-    """Scatter: wycena vs P&L, kolor = trade_accuracy per agent."""
+    """Scatter: expected_price vs P&L, kolor = trade_accuracy per agent."""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(
-        "Prywatna wycena vs Realized P&L (kolor = trade_accuracy per agent)\n"
+        "Expected price vs Realized P&L (kolor = trade_accuracy per agent)\n"
         "Zielony = agent podejmowal dobre decyzje (acc>0.5), czerwony = zle",
         fontsize=12, fontweight="bold",
     )
@@ -388,7 +442,7 @@ def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
             _run_zi_episode(da, cfg)
             am = da.agent_metrics()
             for m in am.values():
-                all_vals.append(m["valuation"])
+                all_vals.append(m["expected_price"])
                 all_pnl.append(m["ep_pnl"])
                 all_acc.append(m["trade_accuracy"])
 
@@ -408,7 +462,7 @@ def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
 
         plt.colorbar(sc, ax=ax, label="trade_accuracy")
         ax.legend(fontsize=8)
-        ax.set_xlabel("Prywatna wycena aktywa")
+        ax.set_xlabel("Expected/fair price agenta")
         ax.set_ylabel("Realized P&L epizodu")
         ax.set_title(f"D={d:.1f} | N={len(all_vals)} obs.")
         ax.set_xlim(0.05, 0.95)
@@ -437,12 +491,12 @@ def plot_zi_validation(n_episodes: int = 150) -> None:
     fig, axes = plt.subplots(1, 4, figsize=(18, 5))
     fig.suptitle(
         "ZI Baseline — walidacja srodowiska spekulacyjnego CT\n"
-        "(trade_accuracy~0.50 niezaleznie od D = poprawna walidacja)",
+        "(trade_accuracy liczona empirycznie w benchmarkowym protokole ZI)",
         fontsize=12, fontweight="bold",
     )
 
     metrics = [
-        ("trade_accuracy",     "Trade accuracy",          "Glowna metryka (ZI = 0.50)"),
+        ("trade_accuracy",     "Trade accuracy",          "Empiryczny wynik ZI"),
         ("pnl_positive_agents","Agentow z dodatnim P&L",  "Ile agentow zarabia"),
         ("n_trades",           "Transakcji / epizod",      "Aktywnosc rynkowa"),
         ("action_hold_frac",   "Frakcja HOLD",             "Inercja rynku"),
@@ -464,7 +518,7 @@ def plot_zi_validation(n_episodes: int = 150) -> None:
         ax.set_title(title, fontsize=10)
         ax.grid(True, alpha=0.3)
         if key == "trade_accuracy":
-            ax.axhline(0.5, color="gray", ls="--", lw=1.5, label="ZI = 0.50")
+            ax.axhline(0.5, color="gray", ls="--", lw=1.5, label="neutral reference")
             ax.set_ylim(0.35, 0.65)
             ax.legend(fontsize=8)
 
@@ -492,7 +546,7 @@ def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
         da.reset(diversity_score=d, seed=ep_seed)
         agent_ids = list(da.population.agents.keys())
         if valuations is None:
-            valuations = [da.population.agents[aid].valuation
+            valuations = [da.population.agents[aid].expected_price
                           for aid in agent_ids]
 
         zi = {aid: ZeroIntelligenceAgent(p, cfg.env)
@@ -534,7 +588,7 @@ def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
     ax1.set_xticks(range(n_actions))
     ax1.set_xticklabels(x_labels, fontsize=10)
     ax1.set_xlabel("Akcja")
-    ax1.set_ylabel("Agent (posortowany wg wyceny rosnaco)")
+    ax1.set_ylabel("Agent (posortowany wg expected_price rosnaco)")
     ax1.set_title("Heatmapa akcji (znorm. per agent)")
     plt.colorbar(im, ax=ax1, label="Frakcja wyborow")
 
@@ -623,7 +677,7 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
         da.reset(diversity_score=d, seed=42)
 
         agents_sorted = sorted(da.population.agents.items(),
-                               key=lambda x: x[1].valuation)
+                               key=lambda x: x[1].expected_price)
         n = len(agents_sorted)
         tracked = {
             "HIGH":  agents_sorted[-1][0],
@@ -639,17 +693,17 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
         }
 
         ref_prices = [da.ref_price]
-        val_all    = [[p.valuation for p in da.population.agents.values()]]
-        val_tracked = {k: [da.population.agents[v].valuation]
+        val_all    = [[p.expected_price for p in da.population.agents.values()]]
+        val_tracked = {k: [da.population.agents[v].expected_price]
                        for k, v in tracked.items()}
         trades_per_ep = []
 
         for ep in range(n_episodes):
             m = _run_zi_episode(da, cfg)
             ref_prices.append(da.ref_price)
-            val_all.append([p.valuation for p in da.population.agents.values()])
+            val_all.append([p.expected_price for p in da.population.agents.values()])
             for k, aid in tracked.items():
-                val_tracked[k].append(da.population.agents[aid].valuation)
+                val_tracked[k].append(da.population.agents[aid].expected_price)
             trades_per_ep.append(m["n_trades"])
 
         rounds  = np.arange(len(ref_prices))
@@ -660,29 +714,29 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
         ax0.fill_between(rounds,
                          np.clip(val_mean - val_std, 0.05, 0.95),
                          np.clip(val_mean + val_std, 0.05, 0.95),
-                         alpha=0.15, color=color, label="±1sigma wycen")
+                         alpha=0.15, color=color, label="±1sigma expected_price")
         ax0.plot(rounds, val_mean, color=color, lw=1.5, ls="--",
-                 alpha=0.7, label="Srednia wycena")
+                 alpha=0.7, label="Sredni expected_price")
         ax0.plot(rounds, ref_prices, color=COLORS["eq"], lw=2.5,
                  label="ref_price")
         ax0.axhline(0.5, color="gray", ls=":", lw=1, alpha=0.5)
-        ax0.set_title(f"D={d:.1f} — Cena vs wyceny",
+        ax0.set_title(f"D={d:.1f} — Cena vs expected_price",
                       fontsize=11, color=color, fontweight="bold")
-        ax0.set_ylabel("Cena / Wycena")
+        ax0.set_ylabel("Cena / expected_price")
         ax0.set_ylim(0.1, 0.9)
         ax0.legend(fontsize=7)
         ax0.grid(True, alpha=0.3)
 
         ax1 = axes[1, col]
         for k, vals in val_tracked.items():
-            base = da.population.agents[tracked[k]].base_valuation
+            base = da.population.agents[tracked[k]].long_run_fair_price
             ax1.plot(rounds, vals, color=track_colors[k], lw=1.8,
                      label=f"{k} (base={base:.2f})")
         ax1.plot(rounds, ref_prices, color=COLORS["eq"], lw=1.5,
                  ls="--", alpha=0.5, label="ref_price")
-        ax1.set_ylabel("Wycena agenta")
+        ax1.set_ylabel("Expected price agenta")
         ax1.set_ylim(0.1, 0.9)
-        ax1.set_title(f"D={d:.1f} — Wyceny 5 agentow", fontsize=10)
+        ax1.set_title(f"D={d:.1f} — Expected price 5 agentow", fontsize=10)
         ax1.legend(fontsize=7)
         ax1.grid(True, alpha=0.3)
         fv = {k: val_tracked[k][-1] for k in tracked}
@@ -866,10 +920,10 @@ def plot_pnl_distribution(n_agents: int = 20, n_episodes: int = 30) -> None:
     for pc, c in zip(parts3["bodies"], colors):
         pc.set_facecolor(c)
         pc.set_alpha(0.7)
-    ax3.axhline(0.5, color="gray", ls="--", lw=1.5, label="ZI = 0.50")
+    ax3.axhline(0.5, color="gray", ls="--", lw=1.5, label="neutral reference")
     ax3.set_xticks(range(len(D_SHOW)))
     ax3.set_xticklabels(labels)
-    ax3.set_title("Trade accuracy per agent (>0.5 = lepszy niz ZI)")
+    ax3.set_title("Trade accuracy per agent")
     ax3.set_ylabel("Trade accuracy")
     ax3.set_ylim(0, 1)
     ax3.legend(fontsize=8)
@@ -926,7 +980,7 @@ def plot_trading_activity(diversity_scores: List[float] = None,
             for a_idx in range(3):
                 action_counts[a_idx].append(
                     sum(1 for a in step_actions.values() if a == a_idx))
-            curr = len(da.order_book.trade_history)
+            curr = da.episode_metrics()["n_trades"]
             trade_counts.append(curr - prev_trades)
             prev_trades = curr
 
@@ -966,6 +1020,120 @@ def plot_trading_activity(diversity_scores: List[float] = None,
 
 
 # ===========================================================================
+# Wykresy z wynikow treningu CSV
+# ===========================================================================
+
+def plot_role_emergence_from_results(csv_path: Optional[str] = None,
+                                     quick: bool = False,
+                                     final_window: Optional[int] = None) -> None:
+    """Proporcje akcji, P&L i transakcje vs D bez ponownej symulacji."""
+    df, path = _load_results_csv(csv_path, quick=quick)
+    if df is None:
+        return
+
+    needed = {"action_buy_frac", "action_sell_frac", "action_hold_frac", "mean_pnl", "n_trades"}
+    missing = sorted(needed - set(df.columns))
+    if missing:
+        print(f"  [!] CSV nie ma kolumn: {missing}")
+        return
+
+    max_episode = int(df["episode"].max())
+    if final_window is None:
+        final_window = min(50, max(1, (max_episode + 1) // 3))
+    final = df[df["episode"] >= max_episode - final_window + 1]
+
+    d_vals = sorted(final["diversity_score"].unique())
+    colors = _result_colors(d_vals)
+    x = np.arange(len(d_vals))
+    w = 0.6
+
+    grouped = final.groupby("diversity_score")
+    buy_m = grouped["action_buy_frac"].mean().reindex(d_vals).to_numpy()
+    sell_m = grouped["action_sell_frac"].mean().reindex(d_vals).to_numpy()
+    hold_m = grouped["action_hold_frac"].mean().reindex(d_vals).to_numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(
+        f"Akcje i metryki Deep SARSA z wynikow treningu\n"
+        f"{path.name}, ostatnie {final_window} epizodow",
+        fontsize=12, fontweight="bold",
+    )
+
+    ax = axes[0]
+    ax.bar(x, buy_m, w, label="BUY", color=COLORS["buy"], alpha=0.85)
+    ax.bar(x, sell_m, w, bottom=buy_m, label="SELL", color=COLORS["sell"], alpha=0.85)
+    ax.bar(x, hold_m, w, bottom=buy_m + sell_m, label="HOLD", color=COLORS["hold"], alpha=0.85)
+    ax.set_xticks(x); ax.set_xticklabels([f"D={d:.1f}" for d in d_vals], rotation=30)
+    ax.set_ylabel("Frakcja akcji"); ax.set_ylim(0, 1)
+    ax.set_title("Proporcje akcji agentow")
+    ax.legend(fontsize=9); ax.grid(True, axis="y", alpha=0.3)
+
+    ax = axes[1]
+    pnl = grouped["mean_pnl"].agg(["mean", "std"]).reindex(d_vals).fillna(0)
+    ax.errorbar(d_vals, pnl["mean"], yerr=pnl["std"], fmt="o-",
+                color=COLORS["zi"], lw=2, capsize=5, ms=8)
+    ax.axhline(0, color="gray", lw=1, alpha=0.5)
+    ax.set_xlabel("Diversity Score D"); ax.set_ylabel("Mean realized P&L")
+    ax.set_title("P&L jako funkcja D"); ax.grid(True, alpha=0.3)
+
+    ax = axes[2]
+    trades = grouped["n_trades"].agg(["mean", "std"]).reindex(d_vals).fillna(0)
+    bars = ax.bar(d_vals, trades["mean"], width=0.12,
+                  color=[colors[d] for d in d_vals], alpha=0.85, edgecolor="white")
+    ax.errorbar(d_vals, trades["mean"], yerr=trades["std"], fmt="none",
+                color="gray", capsize=4, lw=1.5)
+    for bar, m in zip(bars, trades["mean"]):
+        ax.text(bar.get_x() + bar.get_width() / 2, m + 0.1,
+                f"{m:.1f}", ha="center", va="bottom", fontsize=9)
+    ax.set_xlabel("Diversity Score D"); ax.set_ylabel("Transakcji / epizod")
+    ax.set_title("Aktywnosc rynkowa vs D"); ax.grid(True, axis="y", alpha=0.3)
+
+    _tight()
+    _save(fig, "03_role_emergence.png")
+
+
+def plot_training_metrics_from_results(csv_path: Optional[str] = None,
+                                       quick: bool = False,
+                                       rolling_window: int = 10) -> None:
+    """Kompaktowe krzywe z CSV: P&L, transakcje, epsilon i TD error."""
+    df, path = _load_results_csv(csv_path, quick=quick)
+    if df is None:
+        return
+
+    d_vals = sorted(df["diversity_score"].unique())
+    colors = _result_colors(d_vals)
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    fig.suptitle(f"Deep SARSA — metryki treningu z CSV ({path.name})",
+                 fontsize=12, fontweight="bold")
+
+    panels = [
+        ("mean_pnl", "Mean P&L"),
+        ("n_trades", "Transakcje / epizod"),
+        ("mean_epsilon", "Epsilon"),
+        ("mean_td_error", "TD error"),
+    ]
+
+    for ax, (col, title) in zip(axes.flat, panels):
+        if col not in df.columns:
+            ax.set_visible(False)
+            continue
+        for d in d_vals:
+            df_d = df[df["diversity_score"] == d]
+            mean = df_d.groupby("episode")[col].mean()
+            smooth = mean.rolling(rolling_window, min_periods=1).mean()
+            ax.plot(mean.index, smooth, color=colors[d], lw=2, label=f"D={d:.1f}")
+        if col == "mean_pnl":
+            ax.axhline(0, color="gray", lw=1, alpha=0.5)
+        ax.set_title(title)
+        ax.set_xlabel("Epizod")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+
+    _tight()
+    _save(fig, "15_training_metrics_from_results.png")
+
+
+# ===========================================================================
 # 13. SARSA vs ZI — trade_accuracy przez epizody (czyta CSV)
 # ===========================================================================
 
@@ -991,8 +1159,7 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
         return
 
     df = pd.read_csv(csv_path)
-    metric_col = "trade_accuracy" if "trade_accuracy" in df.columns \
-        else "pnl_positive_frac"
+    metric_col = "trade_accuracy"
     if metric_col not in df.columns:
         print("  [!] Brak trade_accuracy w CSV")
         return
@@ -1002,14 +1169,14 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
     cmap   = plt.cm.coolwarm
     colors = {d: cmap(i / max(n_cols - 1, 1)) for i, d in enumerate(d_vals)}
 
-    ZI_LEVEL = 0.50
+    zi_by_d = _baseline_by_d(df)
 
     fig = plt.figure(figsize=(5 * n_cols + 4, 8))
     gs  = fig.add_gridspec(2, n_cols + 1,
                             width_ratios=[1] * n_cols + [1.2])
     fig.suptitle(
         "SARSA vs ZI Baseline — trade accuracy przez epizody\n"
-        "(ZI = 0.50 z definicji; SARSA powinien przekroczyc 0.50 przy duzym D)",
+        "(linia ZI = empiryczny baseline z tego samego CSV)",
         fontsize=13, fontweight="bold",
     )
 
@@ -1033,15 +1200,17 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
                             np.clip(smooth + std_s, 0, 1),
                             alpha=0.15, color=color)
         ax_top.plot(ep_idx, smooth, color=color, lw=2.5, label="SARSA")
-        ax_top.axhline(ZI_LEVEL, color=COLORS["zi"], ls="--", lw=1.5,
-                       label="ZI = 0.50", alpha=0.8)
-        ax_top.axhspan(ZI_LEVEL, 1.0, alpha=0.04, color="#2E7D32")
+        zi_level = zi_by_d.get(d)
+        if zi_level is not None:
+            ax_top.axhline(zi_level, color=COLORS["zi"], ls="--", lw=1.5,
+                           label=f"ZI={zi_level:.3f}", alpha=0.8)
+            ax_top.axhspan(zi_level, 1.0, alpha=0.04, color="#2E7D32")
 
         final = float(smooth.iloc[-1])
-        delta = final - ZI_LEVEL
+        delta = final - zi_level if zi_level is not None else float("nan")
         c_d   = "#2E7D32" if delta > 0 else "#C62828"
         ax_top.annotate(
-            f"delta={delta:+.3f}",
+            f"delta={delta:+.3f}" if zi_level is not None else "brak ZI",
             xy=(ep_idx[-1], final),
             fontsize=9, color=c_d, fontweight="bold",
             ha="right", va="bottom",
@@ -1081,20 +1250,23 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
 
     ax_bar.bar(x, s_vals, w,
                color=[colors[d] for d in d_vals], alpha=0.85)
-    ax_bar.axhline(ZI_LEVEL, color=COLORS["zi"], ls="--", lw=2,
-                   label="ZI = 0.50", alpha=0.9)
+    zi_vals = [zi_by_d.get(d) for d in d_vals]
+    if all(v is not None for v in zi_vals):
+        ax_bar.plot(x, zi_vals, color=COLORS["zi"], ls="--", lw=2,
+                    marker="o", label="ZI empirical", alpha=0.9)
 
     for xi, sv in enumerate(s_vals):
-        delta = sv - ZI_LEVEL
+        zi_level = zi_by_d.get(d_vals[xi])
+        delta = sv - zi_level if zi_level is not None else float("nan")
         c_d   = "#2E7D32" if delta > 0 else "#C62828"
         ax_bar.text(xi, sv + 0.01,
-                    f"{sv:.3f}  d={delta:+.3f}",
+                    f"{sv:.3f}  d={delta:+.3f}" if zi_level is not None else f"{sv:.3f}",
                     ha="center", fontsize=7, color=c_d, fontweight="bold")
 
     ax_bar.set_xticks(x)
     ax_bar.set_xticklabels([f"D={d:.1f}" for d in d_vals], rotation=30)
     ax_bar.set_ylabel("trade_accuracy (ostatnie 30 ep)")
-    ax_bar.set_title("Wynik koncowy vs ZI=0.50", fontsize=10)
+    ax_bar.set_title("Wynik koncowy vs empiryczny ZI", fontsize=10)
     ax_bar.set_ylim(0.2, 0.8)
     ax_bar.legend(fontsize=9)
     ax_bar.grid(True, axis="y", alpha=0.3)
@@ -1110,7 +1282,7 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
 def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
                                 rolling_window: int = 20) -> None:
     """
-    Jeden panel per D — trade_accuracy SARSA vs linia ZI=0.50.
+    Jeden panel per D — trade_accuracy SARSA vs empiryczny baseline ZI.
     Najbardziej czytelny wykres do artykulu.
     """
     try:
@@ -1137,6 +1309,7 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
     n_cols = len(d_vals)
     cmap   = plt.cm.coolwarm
     colors = {d: cmap(i / max(n_cols - 1, 1)) for i, d in enumerate(d_vals)}
+    zi_by_d = _baseline_by_d(df)
 
     fig, axes = plt.subplots(1, n_cols, figsize=(4.5 * n_cols, 5), sharey=True)
     if n_cols == 1:
@@ -1144,7 +1317,7 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
 
     fig.suptitle(
         "Trade Accuracy — Deep SARSA per D\n"
-        "(> 0.50 = lepsze decyzje niz ZI losowy; hipoteza: roznica rosnie z D)",
+        "(porównanie do empirycznego baseline'u ZI z tych samych warunków)",
         fontsize=13, fontweight="bold",
     )
 
@@ -1162,15 +1335,18 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
                         np.clip(smooth + std_acc, 0, 1),
                         alpha=0.15, color=color)
         ax.plot(ep_idx, smooth, color=color, lw=2.5, label="SARSA")
-        ax.axhline(0.50, color="gray", ls="--", lw=1.5,
-                   alpha=0.8, label="ZI = 0.50")
-        ax.axhspan(0.50, 1.0, alpha=0.04, color="#2E7D32")
+        zi_level = zi_by_d.get(d)
+        if zi_level is not None:
+            ax.axhline(zi_level, color="gray", ls="--", lw=1.5,
+                       alpha=0.8, label=f"ZI={zi_level:.3f}")
+            ax.axhspan(zi_level, 1.0, alpha=0.04, color="#2E7D32")
 
         final = float(smooth.iloc[-min(30, len(smooth)):].mean())
-        delta = final - 0.50
+        delta = final - zi_level if zi_level is not None else float("nan")
         c_d   = "#2E7D32" if delta > 0 else "#C62828"
         ax.text(0.97, 0.05,
-                f"koncowe: {final:.3f}\ndelta={delta:+.3f}",
+                f"koncowe: {final:.3f}\ndelta={delta:+.3f}" if zi_level is not None
+                else f"koncowe: {final:.3f}\nbrak ZI",
                 transform=ax.transAxes, ha="right", va="bottom",
                 fontsize=9, color=c_d, fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
@@ -1190,53 +1366,97 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
 # Main
 # ===========================================================================
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Wykresy HTM. Domyslnie czyta wyniki train_deep_sarsa z CSV.",
+    )
+    parser.add_argument("--csv", type=str, help="Sciezka do CSV z treningu.")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Uzyj results/deep_sarsa_quick_results.csv.",
+    )
+    parser.add_argument(
+        "--rolling-window",
+        type=int,
+        default=10,
+        help="Okno wygładzania krzywych z CSV.",
+    )
+    parser.add_argument(
+        "--simulate-diagnostics",
+        action="store_true",
+        help="Stary wolny tryb: generuje wykresy 1-12 przez nowe symulacje.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
     print("=" * 60)
-    print("HTM — Wykresy diagnostyczne (CT model, trade_accuracy)")
+    print("HTM — Wykresy z wynikow treningu")
     print("=" * 60)
 
-    print("\n[01] Rozklady wycen agentow...")
-    plot_valuation_distributions(n_agents=40, n_seeds=15)
+    df, csv_path = _load_results_csv(args.csv, quick=args.quick)
+    if df is None:
+        return
+    print(f"CSV: {csv_path}")
+    d_list = [float(d) for d in sorted(df["diversity_score"].unique())]
+    print(f"Wiersze: {len(df)} | D={d_list}")
 
-    print("[02] Parametry heterogenicznosci...")
-    plot_heterogeneity_parameters(n_agents=50, n_seeds=8)
-
-    print("[03] Emergencja rol BUY/SELL/HOLD...")
-    plot_role_emergence(n_episodes=80)
-
-    print("[04] Dynamika ceny...")
-    plot_price_dynamics([0.0, 0.5, 1.0])
-
-    print("[05] Valuation vs Realized P&L (trade_accuracy)...")
-    plot_valuation_vs_pnl(n_episodes=25)
-
-    print("[06] ZI walidacja srodowiska...")
-    plot_zi_validation(n_episodes=100)
-
-    print("[07] Heatmapa akcji...")
-    plot_action_heatmap(n_episodes=50, d=0.7)
-
-    print("[08] Rozklad majatku i max_position...")
-    plot_wealth_distribution()
-
-    print("[09] Ewolucja cen i wycen przez epizody...")
-    plot_price_valuation_evolution(n_episodes=60)
-
-    print("[10] Ewolucja pozycji przez epizod...")
-    plot_position_evolution()
-
-    print("[11] Rozklad P&L i trade_accuracy vs D...")
-    plot_pnl_distribution(n_episodes=20)
-
-    print("[12] Aktywnosc handlowa...")
-    plot_trading_activity()
+    print("\n[03] Akcje/P&L/transakcje z CSV...")
+    plot_role_emergence_from_results(str(csv_path), final_window=args.rolling_window)
 
     print("[13] SARSA vs ZI (trade_accuracy, z CSV)...")
-    plot_sarsa_vs_zi()
+    plot_sarsa_vs_zi(str(csv_path), rolling_window=args.rolling_window)
 
-    print("[14] Trade accuracy curves (glowny wykres artykulu, z CSV)...")
-    plot_trade_accuracy_curves()
+    print("[14] Trade accuracy curves (z CSV)...")
+    plot_trade_accuracy_curves(str(csv_path), rolling_window=args.rolling_window)
+
+    print("[15] Metryki treningu (z CSV)...")
+    plot_training_metrics_from_results(str(csv_path), rolling_window=args.rolling_window)
+
+    if args.simulate_diagnostics:
+        print("\n[simulate] Rozklady wycen agentow...")
+        plot_valuation_distributions(n_agents=40, n_seeds=15)
+
+        print("[simulate] Parametry heterogenicznosci...")
+        plot_heterogeneity_parameters(n_agents=50, n_seeds=8)
+
+        print("[simulate] Emergencja rol BUY/SELL/HOLD...")
+        plot_role_emergence(n_episodes=80)
+
+        print("[simulate] Dynamika ceny...")
+        plot_price_dynamics([0.0, 0.5, 1.0])
+
+        print("[simulate] Valuation vs Realized P&L (trade_accuracy)...")
+        plot_valuation_vs_pnl(n_episodes=25)
+
+        print("[simulate] ZI walidacja srodowiska...")
+        plot_zi_validation(n_episodes=100)
+
+        print("[simulate] Heatmapa akcji...")
+        plot_action_heatmap(n_episodes=50, d=0.7)
+
+        print("[simulate] Rozklad majatku i max_position...")
+        plot_wealth_distribution()
+
+        print("[simulate] Ewolucja cen i wycen przez epizody...")
+        plot_price_valuation_evolution(n_episodes=60)
+
+        print("[simulate] Ewolucja pozycji przez epizod...")
+        plot_position_evolution()
+
+        print("[simulate] Rozklad P&L i trade_accuracy vs D...")
+        plot_pnl_distribution(n_episodes=20)
+
+        print("[simulate] Aktywnosc handlowa...")
+        plot_trading_activity()
 
     print("\n" + "=" * 60)
     print(f"Wykresy zapisane w: {PLOTS_DIR}")
     print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

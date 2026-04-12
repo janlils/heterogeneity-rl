@@ -1,5 +1,5 @@
 """
-agents/deep_sarsa.py — Deep SARSA w czystym numpy
+codes/deep_sarsa.py — Deep SARSA w czystym numpy
 ==================================================
 Powrót do numpy po testach z PyTorch.
 
@@ -20,8 +20,12 @@ import logging
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DeepSARSAConfig
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from codes.config import DeepSARSAConfig
 
 logger = logging.getLogger("htm.deep_sarsa")
 
@@ -131,8 +135,7 @@ class DeepSARSAAgent:
     On-policy SARSA z numpy MLP + Adam.
 
     Maskowanie akcji (CT — Continuous Trading):
-      obs[6]  = inventory_norm ∈ [-1,+1]
-      obs[6]  = position_norm ∈ [-1,+1]
+      obs[5]  = position_norm ∈ [-1,+1]
       can_buy  = position_norm < 0.99   (nie max long)
       can_sell = position_norm > -0.99  (nie max short, symetrycznie)
     """

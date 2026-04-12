@@ -14,28 +14,35 @@ Brak zależności GPU — kod działa w czystym numpy.
 
 ```bash
 # Walidacja środowiska (~0.2s)
-python envs/double_auction.py
+python -m codes.double_auction
 
-# Wykresy diagnostyczne (~3 min)
-python analysis/visualize.py
+# Wykresy z wyników treningu
+python -m codes.visualize
+
+# Wykresy z szybkiego treningu
+python -m codes.visualize --quick
 
 # Trening Deep SARSA (równoległy, ~4-6 min)
-python experiments/train_deep_sarsa.py
+python -m codes.train_deep_sarsa
+
+# Szybki test Deep SARSA (~1 min)
+python -m codes.train_deep_sarsa --quick
 ```
 
 ## Struktura
 
 ```
 htm_project/
-├── config.py                   # centralna konfiguracja
-├── envs/
-│   └── double_auction.py       # środowisko spekulacyjne
-├── agents/
-│   └── deep_sarsa.py           # per-agent Deep SARSA (numpy)
+├── codes/
+│   ├── config.py               # centralna konfiguracja
+│   ├── double_auction.py       # środowisko spekulacyjne
+│   ├── deep_sarsa.py           # per-agent Deep SARSA (numpy)
+│   ├── train_deep_sarsa.py     # pętla treningowa z multiprocessing
+│   └── visualize.py            # wykresy diagnostyczne
 ├── experiments/
-│   └── train_deep_sarsa.py     # pętla treningowa z multiprocessing
-└── analysis/
-    └── visualize.py            # 8 wykresów diagnostycznych
+│   └── train_deep_sarsa.py     # wrapper zgodności do codes.train_deep_sarsa
+└── tests/
+    └── test_env.py             # testy środowiska
 ```
 
 Katalogi `plots/`, `results/`, `logs/` tworzone automatycznie.
