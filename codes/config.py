@@ -177,6 +177,30 @@ class DeepSARSAConfig:
 
 
 # ---------------------------------------------------------------------------
+# PPO
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PPOConfig:
+    """Hiperparametry shared-policy PPO actor-critic."""
+    hidden_size: int = 64
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_ratio: float = 0.2
+    value_coef: float = 0.5
+    entropy_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    update_epochs: int = 10
+    minibatch_size: int = 256
+    rollout_episodes: int = 1
+    normalize_advantages: bool = True
+    device: str = "cpu"
+    use_agent_id_features: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Logowanie
 # ---------------------------------------------------------------------------
 
@@ -249,6 +273,7 @@ class HTMConfig:
     beliefs:   BeliefConfig    = field(default_factory=BeliefConfig)
     diversity: DiversityConfig = field(default_factory=DiversityConfig)
     sarsa:     DeepSARSAConfig = field(default_factory=DeepSARSAConfig)
+    ppo:       PPOConfig       = field(default_factory=PPOConfig)
     log:       LogConfig       = field(default_factory=LogConfig)
     exp:       ExpConfig       = field(default_factory=ExpConfig)
 

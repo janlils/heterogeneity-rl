@@ -631,16 +631,24 @@ def build_run_settings(args: argparse.Namespace) -> dict:
     if args.quick:
         settings = {
             "run_name": "quick",
-            "diversity_scores": [0.0, 0.3, 0.7],
+            "diversity_scores": [0.0, 0.3, 0.5, 0.7, 0.9, 1.0],
             "n_agents": 20,
             "n_episodes": 40,
             "episode_steps": 800,
             "n_seeds": 1,
-            "zi_episodes": 5,
-            "eval_episodes": 5,
+            "zi_episodes": 10,
+            "eval_episodes": 50,
             "log_every": 10,
             "rolling_window": 5,
             "n_workers": 1,
+            "sarsa_cfg": DeepSARSAConfig(
+                hidden_size=32,
+                lr=1e-3,
+                epsilon_start=0.20,
+                epsilon_end=0.02,
+                epsilon_decay=0.90,
+                grad_clip=1.0,
+            ),
         }
     else:
         settings = {
@@ -655,6 +663,7 @@ def build_run_settings(args: argparse.Namespace) -> dict:
             "log_every": LOG_EVERY,
             "rolling_window": ROLLING_WINDOW,
             "n_workers": N_WORKERS,
+            "sarsa_cfg": SARSA_CFG,
         }
 
     if args.episodes is not None:
@@ -697,6 +706,7 @@ def main():
     zi_episodes = settings["zi_episodes"]
     n_eval_episodes = settings["eval_episodes"]
     n_workers = settings["n_workers"]
+    sarsa_cfg = settings["sarsa_cfg"]
     run_name = settings["run_name"]
     output_stem = "deep_sarsa" if run_name == "full" else f"deep_sarsa_{run_name}"
 
@@ -705,6 +715,10 @@ def main():
     log.info(f"Tryb: {run_name}")
     log.info(f"N={n_agents} | D={diversity_scores} | ep={n_episodes} | steps/ep={episode_steps} | seeds={n_seeds}")
     log.info(f"Łączne kroki per agent per D: {n_episodes}×{episode_steps}={n_episodes*episode_steps} | update_every={UPDATE_EVERY}")
+    log.info(
+        f"SARSA epsilon: start={sarsa_cfg.epsilon_start:.3f} | "
+        f"end={sarsa_cfg.epsilon_end:.3f} | decay={sarsa_cfg.epsilon_decay:.3f}"
+    )
     log.info(f"Market: eq±{MARKET.eq_spread} drift={MARKET.drift_enabled}")
     log.info("=" * 65)
 
@@ -716,7 +730,7 @@ def main():
         env    = EnvConfig(n_agents=n_agents, episode_steps=episode_steps),
         market = MARKET,
         log    = LogConfig(level="WARNING"),
-        sarsa  = SARSA_CFG,
+        sarsa  = sarsa_cfg,
     )
 
     log.info(cfg.summary())
@@ -748,7 +762,7 @@ def main():
     tasks = [
         (
             d, seed, cfg, zi_baselines[d], zi_positive_baselines[d],
-            n_episodes, n_eval_episodes, SARSA_CFG, settings["log_every"],
+            n_episodes, n_eval_episodes, sarsa_cfg, settings["log_every"],
         )
         for d in diversity_scores
         for seed in range(n_seeds)
@@ -821,25 +835,55 @@ def main():
 
     # 5. Podsumowanie w konsoli
     final_window = min(50, max(1, n_episodes // 3))
-    log.info("\n" + "=" * 65)
+    log.info("\n" + "=" * 82)
     log.info(f"PODSUMOWANIE — ostatnie {final_window} epizodów, uśrednione po seedach")
-    log.info(f"{'D':>5} | {'acc':>7} | {'ZI acc':>7} | {'pnl':>8} | {'Trades':>7}")
-    log.info("-" * 48)
+    log.info(
+        f"{'D':>5} | {'acc':>7} | {'ZI acc':>7} | {'pnl_tot':>9} | "
+        f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
+    )
+    log.info("-" * 82)
 
     final = df[df["episode"] >= n_episodes - final_window]
     for d in diversity_scores:
         sub   = final[final["diversity_score"] == d]
         if sub.empty:
             continue
-        pos_frac = sub["pnl_positive_frac"].mean()
-        s_pnl    = sub["mean_pnl"].mean()
+        s_pnl    = sub["mean_total_pnl"].mean()
+        term_pnl = sub["mean_terminal_pnl"].mean()
         tacc     = sub["trade_accuracy"].mean()
         zi       = zi_baselines.get(d, 0.0)
         trades   = sub["n_trades"].mean()
+        closed   = sub["n_trades_closed"].mean()
         sign     = "↑" if tacc > zi else "↓"
         log.info(
-            f"{d:>5.1f} | {tacc:>7.3f}{sign} | {zi:>7.3f} | {s_pnl:>8.4f} | {trades:>7.1f}"
+            f"{d:>5.1f} | {tacc:>7.3f}{sign} | {zi:>7.3f} | "
+            f"{s_pnl:>9.4f} | {term_pnl:>8.4f} | {trades:>7.1f} | {closed:>7.1f}"
         )
+
+    if not eval_df.empty:
+        log.info("")
+        log.info("EWALUACJA SARSA — greedy, explore=False")
+        log.info(
+            f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
+            f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
+        )
+        log.info("-" * 76)
+        for d in diversity_scores:
+            sub = eval_df[eval_df["diversity_score"] == d]
+            if sub.empty:
+                continue
+            eval_acc = sub["trade_accuracy"].mean()
+            eval_pnl = sub["mean_total_pnl"].mean()
+            eval_term = sub["mean_terminal_pnl"].mean()
+            eval_trades = sub["n_trades"].mean()
+            eval_closed = sub["n_trades_closed"].mean()
+            zi = zi_baselines.get(d, 0.0)
+            sign = "↑" if eval_acc > zi else "↓"
+            log.info(
+                f"{d:>5.1f} | {eval_acc:>7.3f}{sign} | {zi:>7.3f} | "
+                f"{eval_pnl:>9.4f} | {eval_term:>8.4f} | "
+                f"{eval_trades:>7.1f} | {eval_closed:>7.1f}"
+            )
 
     log.info(f"\nCałkowity czas: {time.time()-t_total:.0f}s")
     log.info(f"Wykresy: plots/{output_stem}_learning_curves.png")
