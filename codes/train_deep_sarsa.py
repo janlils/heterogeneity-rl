@@ -85,6 +85,10 @@ EPISODE_STEPS    = 200                            # długość epizodu CT
 # Warunek rynkowy: stable / random_eq / drifting
 MARKET = MarketDynamics.random_eq()
 
+# Algorytmiczne gamma dla TD target — stałe dla wszystkich sieci SARSA.
+# Gamma behawioralne agenta pozostaje w obs[8] i sieć może się go nauczyć.
+SARSA_ALGO_GAMMA = 0.95
+
 # Hiperparametry sieci
 SARSA_CFG = DeepSARSAConfig(
     hidden_size   = 32,
@@ -193,13 +197,15 @@ def run_training(
     da.reset(diversity_score=diversity_score, seed=seed)
 
     agent_ids    = list(da.population.agents.keys())
-    agent_gammas = np.array([da.population.agents[aid].gamma for aid in agent_ids])
+    agent_gammas = np.full(len(agent_ids), SARSA_ALGO_GAMMA)
 
+    pop_gammas = [da.population.agents[a].gamma for a in agent_ids]
     log.info(
         f"  Populacja | N={len(agent_ids)} | "
         f"expected=[{min(da.population.agents[a].expected_price for a in agent_ids):.2f}, "
         f"{max(da.population.agents[a].expected_price for a in agent_ids):.2f}] | "
-        f"gamma=[{agent_gammas.min():.2f}, {agent_gammas.max():.2f}]"
+        f"gamma_behaw=[{min(pop_gammas):.2f}, {max(pop_gammas):.2f}] | "
+        f"gamma_algo={SARSA_ALGO_GAMMA}"
     )
 
     sarsa = DeepSARSAMultiAgent(
@@ -322,7 +328,7 @@ def evaluate_trained_sarsa(
     zi_baseline_positive_pnl_frac: float,
 ) -> List[dict]:
     """
-    Ewaluacja wytrenowanej polityki bez eksploracji i bez update'ów sieci.
+    Ewaluacja wytrenowanej polityki z końcowym epsilonem i bez update'ów sieci.
     Używa tego samego sekwencyjnego protokołu kroku co trening.
     """
     eval_records: List[dict] = []
@@ -335,7 +341,7 @@ def evaluate_trained_sarsa(
         while not da.done:
             for aid in eval_rng.permutation(agent_ids):
                 obs = da.get_observation(aid)
-                action = sarsa.agents[aid].act(obs, explore=False)
+                action = sarsa.agents[aid].act(obs, explore=True)
                 da.execute_single_action(aid, action)
             da.compute_step_rewards()
 
@@ -862,7 +868,7 @@ def main():
 
     if not eval_df.empty:
         log.info("")
-        log.info("EWALUACJA SARSA — greedy, explore=False")
+        log.info("EWALUACJA SARSA — epsilon policy, explore=True")
         log.info(
             f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
             f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"

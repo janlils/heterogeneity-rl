@@ -173,8 +173,17 @@ class SharedPPOTrainer:
         self.device = torch.device(self.cfg.device)
         torch.manual_seed(seed)
         self.model = PPOActorCritic(obs_dim, n_actions, self.cfg.hidden_size).to(self.device)
-        lr = self.cfg.actor_lr
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam([
+            {
+                "params": list(self.model.trunk.parameters())
+                       + list(self.model.policy_head.parameters()),
+                "lr": self.cfg.actor_lr,
+            },
+            {
+                "params": self.model.value_head.parameters(),
+                "lr": self.cfg.critic_lr,
+            },
+        ])
         self.buffer = RolloutBuffer()
         self.training_step = 0
         self.agent_to_idx = (

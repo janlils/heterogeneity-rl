@@ -66,9 +66,9 @@ def build_run_settings(quick: bool, args) -> dict:
     if quick:
         ppo_cfg = PPOConfig(
             hidden_size=32,
-            update_epochs=2,
+            update_epochs=4,
             minibatch_size=128,
-            rollout_episodes=1,
+            rollout_episodes=5,
             use_agent_id_features=args.agent_id_features,
         )
         return {
@@ -241,11 +241,15 @@ def evaluate_trained_ppo(
     n_eval_episodes: int,
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
+    deterministic: bool = False,
 ) -> List[dict]:
     """
     Ewaluacja PPO na tej samej populacji i stanie środowiska po treningu.
     To jest odpowiednik evaluate_trained_sarsa(): resetuje tylko epizod,
     nie tworzy nowej populacji z innym seedem.
+
+    Domyślnie używa stochastycznego sample z wyuczonej masked policy, bo PPO
+    uczy rozkład akcji. deterministic=True zostaje jako diagnostyka argmax.
     """
     eval_records: List[dict] = []
     agent_ids = list(da.population.agents.keys())
@@ -257,7 +261,7 @@ def evaluate_trained_ppo(
         while not da.done:
             for aid in eval_rng.permutation(agent_ids):
                 obs = da.get_observation(aid)
-                action, _, _, mask = trainer.act_np(obs, aid, deterministic=True)
+                action, _, _, mask = trainer.act_np(obs, aid, deterministic=deterministic)
                 if not mask[action]:
                     raise RuntimeError(f"PPO eval selected illegal action {action} for {aid}")
                 da.execute_single_action(aid, action)
@@ -268,10 +272,11 @@ def evaluate_trained_ppo(
             episode=episode,
             diversity_score=diversity_score,
             seed=seed,
-            algorithm="PPO_EVAL",
+            algorithm="PPO_EVAL_DETERMINISTIC" if deterministic else "PPO_EVAL_STOCHASTIC",
             cfg=cfg,
             metrics=m,
             extra={
+                "eval_mode": "deterministic_argmax" if deterministic else "stochastic_sample",
                 "zi_baseline_trade_accuracy": zi_baseline_trade_accuracy,
                 "zi_baseline_positive_pnl_frac": zi_baseline_positive_pnl_frac,
                 "zi_baseline": zi_baseline_trade_accuracy,
@@ -375,7 +380,7 @@ def log_final_summary(
 
     if not eval_df.empty:
         log.info("")
-        log.info("EWALUACJA PPO — ta sama populacja, deterministic argmax po masked logits")
+        log.info("EWALUACJA PPO — ta sama populacja, stochastic sample z masked policy")
         log.info(
             f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
             f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"

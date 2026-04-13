@@ -22,9 +22,10 @@ def _action_for_policy(algorithm_name: str, policy, obs, aid: str) -> int:
     if name in {"zi", "zero_intelligence", "zerointelligence"}:
         return int(policy[aid].act(obs))
     if "sarsa" in name:
-        return int(policy.agents[aid].act(obs, explore=False))
+        return int(policy.agents[aid].act(obs, explore=True))
     if "ppo" in name:
-        action, _, _, _ = policy.act_np(obs, aid, deterministic=True)
+        deterministic = "deterministic" in name or "argmax" in name
+        action, _, _, _ = policy.act_np(obs, aid, deterministic=deterministic)
         return int(action)
     if hasattr(policy, "act_np"):
         action, _, _, _ = policy.act_np(obs, aid, deterministic=True)

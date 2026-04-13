@@ -1406,7 +1406,7 @@ f"N={self.cfg.env.n_agents}"
             "action_hold_frac":    n_hold / n_acts,
             "mean_terminal_pnl":       mean_terminal_pnl,
             "terminal_positive_frac":  float(terminal_positive / max(self.cfg.env.n_agents, 1)),
-            "mean_total_pnl":          mean_pnl + mean_terminal_pnl,
+            "mean_total_pnl":          mean_pnl,
             # Backward compat alias
             "allocative_efficiency": positive_pnl_frac,
         }
