@@ -33,14 +33,12 @@ class EnvConfig:
 
     Każdy agent handluje przez T=episode_steps kroków.
     Nikt nie 'wychodzi' po transakcji — agenci zarządzają portfolio.
-    Reward = realized_pnl_this_step + alignment - risk_penalty.
+    Reward = realized_pnl_this_step - risk_penalty - holding_cost.
     """
     n_agents:               int   = 20
     episode_steps:          int   = 200    # T: długość epizodu
     max_position:           int   = 3      # domyślne max |position| (może być nadpisane przez wealth)
     risk_aversion_base:     float = 1.0    # bazowa kara za otwartą pozycję
-
-    trade_threshold_base:   float = 0.06   # min |expected_price - price| żeby mieć sygnał
 
     # Market maker / dealer execution
     use_market_maker:       bool  = True
@@ -49,19 +47,16 @@ class EnvConfig:
     perm_impact:            float = 0.0016
     p_min:                  float = 0.05
     p_max:                  float = 0.95
-    alignment_scale:        float = 0.000   # 0.0 = pomocniczy sygnał alignment wyłączony
-    risk_penalty_kappa:     float = 0.001
+    # alignment_scale usunięty (zawsze był 0)
+    risk_penalty_kappa:     float = 0.02
     auto_liquidate_end:     bool  = True
 
-    # Deprecated: kept for older scripts, no longer used in the main path.
-    discovery_threshold:    float = 0.05
-    price_impact_lambda:    float = 0.0
+    # Kara za trzymanie zysku bez zamknięcia (rośnie pod koniec epizodu)
+    holding_cost_kappa:      float = 0.03
+    # Ostatnie X% epizodu to "strefa urgency" dla holding_cost
+    holding_urgency_horizon: float = 0.30
 
-    # Normalizacja unrealized PnL w obserwacji (dawne limit_offset)
-    price_norm:             float = 0.03
-
-    # Deprecated: terminal positions are liquidated instead of penalized.
-    closing_penalty_lambda: float = 0.0
+    # deprecated fields removed
 
     # Indeksy akcji — 3 (usunięte limit orders dla prostoty)
     ACTION_HOLD:        int = 0
@@ -74,7 +69,7 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 15
+        return 7
 
     def action_name(self, idx: int) -> str:
         return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
@@ -113,21 +108,33 @@ class MarketDynamics:
 
 
 # ---------------------------------------------------------------------------
-# Przekonania agentów
+# Sentiment agentów
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BeliefConfig:
+class SentimentConfig:
     """
-    Parametry behawioralne agentów (literatura z ekonomii behawioralnej).
-    Przy D=0: wszyscy neutralni. Przy D=1: losowane z poniższych rozkładów.
+    Parametry dynamiki sentimentu i dyfuzji wartości fundamentalnej V_t.
     """
-    update_speed_center:  float = 0.3    # EMA alpha
-    update_speed_spread:  float = 0.25
-    anchoring_spread:     float = 0.35   # max skala Beta(2,5) przy D=1
-                                           # Tversky & Kahneman (1974)
-    loss_aversion_spread: float = 0.30   # sigma LogNormal przy D=1
-                                           # Kahneman & Tversky (1992): mediana=2.25
+    # Dynamika V_t
+    sigma_intra:             float = 0.003   # dryft V_t per krok (wewnątrz epizodu)
+    sigma_macro:             float = 0.015   # skok V_t między epizodami
+    p_info:                  float = 0.04    # prawdopodobieństwo sygnału info per krok
+    sigma_news:              float = 0.15    # szum prywatnej interpretacji newsa
+    sigma_P:                 float = 0.003   # normalizacja zmiany ceny do tanh
+
+    # Centra parametrów behawioralnych (przy D=0 wszyscy mają te wartości)
+    alpha_center:            float = 0.08    # momentum: waga sygnału cenowego
+    beta_center:             float = 0.06    # mean reversion: powrót do neutralu
+    news_sensitivity_center: float = 0.12   # waga sygnału informacyjnego z V_t
+
+    # Zakresy przy D=1 (losowane jednostajnie: center ± half_range)
+    alpha_spread:            float = 0.22    # → zakres [0.03, 0.25] przy D=1
+    beta_spread:             float = 0.12    # → zakres [0.03, 0.15] przy D=1
+    news_sensitivity_spread: float = 0.35   # → zakres [0.05, 0.40] przy D=1
+
+
+# BeliefConfig usunięty — zastąpiony przez SentimentConfig.
 
 
 # ---------------------------------------------------------------------------
@@ -140,18 +147,18 @@ class DiversityConfig:
     Co D kontroluje. Każdy wymiar można włączyć/wyłączyć osobno
     (eksperymenty ablacyjne: który wymiar heterogeniczności jest kluczowy).
     """
-    valuation_spread:    bool = True   # historyczna nazwa: rozrzut expected_price
+    sentiment_spread:    bool = True   # rozrzut początkowego sentimentu agentów
     threshold_spread:    bool = True   # różne progi decyzji o handlu
     gamma_spread:        bool = True   # horyzonty czasowe
     wealth_spread:       bool = True   # majątek (Pareto)
     risk_aversion_spread:bool = True   # awersja do ryzyka pozycji
-    belief_spread:       bool = True   # parametry behawioralne
+    behavioral_spread:   bool = True   # parametry α_i, β_i, news_sensitivity
 
     @classmethod
-    def valuations_only(cls) -> "DiversityConfig":
-        """Tylko wyceny — najczystszy test modelu spekulacyjnego."""
+    def sentiment_only(cls) -> "DiversityConfig":
+        """Tylko sentiment — najczystszy test modelu spekulacyjnego."""
         return cls(threshold_spread=False, gamma_spread=False,
-                   wealth_spread=False, belief_spread=False)
+                   wealth_spread=False, behavioral_spread=False)
 
     @classmethod
     def full(cls) -> "DiversityConfig":
@@ -270,7 +277,7 @@ class ExpConfig:
 class HTMConfig:
     env:       EnvConfig       = field(default_factory=EnvConfig)
     market:    MarketDynamics  = field(default_factory=MarketDynamics.stable)
-    beliefs:   BeliefConfig    = field(default_factory=BeliefConfig)
+    sentiment: SentimentConfig = field(default_factory=SentimentConfig)
     diversity: DiversityConfig = field(default_factory=DiversityConfig)
     sarsa:     DeepSARSAConfig = field(default_factory=DeepSARSAConfig)
     ppo:       PPOConfig       = field(default_factory=PPOConfig)

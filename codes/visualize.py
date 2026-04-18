@@ -7,14 +7,14 @@ Wersja zsynchronizowana z aktualnym API:
   - trade_accuracy jako glowna metryka, porownywana z empirycznym ZI
   - 3 akcje: HOLD/BUY/SELL
   - Position model: position in [-max_pos, +max_pos]
-  - obs[5] = position_norm
+  - obs[1] = position_norm
 
 Wykresy:
-  01  Rozklady oczekiwanych cen agentow przy roznych D
-  02  Parametry heterogenicznosci (gamma, threshold, risk_aversion, beliefs)
+  01  Rozklady sentimentu agentow przy roznych D
+  02  Parametry heterogenicznosci (gamma, threshold, risk_aversion, sentiment)
   03  Emergencja rol BUY/SELL/HOLD jako funkcja D
   04  Dynamika ceny rynkowej w jednym epizodzie
-  05  Expected price vs realized P&L (kolorowany trade_accuracy per agent)
+  05  Sentiment vs realized P&L (kolorowany trade_accuracy per agent)
   06  ZI baseline walidacja srodowiska (trade_accuracy, pos_agents, trades, hold_frac)
   07  Heatmapa akcji per agent (CT, 3 akcje)
   08  Rozklad majatku agentow (Pareto -> max_position)
@@ -176,11 +176,11 @@ def _baseline_by_d(df):
 # ===========================================================================
 
 def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
-    """Rozklad expected_price — glowna cecha modelu spekulacyjnego."""
+    """Rozklad sentimentu — glowna cecha modelu spekulacyjnego."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     fig.suptitle(
-        "Rozklad expected_price agentow — model spekulacyjny\n"
-        "(handel wynika z roznych oczekiwan, nie stalych rol)",
+        "Rozklad sentimentu agentow — model spekulacyjny\n"
+        "(handel wynika z roznych nastrojow, nie stalych rol)",
         fontsize=13, fontweight="bold", y=1.01,
     )
     cfg = _cfg(n_agents=n_agents)
@@ -191,10 +191,10 @@ def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
         for s in range(n_seeds):
             pop = AgentPopulation(
                 n_agents=n_agents, diversity_score=d,
-                diversity_cfg=cfg.diversity, belief_cfg=cfg.beliefs,
+                diversity_cfg=cfg.diversity, sentiment_cfg=cfg.sentiment,
                 env_cfg=cfg.env, eq_price=eq, seed=s,
             )
-            vals.extend(p.expected_price for p in pop.agents.values())
+            vals.extend(p.sentiment for p in pop.agents.values())
         vals = np.array(vals)
 
         ax.hist(vals, bins=25, color=color, alpha=0.75, density=True,
@@ -204,8 +204,8 @@ def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
         ax.axvspan(0.0, eq, alpha=0.05, color=COLORS["sell"])
 
         ax.text(0.05, 0.95,
-                f"sigma={vals.std():.3f}\nbuy: {(vals>eq).mean()*100:.0f}%\n"
-                f"sell: {(vals<eq).mean()*100:.0f}%",
+                f"sigma={vals.std():.3f}\nbull: {(vals>0).mean()*100:.0f}%\n"
+                f"bear: {(vals<0).mean()*100:.0f}%",
                 transform=ax.transAxes, fontsize=9, va="top",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
         ax.text(0.75, 0.82, "KUP", transform=ax.transAxes,
@@ -213,9 +213,9 @@ def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
         ax.text(0.25, 0.82, "SPRZEDAJ", transform=ax.transAxes,
                 color=COLORS["sell"], fontsize=9, fontweight="bold", ha="center")
         ax.set_title(f"D = {d:.1f}", fontsize=12, color=color, fontweight="bold")
-        ax.set_xlabel("Expected/fair price aktywa")
+        ax.set_xlabel("Sentiment")
         ax.set_ylabel("Gestosc" if ax in axes[:, 0] else "")
-        ax.set_xlim(0, 1)
+        ax.set_xlim(-1, 1)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
@@ -239,10 +239,10 @@ def plot_heterogeneity_parameters(n_agents: int = 60, n_seeds: int = 10) -> None
         ("threshold",      "Prog decyzji",              [0.0, 0.30], "Min |val-price| do handlu"),
         ("risk_aversion",  "Awersja do ryzyka lambda",  [0.0, 3.0],  "Kara za duza pozycje (CT)"),
         ("wealth",         "Majatek (wealth)",          [0.0, 6.0],  "Pareto(1.5) -> max_position"),
-        ("update_speed",   "update_speed",              [0.0, 1.0],  "EMA alpha (Barberis 2003)"),
-        ("anchoring_bias", "Zakotwiczenie",             [0.0, 0.4],  "Beta(2,5) (Tversky 1974)"),
-        ("loss_aversion",  "Awersja do strat lambda",   [1.0, 5.0],  "LogNorm (Kahneman 1992)"),
-        ("belief_reversion","Belief reversion",         [0.0, 1.0],  "Powrot do fundamentow"),
+        ("sentiment",      "Sentiment",                 [-1.0, 1.0], "Nastroj poczatkowy"),
+        ("alpha_i",        "alpha_i",                   [0.0, 0.4],  "Momentum ceny"),
+        ("beta_i",         "beta_i",                    [0.0, 0.25], "Powrot do neutralu"),
+        ("news_sensitivity","news_sensitivity",         [0.0, 0.5],  "Reakcja na news"),
     ]
     d_sub    = [0.0, 0.5, 1.0]
     d_colors = [COLORS["D0.0"], COLORS["D0.4"], COLORS["D1.0"]]
@@ -253,15 +253,11 @@ def plot_heterogeneity_parameters(n_agents: int = 60, n_seeds: int = 10) -> None
             for s in range(n_seeds):
                 pop = AgentPopulation(
                     n_agents=n_agents, diversity_score=d,
-                    diversity_cfg=cfg.diversity, belief_cfg=cfg.beliefs,
+                    diversity_cfg=cfg.diversity, sentiment_cfg=cfg.sentiment,
                     env_cfg=cfg.env, eq_price=0.5, seed=s,
                 )
                 for p in pop.agents.values():
-                    if param in ("gamma", "threshold", "risk_aversion",
-                                 "wealth", "belief_reversion"):
-                        values.append(getattr(p, param))
-                    else:
-                        values.append(getattr(p.belief, param))
+                    values.append(getattr(p, param))
             ax.hist(values, bins=20, color=color, alpha=0.55, density=True,
                     label=f"D={d:.1f}", edgecolor="none")
 
@@ -416,14 +412,14 @@ def plot_price_dynamics(diversity_scores: List[float] = None) -> None:
 
 
 # ===========================================================================
-# 05. Expected price vs realized P&L (kolorowany trade_accuracy)
+# 05. Sentiment vs realized P&L (kolorowany trade_accuracy)
 # ===========================================================================
 
 def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
-    """Scatter: expected_price vs P&L, kolor = trade_accuracy per agent."""
+    """Scatter: sentiment vs P&L, kolor = trade_accuracy per agent."""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(
-        "Expected price vs Realized P&L (kolor = trade_accuracy per agent)\n"
+        "Sentiment vs Realized P&L (kolor = trade_accuracy per agent)\n"
         "Zielony = agent podejmowal dobre decyzje (acc>0.5), czerwony = zle",
         fontsize=12, fontweight="bold",
     )
@@ -442,7 +438,7 @@ def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
             _run_zi_episode(da, cfg)
             am = da.agent_metrics()
             for m in am.values():
-                all_vals.append(m["expected_price"])
+                all_vals.append(m["sentiment"])
                 all_pnl.append(m["ep_pnl"])
                 all_acc.append(m["trade_accuracy"])
 
@@ -452,7 +448,7 @@ def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
 
         sc = ax.scatter(vals, pnl, c=acc, cmap="RdYlGn",
                         vmin=0.0, vmax=1.0, alpha=0.5, s=22, edgecolors="none")
-        ax.axvline(0.5, color=COLORS["eq"], ls="--", lw=1.5, alpha=0.7, label="eq=0.5")
+        ax.axvline(0.0, color=COLORS["eq"], ls="--", lw=1.5, alpha=0.7, label="neutral")
         ax.axhline(0.0, color="gray", lw=0.8, alpha=0.5)
 
         if len(vals) > 5:
@@ -462,10 +458,10 @@ def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
 
         plt.colorbar(sc, ax=ax, label="trade_accuracy")
         ax.legend(fontsize=8)
-        ax.set_xlabel("Expected/fair price agenta")
+        ax.set_xlabel("Sentiment agenta")
         ax.set_ylabel("Realized P&L epizodu")
         ax.set_title(f"D={d:.1f} | N={len(all_vals)} obs.")
-        ax.set_xlim(0.05, 0.95)
+        ax.set_xlim(-1.0, 1.0)
         ax.grid(True, alpha=0.3)
 
     _tight()
@@ -531,7 +527,7 @@ def plot_zi_validation(n_episodes: int = 150) -> None:
 # ===========================================================================
 
 def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
-    """Ktory agent wybiera jaka akcje — posortowane wg wyceny."""
+    """Ktory agent wybiera jaka akcje — posortowane wg sentimentu."""
     cfg = _cfg(n_agents=20)
     da  = DoubleAuction(cfg, seed=42)
     rng = np.random.default_rng(42)
@@ -546,7 +542,7 @@ def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
         da.reset(diversity_score=d, seed=ep_seed)
         agent_ids = list(da.population.agents.keys())
         if valuations is None:
-            valuations = [da.population.agents[aid].expected_price
+            valuations = [da.population.agents[aid].sentiment
                           for aid in agent_ids]
 
         zi = {aid: ZeroIntelligenceAgent(p, cfg.env)
@@ -588,17 +584,17 @@ def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
     ax1.set_xticks(range(n_actions))
     ax1.set_xticklabels(x_labels, fontsize=10)
     ax1.set_xlabel("Akcja")
-    ax1.set_ylabel("Agent (posortowany wg expected_price rosnaco)")
+    ax1.set_ylabel("Agent (posortowany wg sentimentu rosnaco)")
     ax1.set_title("Heatmapa akcji (znorm. per agent)")
     plt.colorbar(im, ax=ax1, label="Frakcja wyborow")
 
-    colors_v = [COLORS["buy"] if v > 0.5 else COLORS["sell"]
+    colors_v = [COLORS["buy"] if v > 0.0 else COLORS["sell"]
                 for v in sorted_vals]
     ax2.barh(range(len(sorted_vals)), sorted_vals, color=colors_v, alpha=0.8)
-    ax2.axvline(0.5, color=COLORS["eq"], ls="--", lw=2)
-    ax2.set_xlabel("Wycena agenta")
-    ax2.set_title("Wyceny (rosnaco)")
-    ax2.set_xlim(0.1, 0.9)
+    ax2.axvline(0.0, color=COLORS["eq"], ls="--", lw=2)
+    ax2.set_xlabel("Sentiment agenta")
+    ax2.set_title("Sentiment (rosnaco)")
+    ax2.set_xlim(-1.0, 1.0)
     ax2.grid(True, axis="x", alpha=0.3)
 
     _tight()
@@ -624,7 +620,7 @@ def plot_wealth_distribution() -> None:
                                        (1.0, D_COLORS[5])]):
         pop = AgentPopulation(
             n_agents=200, diversity_score=d,
-            diversity_cfg=cfg.diversity, belief_cfg=cfg.beliefs,
+            diversity_cfg=cfg.diversity, sentiment_cfg=cfg.sentiment,
             env_cfg=cfg.env, eq_price=0.5, seed=42,
         )
         wealth   = np.array([p.wealth       for p in pop.agents.values()])
@@ -655,19 +651,19 @@ def plot_wealth_distribution() -> None:
 
 
 # ===========================================================================
-# 09. Ewolucja cen i wycen przez kolejne epizody
+# 09. Ewolucja cen i sentimentu przez kolejne epizody
 # ===========================================================================
 
 def plot_price_valuation_evolution(n_episodes: int = 60,
                                    n_agents:   int = 20) -> None:
-    """Jak ref_price i wyceny ewoluuja przez wiele epizodow (cena nie resetuje sie)."""
+    """Jak ref_price i sentiment ewoluuja przez wiele epizodow."""
     cfg    = _cfg(n_agents=n_agents)
     D_SHOW = [0.3, 0.7, 1.0]
     D_COL3 = [COLORS["D0.2"], COLORS["D0.6"], COLORS["D1.0"]]
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 12))
     fig.suptitle(
-        "Ewolucja cen i wycen przez kolejne epizody CT\n"
+        "Ewolucja cen i sentimentu przez kolejne epizody CT\n"
         "(cena NIE resetuje sie miedzy epizodami — ciaglsc historii)",
         fontsize=13, fontweight="bold",
     )
@@ -677,7 +673,7 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
         da.reset(diversity_score=d, seed=42)
 
         agents_sorted = sorted(da.population.agents.items(),
-                               key=lambda x: x[1].expected_price)
+                               key=lambda x: x[1].sentiment)
         n = len(agents_sorted)
         tracked = {
             "HIGH":  agents_sorted[-1][0],
@@ -693,17 +689,17 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
         }
 
         ref_prices = [da.ref_price]
-        val_all    = [[p.expected_price for p in da.population.agents.values()]]
-        val_tracked = {k: [da.population.agents[v].expected_price]
+        val_all    = [[p.sentiment for p in da.population.agents.values()]]
+        val_tracked = {k: [da.population.agents[v].sentiment]
                        for k, v in tracked.items()}
         trades_per_ep = []
 
         for ep in range(n_episodes):
             m = _run_zi_episode(da, cfg)
             ref_prices.append(da.ref_price)
-            val_all.append([p.expected_price for p in da.population.agents.values()])
+            val_all.append([p.sentiment for p in da.population.agents.values()])
             for k, aid in tracked.items():
-                val_tracked[k].append(da.population.agents[aid].expected_price)
+                val_tracked[k].append(da.population.agents[aid].sentiment)
             trades_per_ep.append(m["n_trades"])
 
         rounds  = np.arange(len(ref_prices))
@@ -714,29 +710,27 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
         ax0.fill_between(rounds,
                          np.clip(val_mean - val_std, 0.05, 0.95),
                          np.clip(val_mean + val_std, 0.05, 0.95),
-                         alpha=0.15, color=color, label="±1sigma expected_price")
+                         alpha=0.15, color=color, label="±1sigma sentiment")
         ax0.plot(rounds, val_mean, color=color, lw=1.5, ls="--",
-                 alpha=0.7, label="Sredni expected_price")
+                 alpha=0.7, label="Sredni sentiment")
         ax0.plot(rounds, ref_prices, color=COLORS["eq"], lw=2.5,
                  label="ref_price")
         ax0.axhline(0.5, color="gray", ls=":", lw=1, alpha=0.5)
-        ax0.set_title(f"D={d:.1f} — Cena vs expected_price",
+        ax0.set_title(f"D={d:.1f} — Cena vs sentiment",
                       fontsize=11, color=color, fontweight="bold")
-        ax0.set_ylabel("Cena / expected_price")
-        ax0.set_ylim(0.1, 0.9)
+        ax0.set_ylabel("Cena / sentiment")
         ax0.legend(fontsize=7)
         ax0.grid(True, alpha=0.3)
 
         ax1 = axes[1, col]
         for k, vals in val_tracked.items():
-            base = da.population.agents[tracked[k]].long_run_fair_price
             ax1.plot(rounds, vals, color=track_colors[k], lw=1.8,
-                     label=f"{k} (base={base:.2f})")
+                     label=f"{k}")
         ax1.plot(rounds, ref_prices, color=COLORS["eq"], lw=1.5,
                  ls="--", alpha=0.5, label="ref_price")
-        ax1.set_ylabel("Expected price agenta")
-        ax1.set_ylim(0.1, 0.9)
-        ax1.set_title(f"D={d:.1f} — Expected price 5 agentow", fontsize=10)
+        ax1.set_ylabel("Sentiment agenta")
+        ax1.set_ylim(-1.0, 1.0)
+        ax1.set_title(f"D={d:.1f} — Sentiment 5 agentow", fontsize=10)
         ax1.legend(fontsize=7)
         ax1.grid(True, alpha=0.3)
         fv = {k: val_tracked[k][-1] for k in tracked}

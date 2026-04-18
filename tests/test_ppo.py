@@ -26,12 +26,12 @@ def make_cfg(**env_kwargs):
 
 
 def test_action_mask_blocks_boundary_actions():
-    obs = np.zeros(15, dtype=np.float32)
-    obs[5] = 1.0
+    obs = np.zeros(7, dtype=np.float32)
+    obs[1] = 1.0
     mask = action_mask_from_obs(obs)
     assert mask.tolist() == [True, False, True]
 
-    obs[5] = -1.0
+    obs[1] = -1.0
     mask = action_mask_from_obs(obs)
     assert mask.tolist() == [True, True, False]
 
@@ -45,7 +45,7 @@ def test_ppo_never_selects_masked_action_with_biased_logits():
         trainer.model.policy_head.bias[:] = torch.tensor([0.0, 100.0, 90.0])
 
     obs = np.zeros(cfg.env.n_obs, dtype=np.float32)
-    obs[5] = 1.0
+    obs[1] = 1.0
     for _ in range(100):
         action, _, _, _ = trainer.act_np(obs, "agent_0", deterministic=False)
         assert action != cfg.env.ACTION_BUY_MARKET
@@ -58,7 +58,7 @@ def test_ppo_checkpoint_roundtrip_preserves_deterministic_action(tmp_path):
     cfg = make_cfg(n_agents=2, episode_steps=2)
     trainer = SharedPPOTrainer(cfg.env.n_obs, cfg.env.n_actions, cfg.ppo, seed=2)
     obs = np.linspace(0, 1, cfg.env.n_obs, dtype=np.float32)
-    obs[5] = 0.0
+    obs[1] = 0.0
 
     action_before, _, _, _ = trainer.act_np(obs, "agent_0", deterministic=True)
     path = tmp_path / "ppo.pt"

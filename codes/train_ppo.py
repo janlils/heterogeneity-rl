@@ -9,6 +9,7 @@ Uruchomienie:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import os
 import sys
@@ -148,12 +149,15 @@ def run_training(
     da = DoubleAuction(cfg, seed=seed)
     da.reset(diversity_score=diversity_score, seed=seed)
     agent_ids = list(da.population.agents.keys())
+    mean_gamma_pop = float(np.mean([da.population.agents[aid].gamma for aid in agent_ids]))
+    ppo_cfg = dataclasses.replace(cfg.ppo, gamma=mean_gamma_pop)
+    cfg.ppo = ppo_cfg
 
-    obs_dim = cfg.env.n_obs + (len(agent_ids) if cfg.ppo.use_agent_id_features else 0)
+    obs_dim = cfg.env.n_obs + (len(agent_ids) if ppo_cfg.use_agent_id_features else 0)
     trainer = SharedPPOTrainer(
         obs_dim=obs_dim,
         n_actions=cfg.env.n_actions,
-        cfg=cfg.ppo,
+        cfg=ppo_cfg,
         seed=seed,
         agent_ids=agent_ids,
     )

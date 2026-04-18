@@ -135,7 +135,7 @@ class DeepSARSAAgent:
     On-policy SARSA z numpy MLP + Adam.
 
     Maskowanie akcji (CT — Continuous Trading):
-      obs[5]  = position_norm ∈ [-1,+1]
+      obs[1]  = position_norm ∈ [-1,+1]
       can_buy  = position_norm < 0.99   (nie max long)
       can_sell = position_norm > -0.99  (nie max short, symetrycznie)
     """
@@ -163,8 +163,8 @@ class DeepSARSAAgent:
         self.total_updates:      int         = 0
 
     def _mask(self, obs: np.ndarray) -> Tuple[bool, bool]:
-        # obs[5] = position_norm = position / max_position ∈ [-1, +1]
-        pos_norm = float(obs[5])
+        # obs[1] = position_norm = position / max_position ∈ [-1, +1]
+        pos_norm = float(obs[1])
         can_buy  = pos_norm < 0.99   # nie na maksimum long
         can_sell = pos_norm > -0.99  # nie na maksimum short
         return can_buy, can_sell

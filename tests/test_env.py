@@ -97,7 +97,7 @@ def test_terminal_liquidation_closes_positions():
 
 
 def test_risk_aversion_affects_reward():
-    cfg = make_cfg(n_agents=2, episode_steps=5, alignment_scale=0.0, risk_penalty_kappa=0.01)
+    cfg = make_cfg(n_agents=2, episode_steps=5, risk_penalty_kappa=0.01)
     da = DoubleAuction(cfg, seed=5)
     da.reset(diversity_score=0.0, seed=5)
     aid0, aid1 = list(da.population.agents)[:2]
@@ -111,7 +111,7 @@ def test_risk_aversion_affects_reward():
     assert rewards[aid1] < rewards[aid0]
 
 
-def test_observation_shape_and_expected_price_semantics():
+def test_observation_shape_and_sentiment_semantics():
     cfg = make_cfg(n_agents=3, episode_steps=5)
     da = DoubleAuction(cfg, seed=6)
     obs = da.reset(diversity_score=0.5, seed=6)
@@ -119,8 +119,8 @@ def test_observation_shape_and_expected_price_semantics():
     agent = da.population.agents[aid]
 
     assert obs[aid].shape == (cfg.env.n_obs,)
-    assert np.isclose(obs[aid][0], agent.expected_price)
-    assert np.isclose(obs[aid][10], agent.long_run_fair_price)
+    assert np.isclose(obs[aid][0], agent.sentiment)
+    assert np.isclose(obs[aid][6], agent.gamma)
 
 
 def test_zi_baseline_runs_with_same_action_interface():

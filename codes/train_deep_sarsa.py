@@ -85,9 +85,7 @@ EPISODE_STEPS    = 200                            # długość epizodu CT
 # Warunek rynkowy: stable / random_eq / drifting
 MARKET = MarketDynamics.random_eq()
 
-# Algorytmiczne gamma dla TD target — stałe dla wszystkich sieci SARSA.
-# Gamma behawioralne agenta pozostaje w obs[8] i sieć może się go nauczyć.
-SARSA_ALGO_GAMMA = 0.95
+# SARSA_ALGO_GAMMA usunięty — każdy agent używa własnej gamma z populacji
 
 # Hiperparametry sieci
 SARSA_CFG = DeepSARSAConfig(
@@ -197,15 +195,17 @@ def run_training(
     da.reset(diversity_score=diversity_score, seed=seed)
 
     agent_ids    = list(da.population.agents.keys())
-    agent_gammas = np.full(len(agent_ids), SARSA_ALGO_GAMMA)
+    agent_gammas = np.array(
+        [da.population.agents[aid].gamma for aid in agent_ids],
+        dtype=np.float64,
+    )
 
-    pop_gammas = [da.population.agents[a].gamma for a in agent_ids]
+    sentiments = [da.population.agents[a].sentiment for a in agent_ids]
+    gammas_pop = [da.population.agents[a].gamma for a in agent_ids]
     log.info(
         f"  Populacja | N={len(agent_ids)} | "
-        f"expected=[{min(da.population.agents[a].expected_price for a in agent_ids):.2f}, "
-        f"{max(da.population.agents[a].expected_price for a in agent_ids):.2f}] | "
-        f"gamma_behaw=[{min(pop_gammas):.2f}, {max(pop_gammas):.2f}] | "
-        f"gamma_algo={SARSA_ALGO_GAMMA}"
+        f"sentiment=[{min(sentiments):.2f}, {max(sentiments):.2f}] | "
+        f"gamma=[{min(gammas_pop):.2f}, {max(gammas_pop):.2f}] mean={np.mean(gammas_pop):.3f}"
     )
 
     sarsa = DeepSARSAMultiAgent(
@@ -217,10 +217,12 @@ def run_training(
     # Parametry populacji — stałe przez cały run, zapisywane do każdego rekordu
     _ap = da.population.agents
     pop_meta = {
-        "pop_mean_expected_price":float(np.mean([_ap[a].expected_price for a in agent_ids])),
-        "pop_std_expected_price": float(np.std( [_ap[a].expected_price for a in agent_ids])),
+        "pop_mean_sentiment":     float(np.mean([_ap[a].sentiment     for a in agent_ids])),
+        "pop_std_sentiment":      float(np.std( [_ap[a].sentiment     for a in agent_ids])),
         "pop_mean_gamma":         float(np.mean([_ap[a].gamma         for a in agent_ids])),
         "pop_std_gamma":          float(np.std( [_ap[a].gamma         for a in agent_ids])),
+        "pop_mean_alpha":         float(np.mean([_ap[a].alpha_i       for a in agent_ids])),
+        "pop_mean_beta":          float(np.mean([_ap[a].beta_i        for a in agent_ids])),
         "pop_mean_risk_aversion": float(np.mean([_ap[a].risk_aversion for a in agent_ids])),
         "pop_mean_threshold":     float(np.mean([_ap[a].threshold     for a in agent_ids])),
         "pop_mean_max_position":  float(np.mean([_ap[a].max_position  for a in agent_ids])),
