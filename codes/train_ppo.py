@@ -9,17 +9,23 @@ Uruchomienie:
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import logging
 import os
 import sys
 import time
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".matplotlib_cache"))
 os.environ.setdefault("XDG_CACHE_HOME", str(PROJECT_ROOT / ".cache"))
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 (PROJECT_ROOT / ".matplotlib_cache").mkdir(exist_ok=True)
 (PROJECT_ROOT / ".cache").mkdir(exist_ok=True)
 
@@ -53,13 +59,13 @@ log = logging.getLogger("htm.train_ppo")
 DIVERSITY_SCORES = [0.0, 0.3, 0.5, 0.7, 1.0]
 N_AGENTS = 20
 N_EPISODES = 500
-N_SEEDS = 3
-EPISODE_STEPS = 200
+N_SEEDS = 10
+EPISODE_STEPS = 500
 ZI_EPISODES = 30
 EVAL_EPISODES = 30
 LOG_EVERY = 25
 ROLLING_WINDOW = 30
-MARKET = MarketDynamics.random_eq()
+MARKET = MarketDynamics.drifting()
 PPO_CFG = PPOConfig()
 
 
@@ -72,9 +78,9 @@ def build_run_settings(quick: bool, args) -> dict:
             rollout_episodes=5,
             use_agent_id_features=args.agent_id_features,
         )
-        return {
+        settings = {
             "run_name": "quick",
-            "diversity_scores": [0.0, 0.3, 0.5, 0.7, 0.9, 1.0],
+            "diversity_scores": [0.0, 0.3, 0.7, 1.0],
             "n_agents": 20,
             "n_episodes": 50,
             "episode_steps": 150,
@@ -83,25 +89,36 @@ def build_run_settings(quick: bool, args) -> dict:
             "eval_episodes": 50,
             "log_every": 1,
             "rolling_window": 2,
-            "market": MarketDynamics.random_eq(),
+            "n_workers": 1,
+            "market": MarketDynamics.drifting(),
+            "ppo_cfg": ppo_cfg,
+        }
+    else:
+        ppo_cfg = PPOConfig(use_agent_id_features=args.agent_id_features)
+        settings = {
+            "run_name": "full",
+            "diversity_scores": DIVERSITY_SCORES,
+            "n_agents": N_AGENTS,
+            "n_episodes": N_EPISODES,
+            "episode_steps": EPISODE_STEPS,
+            "n_seeds": N_SEEDS,
+            "zi_episodes": ZI_EPISODES,
+            "eval_episodes": EVAL_EPISODES,
+            "log_every": LOG_EVERY,
+            "rolling_window": ROLLING_WINDOW,
+            "n_workers": cpu_count(),
+            "market": MARKET,
             "ppo_cfg": ppo_cfg,
         }
 
-    ppo_cfg = PPOConfig(use_agent_id_features=args.agent_id_features)
-    return {
-        "run_name": "full",
-        "diversity_scores": DIVERSITY_SCORES,
-        "n_agents": N_AGENTS,
-        "n_episodes": N_EPISODES,
-        "episode_steps": EPISODE_STEPS,
-        "n_seeds": N_SEEDS,
-        "zi_episodes": ZI_EPISODES,
-        "eval_episodes": EVAL_EPISODES,
-        "log_every": LOG_EVERY,
-        "rolling_window": ROLLING_WINDOW,
-        "market": MARKET,
-        "ppo_cfg": ppo_cfg,
-    }
+    if args.workers is not None:
+        settings["n_workers"] = args.workers
+
+    max_workers = settings["n_seeds"] * len(settings["diversity_scores"])
+    settings["n_workers"] = max(1, min(settings["n_workers"], max_workers))
+    settings["log_every"] = max(1, min(settings["log_every"], settings["n_episodes"]))
+    settings["rolling_window"] = max(1, min(settings["rolling_window"], settings["n_episodes"]))
+    return settings
 
 
 def make_cfg(settings: dict) -> HTMConfig:
@@ -257,18 +274,18 @@ def evaluate_trained_ppo(
     """
     eval_records: List[dict] = []
     agent_ids = list(da.population.agents.keys())
-    eval_rng = np.random.default_rng(seed + 70_000)
-
     for episode in range(n_eval_episodes):
         da.reset_episode()
 
         while not da.done:
-            for aid in eval_rng.permutation(agent_ids):
+            actions = {}
+            for aid in agent_ids:
                 obs = da.get_observation(aid)
                 action, _, _, mask = trainer.act_np(obs, aid, deterministic=deterministic)
                 if not mask[action]:
                     raise RuntimeError(f"PPO eval selected illegal action {action} for {aid}")
-                da.execute_single_action(aid, action)
+                actions[aid] = action
+            da.execute_parallel_actions(actions)
             da.compute_step_rewards()
 
         m = da.episode_metrics()
@@ -322,6 +339,7 @@ def plot_learning_curves(
     axes[0].set_title("PPO trade_accuracy")
     axes[0].set_xlabel("Epizod")
     axes[0].set_ylabel("trade_accuracy")
+    axes[0].set_ylim(0.0, 1.0)
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(fontsize=8)
 
@@ -408,6 +426,45 @@ def log_final_summary(
             )
 
 
+def _train_worker(args: tuple) -> tuple[List[dict], List[dict], Path]:
+    """
+    Jeden niezależny trening PPO dla kombinacji (D, seed).
+
+    Funkcja jest na poziomie modułu, żeby multiprocessing mógł ją picklować.
+    """
+    (
+        diversity_score,
+        seed,
+        cfg,
+        zi_baseline_trade_accuracy,
+        zi_baseline_positive_pnl_frac,
+        n_episodes,
+        checkpoint_dir,
+        log_every,
+    ) = args
+
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    cfg = copy.deepcopy(cfg)
+    train_records, eval_records, _, checkpoint_path = run_training(
+        diversity_score=diversity_score,
+        n_episodes=n_episodes,
+        seed=seed,
+        cfg=cfg,
+        zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
+        zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+        checkpoint_dir=checkpoint_dir,
+        log_every=log_every,
+    )
+    return train_records, eval_records, checkpoint_path
+
+
 def main(argv: List[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="Szybki smoke test PPO")
@@ -415,6 +472,11 @@ def main(argv: List[str] | None = None) -> None:
         "--agent-id-features",
         action="store_true",
         help="Doklej one-hot agent_id do obserwacji PPO",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Liczba równoległych procesów dla niezależnych zadań (D, seed).",
     )
     args = parser.parse_args(argv)
 
@@ -427,6 +489,7 @@ def main(argv: List[str] | None = None) -> None:
     log.info(
         f"{run_name} | N={cfg.env.n_agents} | D={settings['diversity_scores']} | "
         f"ep={settings['n_episodes']} | steps={cfg.env.episode_steps} | "
+        f"seeds={settings['n_seeds']} | workers={settings['n_workers']} | "
         f"agent_id_features={cfg.ppo.use_agent_id_features}"
     )
     log.info("=" * 70)
@@ -447,25 +510,59 @@ def main(argv: List[str] | None = None) -> None:
     checkpoints: List[Path] = []
     t0 = time.time()
 
-    for d in settings["diversity_scores"]:
-        for seed in range(settings["n_seeds"]):
-            train_records, eval_records, _, ckpt = run_training(
-                diversity_score=d,
-                n_episodes=settings["n_episodes"],
-                seed=seed,
-                cfg=cfg,
-                zi_baseline_trade_accuracy=zi_acc[d],
-                zi_baseline_positive_pnl_frac=zi_pos[d],
-                checkpoint_dir=checkpoint_dir,
-                log_every=settings["log_every"],
-            )
+    tasks = [
+        (
+            d,
+            seed,
+            cfg,
+            zi_acc[d],
+            zi_pos[d],
+            settings["n_episodes"],
+            checkpoint_dir,
+            settings["log_every"],
+        )
+        for d in settings["diversity_scores"]
+        for seed in range(settings["n_seeds"])
+    ]
+    log.info(
+        f"Start PPO: {len(tasks)} zadań "
+        f"({len(settings['diversity_scores'])} D × {settings['n_seeds']} seeds)"
+    )
+
+    if settings["n_workers"] == 1:
+        iterator = map(_train_worker, tasks)
+        pool = None
+    else:
+        pool = Pool(processes=settings["n_workers"])
+        iterator = pool.imap_unordered(_train_worker, tasks)
+
+    try:
+        for i, worker_result in enumerate(iterator, start=1):
+            train_records, eval_records, ckpt = worker_result
             all_records.extend(train_records)
             all_eval_records.extend(eval_records)
             checkpoints.append(ckpt)
-            log.info(
-                f"  Zakończono D={d:.1f} seed={seed} | "
-                f"train={len(all_records)} eval={len(all_eval_records)} ckpt={ckpt.name}"
+
+            pd.DataFrame(all_records).to_csv(
+                results_dir / f"{run_name}_results_partial.csv",
+                index=False,
             )
+            pd.DataFrame(all_eval_records).to_csv(
+                results_dir / f"{run_name}_eval_results_partial.csv",
+                index=False,
+            )
+
+            d_done = train_records[0]["diversity_score"] if train_records else "?"
+            seed_done = train_records[0]["seed"] if train_records else "?"
+            log.info(
+                f"  Zakończono D={d_done} seed={seed_done} "
+                f"({i}/{len(tasks)}) | train={len(all_records)} "
+                f"eval={len(all_eval_records)} ckpt={ckpt.name}"
+            )
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     train_csv = results_dir / f"{run_name}_results.csv"
     eval_csv = results_dir / f"{run_name}_eval_results.csv"

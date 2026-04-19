@@ -59,6 +59,27 @@ def test_position_limits_block_extra_actions():
     assert da.population.agents[aid].position == 1
 
 
+def test_parallel_actions_execute_at_same_price_and_move_once():
+    cfg = make_cfg(n_agents=4, episode_steps=5, half_spread=0.0, perm_impact=0.01)
+    da = DoubleAuction(cfg, seed=8)
+    da.reset(diversity_score=0.5, seed=8)
+    agent_ids = list(da.population.agents)
+    p0 = da.ref_price
+
+    da.execute_parallel_actions({
+        agent_ids[0]: cfg.env.ACTION_BUY_MARKET,
+        agent_ids[1]: cfg.env.ACTION_BUY_MARKET,
+        agent_ids[2]: cfg.env.ACTION_SELL_MARKET,
+        agent_ids[3]: cfg.env.ACTION_HOLD,
+    })
+
+    assert da.population.agents[agent_ids[0]].entry_price == p0
+    assert da.population.agents[agent_ids[1]].entry_price == p0
+    assert da.population.agents[agent_ids[2]].entry_price == p0
+    assert da.ref_price == np.clip(p0 + cfg.env.perm_impact, cfg.env.p_min, cfg.env.p_max)
+    assert da.episode_metrics()["n_trades"] == 3
+
+
 def test_realized_pnl_uses_entry_and_exit_prices_only():
     cfg = make_cfg(n_agents=2, episode_steps=5, half_spread=0.0, temp_impact=0.0, perm_impact=0.01)
     da = DoubleAuction(cfg, seed=3)
@@ -75,6 +96,22 @@ def test_realized_pnl_uses_entry_and_exit_prices_only():
     assert np.isclose(agent.realized_pnl, expected_realized)
     assert np.isclose(agent.realized_pnl, da._episode_pnl[aid])
     assert rewards[aid] != 0.0
+
+
+def test_mid_episode_reward_has_no_risk_or_holding_penalty():
+    cfg = make_cfg(n_agents=2, episode_steps=5)
+    da = DoubleAuction(cfg, seed=5)
+    da.reset(diversity_score=0.0, seed=5)
+    aid0, aid1 = list(da.population.agents)[:2]
+    da.population.agents[aid0].risk_aversion = 0.1
+    da.population.agents[aid1].risk_aversion = 3.0
+
+    da.execute_single_action(aid0, cfg.env.ACTION_BUY_MARKET)
+    da.execute_single_action(aid1, cfg.env.ACTION_BUY_MARKET)
+    rewards, _ = da.compute_step_rewards()
+
+    assert rewards[aid0] == 0.0
+    assert rewards[aid1] == 0.0
 
 
 def test_terminal_liquidation_closes_positions():
@@ -96,21 +133,6 @@ def test_terminal_liquidation_closes_positions():
     assert "mean_total_pnl" in m
 
 
-def test_risk_aversion_affects_reward():
-    cfg = make_cfg(n_agents=2, episode_steps=5, risk_penalty_kappa=0.01)
-    da = DoubleAuction(cfg, seed=5)
-    da.reset(diversity_score=0.0, seed=5)
-    aid0, aid1 = list(da.population.agents)[:2]
-    da.population.agents[aid0].risk_aversion = 0.1
-    da.population.agents[aid1].risk_aversion = 3.0
-
-    da.execute_single_action(aid0, cfg.env.ACTION_BUY_MARKET)
-    da.execute_single_action(aid1, cfg.env.ACTION_BUY_MARKET)
-    rewards, _ = da.compute_step_rewards()
-
-    assert rewards[aid1] < rewards[aid0]
-
-
 def test_observation_shape_and_sentiment_semantics():
     cfg = make_cfg(n_agents=3, episode_steps=5)
     da = DoubleAuction(cfg, seed=6)
@@ -120,7 +142,7 @@ def test_observation_shape_and_sentiment_semantics():
 
     assert obs[aid].shape == (cfg.env.n_obs,)
     assert np.isclose(obs[aid][0], agent.sentiment)
-    assert np.isclose(obs[aid][6], agent.gamma)
+    assert np.isclose(obs[aid][4], agent.gamma)
 
 
 def test_zi_baseline_runs_with_same_action_interface():

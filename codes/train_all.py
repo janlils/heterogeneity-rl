@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agents", type=int, help="Override agentów dla SARSA.")
     parser.add_argument("--zi-episodes", type=int, help="Override epizodów ZI baseline dla SARSA.")
     parser.add_argument("--eval-episodes", type=int, help="Override epizodów eval dla SARSA.")
-    parser.add_argument("--workers", type=int, help="Override workerów dla SARSA.")
+    parser.add_argument("--workers", type=int, help="Override workerów dla SARSA i PPO.")
     parser.add_argument(
         "--agent-id-features",
         action="store_true",
@@ -69,6 +69,7 @@ def build_ppo_cmd(args: argparse.Namespace) -> List[str]:
         cmd.append("--quick")
     if args.agent_id_features:
         cmd.append("--agent-id-features")
+    _add_optional(cmd, "--workers", args.workers)
     return cmd
 
 

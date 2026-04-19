@@ -72,18 +72,18 @@ log = logging.getLogger("htm.train")
 
 DIVERSITY_SCORES = [0.0, 0.3, 0.5, 0.7, 1.0]   # wartości D do przetestowania
 N_AGENTS         = 20                             # liczba agentów
-N_EPISODES       = 500                            # epizodów CT (każdy = 200 kroków)
-# N_ROUNDS usunięty — CT nie ma rund, epizod = T=200 kroków
-N_SEEDS          = 3                              # powtórzeń (dla std)
+N_EPISODES       = 500                            # epizodów CT (każdy = EPISODE_STEPS kroków)
+# N_ROUNDS usunięty — CT nie ma rund, epizod = T kroków
+N_SEEDS          = 10                             # powtórzeń (dla std)
 N_WORKERS        = min(cpu_count(), N_SEEDS * len([0.0, 0.3, 0.5, 0.7, 1.0]))
                                                   # równoległe procesy (auto: liczba corów)
 LOG_EVERY        = 25                             # loguj co ile epizodów
 ROLLING_WINDOW   = 30                             # okno wygładzania krzywych
 ZI_EPISODES      = 30                             # epizodów do policzenia ZI baseline (populacja nie resetuje się co ep)
-EPISODE_STEPS    = 200                            # długość epizodu CT
+EPISODE_STEPS    = 500                            # długość epizodu CT
 
 # Warunek rynkowy: stable / random_eq / drifting
-MARKET = MarketDynamics.random_eq()
+MARKET = MarketDynamics.drifting()
 
 # SARSA_ALGO_GAMMA usunięty — każdy agent używa własnej gamma z populacji
 
@@ -188,7 +188,8 @@ def run_training(
     """
     Trenuje Deep SARSA — Continuous Trading.
 
-    Jeden epizod = T=200 kroków (wszyscy agenci aktywni przez cały czas).
+    Jeden epizod = T kroków z cfg.env.episode_steps
+    (wszyscy agenci aktywni przez cały czas).
     Między epizodami: portfele resetowane, wyceny dryfują (pamięć rynku).
     Gamma jest istotna w każdym kroku (done=True dopiero po T krokach).
     """
@@ -232,8 +233,6 @@ def run_training(
     records  = []
     t_start  = time.time()
 
-    step_rng = np.random.default_rng(seed + 1000)
-
     n_step = sarsa_cfg.n_step
     traj_buffers: Dict[str, deque] = {aid: deque() for aid in agent_ids}
 
@@ -246,18 +245,16 @@ def run_training(
             traj_buffers[aid].clear()
 
         while not da.done:
-            # Sekwencyjne wykonanie — losowa kolejność agentów per krok
-            # Każdy agent obserwuje rynek ZAKTUALIZOWANY przez poprzedników
-            agent_order = step_rng.permutation(agent_ids)
+            # Parallel execution: wszyscy obserwują ten sam P_t.
             obs_at_action: Dict[str, np.ndarray] = {}
             actions_taken: Dict[str, int]        = {}
 
-            for aid in agent_order:
-                obs = da.get_observation(aid)          # aktualny stan rynku
+            for aid in agent_ids:
+                obs = da.get_observation(aid)
                 obs_at_action[aid] = obs
-                action = sarsa.agents[aid].act(obs, explore=True)
-                actions_taken[aid] = action
-                da.execute_single_action(aid, action)  # natychmiastowe wykonanie
+                actions_taken[aid] = sarsa.agents[aid].act(obs, explore=True)
+
+            da.execute_parallel_actions(actions_taken)
 
             # Nagrody na końcu kroku (po wszystkich agentach)
             rewards, dones = da.compute_step_rewards()
@@ -363,20 +360,19 @@ def evaluate_trained_sarsa(
 ) -> List[dict]:
     """
     Ewaluacja wytrenowanej polityki z końcowym epsilonem i bez update'ów sieci.
-    Używa tego samego sekwencyjnego protokołu kroku co trening.
+    Używa tego samego równoległego protokołu kroku co trening.
     """
     eval_records: List[dict] = []
     agent_ids = list(da.population.agents.keys())
-    eval_rng = np.random.default_rng(seed + 50_000)
-
     for episode in range(n_eval_episodes):
         da.reset_episode()
 
         while not da.done:
-            for aid in eval_rng.permutation(agent_ids):
-                obs = da.get_observation(aid)
-                action = sarsa.agents[aid].act(obs, explore=True)
-                da.execute_single_action(aid, action)
+            actions = {
+                aid: sarsa.agents[aid].act(da.get_observation(aid), explore=True)
+                for aid in agent_ids
+            }
+            da.execute_parallel_actions(actions)
             da.compute_step_rewards()
 
         m = da.episode_metrics()
@@ -472,7 +468,7 @@ def plot_learning_curves(
         ax.set_title(f"D = {d:.1f}", fontsize=11, color=color, fontweight="bold")
         ax.set_xlabel("Epizod")
         ax.set_ylabel("Trade Accuracy")
-        ax.set_ylim(-0.05, 1.1)
+        ax.set_ylim(0.0, 1.0)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
@@ -553,15 +549,15 @@ def plot_final_comparison(
     for i, (sm, zm) in enumerate(zip(sarsa_means, zi_means)):
         delta = sm - zm
         c     = "#2E7D32" if delta > 0 else "#C62828"
-        ax.text(i - w/2, sm + 0.02, f"{sm:.3f}", ha="center", fontsize=7.5)
-        ax.text(i,       max(sm, zm) + 0.06,
+        ax.text(i - w/2, min(sm + 0.02, 0.98), f"{sm:.3f}", ha="center", fontsize=7.5)
+        ax.text(i,       min(max(sm, zm) + 0.06, 0.98),
                 f"Δ={delta:+.2f}", ha="center", fontsize=7.5, color=c, fontweight="bold")
 
     ax.set_xticks(x)
     ax.set_xticklabels([f"D={d}" for d in d_vals], rotation=30)
     ax.set_ylabel("Trade Accuracy")
     ax.set_title("Metryka główna vs empiryczny ZI")
-    ax.set_ylim(0, 1.2)
+    ax.set_ylim(0.0, 1.0)
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
 
@@ -680,7 +676,7 @@ def build_run_settings(args: argparse.Namespace) -> dict:
             "eval_episodes": 50,
             "log_every": 10,
             "rolling_window": 5,
-            "n_workers": 1,
+            "n_workers": 4,
             "sarsa_cfg": DeepSARSAConfig(
                 hidden_size   = 32,
                 lr            = 1e-3,

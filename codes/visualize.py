@@ -2,7 +2,7 @@
 codes/visualize.py — Wykresy diagnostyczne HTM (model spekulacyjny CT)
 =========================================================================
 Wersja zsynchronizowana z aktualnym API:
-  - Sekwencyjne wykonanie: execute_single_action + compute_step_rewards
+  - Równoległe wykonanie: execute_parallel_actions + compute_step_rewards
   - Realized PnL jako główny składnik rewardu
   - trade_accuracy jako glowna metryka, porownywana z empirycznym ZI
   - 3 akcje: HOLD/BUY/SELL
@@ -90,19 +90,19 @@ def _cfg(n_agents: int = 20) -> HTMConfig:
 
 
 def _run_zi_episode(da: DoubleAuction, cfg: HTMConfig) -> dict:
-    """Jeden epizod ZI w CT (sekwencyjne wykonanie). Zwraca episode_metrics()."""
+    """Jeden epizod ZI w CT (równoległe wykonanie). Zwraca episode_metrics()."""
     agent_ids = list(da.population.agents.keys())
     zi = {aid: ZeroIntelligenceAgent(p, cfg.env)
           for aid, p in da.population.agents.items()}
-    rng = np.random.default_rng(42)
-    obs_dict = da.reset_episode()
+    da.reset_episode()
     for _ in range(cfg.env.episode_steps):
         if da.done:
             break
-        order = rng.permutation(agent_ids)
-        for aid in order:
-            obs = da.get_observation(aid)
-            da.execute_single_action(aid, zi[aid].act(obs))
+        actions = {
+            aid: zi[aid].act(da.get_observation(aid))
+            for aid in agent_ids
+        }
+        da.execute_parallel_actions(actions)
         _, dones = da.compute_step_rewards()
         if dones.get(agent_ids[0], False):
             break
@@ -371,7 +371,6 @@ def plot_price_dynamics(diversity_scores: List[float] = None) -> None:
         zi = {aid: ZeroIntelligenceAgent(p, cfg.env)
               for aid, p in da.population.agents.items()}
         agent_ids = list(da.population.agents.keys())
-        rng = np.random.default_rng(0)
         da.reset_episode()
 
         prices, trade_steps = [], []
@@ -380,10 +379,11 @@ def plot_price_dynamics(diversity_scores: List[float] = None) -> None:
                 break
             prices.append(da.ref_price)
             prev_n = da.episode_metrics()["n_trades"]
-            order = rng.permutation(agent_ids)
-            for aid in order:
-                obs = da.get_observation(aid)
-                da.execute_single_action(aid, zi[aid].act(obs))
+            actions = {
+                aid: zi[aid].act(da.get_observation(aid))
+                for aid in agent_ids
+            }
+            da.execute_parallel_actions(actions)
             _, dones = da.compute_step_rewards()
             if da.episode_metrics()["n_trades"] > prev_n:
                 trade_steps.append(step)
@@ -515,7 +515,7 @@ def plot_zi_validation(n_episodes: int = 150) -> None:
         ax.grid(True, alpha=0.3)
         if key == "trade_accuracy":
             ax.axhline(0.5, color="gray", ls="--", lw=1.5, label="neutral reference")
-            ax.set_ylim(0.35, 0.65)
+            ax.set_ylim(0.0, 1.0)
             ax.legend(fontsize=8)
 
     _tight()
@@ -552,14 +552,15 @@ def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
         for _ in range(cfg.env.episode_steps):
             if da.done:
                 break
-            order = rng.permutation(agent_ids)
-            for aid in order:
+            actions = {}
+            for aid in agent_ids:
                 obs    = da.get_observation(aid)
                 action = zi[aid].act(obs)
                 i      = agent_ids.index(aid)
                 if i < n_ag:
                     action_matrix[i, action] += 1
-                da.execute_single_action(aid, action)
+                actions[aid] = action
+            da.execute_parallel_actions(actions)
             _, dones = da.compute_step_rewards()
             if dones.get(agent_ids[0], False):
                 break
@@ -792,10 +793,11 @@ def plot_position_evolution(diversity_scores: List[float] = None,
             positions = [da.population.agents[a].position for a in agent_ids]
             mean_pos.append(float(np.mean(positions)))
 
-            order = rng.permutation(agent_ids)
-            for aid in order:
-                obs = da.get_observation(aid)
-                da.execute_single_action(aid, zi[aid].act(obs))
+            actions = {
+                aid: zi[aid].act(da.get_observation(aid))
+                for aid in agent_ids
+            }
+            da.execute_parallel_actions(actions)
             rewards, dones = da.compute_step_rewards()
 
             for aid in agent_ids:
@@ -963,12 +965,11 @@ def plot_trading_activity(diversity_scores: List[float] = None,
             if da.done:
                 break
             step_actions = {}
-            order = rng.permutation(agent_ids)
-            for aid in order:
+            for aid in agent_ids:
                 obs    = da.get_observation(aid)
                 action = zi[aid].act(obs)
                 step_actions[aid] = action
-                da.execute_single_action(aid, action)
+            da.execute_parallel_actions(step_actions)
             _, dones = da.compute_step_rewards()
 
             for a_idx in range(3):
@@ -1214,7 +1215,7 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
         ax_top.set_xlabel("Epizod")
         if i == 0:
             ax_top.set_ylabel("trade_accuracy")
-        ax_top.set_ylim(0.2, 0.8)
+        ax_top.set_ylim(0.0, 1.0)
         ax_top.legend(fontsize=8)
         ax_top.grid(True, alpha=0.3)
 
@@ -1253,7 +1254,7 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
         zi_level = zi_by_d.get(d_vals[xi])
         delta = sv - zi_level if zi_level is not None else float("nan")
         c_d   = "#2E7D32" if delta > 0 else "#C62828"
-        ax_bar.text(xi, sv + 0.01,
+        ax_bar.text(xi, min(sv + 0.02, 0.98),
                     f"{sv:.3f}  d={delta:+.3f}" if zi_level is not None else f"{sv:.3f}",
                     ha="center", fontsize=7, color=c_d, fontweight="bold")
 
@@ -1261,7 +1262,7 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
     ax_bar.set_xticklabels([f"D={d:.1f}" for d in d_vals], rotation=30)
     ax_bar.set_ylabel("trade_accuracy (ostatnie 30 ep)")
     ax_bar.set_title("Wynik koncowy vs empiryczny ZI", fontsize=10)
-    ax_bar.set_ylim(0.2, 0.8)
+    ax_bar.set_ylim(0.0, 1.0)
     ax_bar.legend(fontsize=9)
     ax_bar.grid(True, axis="y", alpha=0.3)
 
@@ -1347,7 +1348,7 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
 
         ax.set_title(f"D = {d:.1f}", fontsize=12, color=color, fontweight="bold")
         ax.set_xlabel("Epizod")
-        ax.set_ylim(0.25, 0.75)
+        ax.set_ylim(0.0, 1.0)
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 

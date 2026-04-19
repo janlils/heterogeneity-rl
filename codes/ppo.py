@@ -2,8 +2,8 @@
 Shared-policy PPO dla HTM.
 
 Jedna sieć actor-critic obsługuje wszystkich agentów. Rollout używa tego
-samego sekwencyjnego protokołu co Deep SARSA:
-get_observation -> execute_single_action -> compute_step_rewards.
+samego równoległego protokołu co Deep SARSA:
+get_observation -> execute_parallel_actions -> compute_step_rewards.
 """
 
 from __future__ import annotations
@@ -240,7 +240,8 @@ class SharedPPOTrainer:
                 values = {}
                 masks = {}
 
-                for aid in rng.permutation(agent_ids):
+                # Parallel: wszyscy obserwują ten sam P_t przed egzekucją.
+                for aid in agent_ids:
                     obs = da.get_observation(aid)
                     action, logprob, value, mask = self.act_np(
                         obs, aid, deterministic=deterministic
@@ -252,8 +253,8 @@ class SharedPPOTrainer:
                     logprobs[aid] = logprob
                     values[aid] = value
                     masks[aid] = mask
-                    da.execute_single_action(aid, action)
 
+                da.execute_parallel_actions(actions_taken)
                 rewards, dones = da.compute_step_rewards()
 
                 for aid in agent_ids:

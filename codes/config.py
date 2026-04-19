@@ -61,7 +61,7 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 10  # [sentiment, pos_norm, unrealized, time_rem, risk_av, threshold,
+        return 8   # [sentiment, pos_norm, unrealized, time_rem,
                    #  gamma, price_vs_start, trend_short, value_gap]
 
     def action_name(self, idx: int) -> str:
@@ -113,7 +113,7 @@ class SentimentConfig:
     sigma_intra:             float = 0.003   # dryft V_t per krok (wewnątrz epizodu)
     sigma_macro:             float = 0.015   # skok V_t między epizodami
     p_info:                  float = 0.04    # prawdopodobieństwo sygnału info per krok
-    sigma_news:              float = 0.15    # szum prywatnej interpretacji newsa
+    sigma_news:              float = 0.04    # szum prywatnej interpretacji newsa
     sigma_P:                 float = 0.003   # normalizacja zmiany ceny do tanh
 
     # Centra parametrów behawioralnych (przy D=0 wszyscy mają te wartości)

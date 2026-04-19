@@ -26,7 +26,8 @@ def make_cfg(**env_kwargs):
 
 
 def test_action_mask_blocks_boundary_actions():
-    obs = np.zeros(7, dtype=np.float32)
+    cfg = make_cfg(n_agents=2, episode_steps=2)
+    obs = np.zeros(cfg.env.n_obs, dtype=np.float32)
     obs[1] = 1.0
     mask = action_mask_from_obs(obs)
     assert mask.tolist() == [True, False, True]

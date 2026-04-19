@@ -13,7 +13,7 @@ Kluczowa zmiana względem modelu G&S:
 Klasy:
   AgentParams      — profil agenta (sentiment, threshold, gamma, wealth)
   AgentPopulation  — generuje N agentów bez stałych ról
-  DoubleAuction    — główne środowisko CT z sekwencyjną egzekucją market maker
+  DoubleAuction    — główne środowisko CT z równoległą egzekucją market maker
   ZeroIntelligence — baseline (losowa agresywność, losowa decyzja buy/sell/pass)
 """
 
@@ -322,14 +322,14 @@ class DoubleAuction:
     Środowisko spekulacyjne HTM.
 
     Przepływ jednego epizodu:
-      reset(D) → [execute_single_action(...) + compute_step_rewards()] × T → episode_metrics()
+      reset(D) → [execute_parallel_actions(...) + compute_step_rewards()] × T → episode_metrics()
 
     Przestrzeń akcji: 0=HOLD, 1=BUY, 2=SELL.
 
-    Obserwacja (10D):
+    Obserwacja (8D):
       patrz get_observation(); wektor opisuje sentiment, pozycję,
-      unrealized P&L, czas, awersję do ryzyka, próg, gamma,
-      ruch ceny od startu epizodu, krótki trend i value gap.
+      unrealized P&L, czas, gamma, ruch ceny od startu epizodu,
+      krótki trend i value gap.
 
     Reward:
       realized_pnl_this_step (bez kar mid-episode).
@@ -546,6 +546,86 @@ f"N={self.cfg.env.n_agents}"
             )
 
         return {"agent_id": agent_id, "side": self.cfg.env.action_name(action_idx), "price": p_exec}
+
+    def execute_parallel_actions(self, actions: dict) -> None:
+        """
+        Parallel execution: wszyscy agenci obserwują ten sam P_t,
+        składają akcje jednocześnie. Cena przesuwa się RAZ na podstawie
+        net_flow = liczba_BUY - liczba_SELL.
+
+        Zastępuje sekwencyjne wywołania execute_single_action w pętli.
+        Używane przez: train_deep_sarsa.py, train_ppo.py, run_zi_baseline.
+
+        Args:
+            actions: {agent_id: action_idx} — mapa akcji dla wszystkich agentów
+        """
+        if self._done:
+            return None
+
+        e = self.cfg.env
+
+        buys = [
+            aid for aid, action in actions.items()
+            if aid in self.population.agents
+            and action == e.ACTION_BUY_MARKET
+            and self.population.agents[aid].position
+                < self.population.agents[aid].max_position
+        ]
+        sells = [
+            aid for aid, action in actions.items()
+            if aid in self.population.agents
+            and action == e.ACTION_SELL_MARKET
+            and self.population.agents[aid].position
+                > -self.population.agents[aid].max_position
+        ]
+
+        net_flow = len(buys) - len(sells)
+        P_before = self._ref_price
+
+        # Rozlicz kupujących — wszyscy po tej samej cenie przed ruchem.
+        for aid in buys:
+            p_exec = float(np.clip(P_before + e.half_spread, e.p_min, e.p_max))
+            realized = self._execute_fill(aid, "buy", p_exec)
+            self._record_fill_price(p_exec)
+            if realized != 0.0:
+                self._realized_this_step[aid] = (
+                    self._realized_this_step.get(aid, 0.0) + realized
+                )
+
+        # Rozlicz sprzedających — wszyscy po tej samej cenie przed ruchem.
+        for aid in sells:
+            p_exec = float(np.clip(P_before - e.half_spread, e.p_min, e.p_max))
+            realized = self._execute_fill(aid, "sell", p_exec)
+            self._record_fill_price(p_exec)
+            if realized != 0.0:
+                self._realized_this_step[aid] = (
+                    self._realized_this_step.get(aid, 0.0) + realized
+                )
+
+        # Przesuń cenę raz na podstawie net_flow.
+        if net_flow != 0:
+            self._ref_price = float(np.clip(
+                P_before + e.perm_impact * net_flow,
+                e.p_min,
+                e.p_max,
+            ))
+            self._price_history.append(self._ref_price)
+
+        # Zaloguj akcje.
+        for aid, action in actions.items():
+            if aid not in self.population.agents:
+                continue
+            self._actions_log.append({
+                "step":       self._step,
+                "agent_id":   aid,
+                "action":     action,
+                "action_name":e.action_name(action),
+                "position":   self.population.agents[aid].position,
+                "sentiment":  self.population.agents[aid].sentiment,
+                "ref_price":  self._ref_price,
+            })
+
+        return None
 
     def compute_step_rewards(
         self,
@@ -796,18 +876,16 @@ f"N={self.cfg.env.n_agents}"
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        10D wektor obserwacji — Sentiment model z informacją cenową.
+        8D wektor obserwacji — Sentiment model z informacją cenową.
 
           [0] sentiment       bear/bull state ∈ [-1, +1]
           [1] position_norm   position / max_position ∈ [-1, +1]
           [2] unrealized_pnl  znormalizowany niezrealizowany P&L ∈ [-2, +2]
           [3] time_remaining  (T - step) / T ∈ [0, 1]
-          [4] risk_aversion   znorm. ∈ [0, 1]
-          [5] threshold       znorm. ∈ [0, 1]
-          [6] gamma           discount factor ∈ [0.80, 0.99]
-          [7] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
-          [8] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
-          [9] value_gap       tanh((V_perceived - P_t) / 0.05) ∈ (-1, +1)
+          [4] gamma           discount factor ∈ [0.80, 0.99]
+          [5] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
+          [6] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
+          [7] value_gap       tanh((V_perceived - P_t) / 0.05) ∈ (-1, +1)
         """
         p    = self.population.agents[agent_id]
         T    = self.cfg.env.episode_steps
@@ -847,12 +925,10 @@ f"N={self.cfg.env.n_agents}"
             pos_norm,                                           # [1]
             unrealized,                                         # [2]
             time_rem,                                           # [3]
-            float(np.clip(p.risk_aversion / 3.0, 0.0, 1.0)),  # [4]
-            float(np.clip(p.threshold / 0.45, 0.0, 1.0)),     # [5]
-            p.gamma,                                            # [6]
-            price_vs_start,                                     # [7]
-            trend_short,                                        # [8]
-            value_gap,                                          # [9]
+            p.gamma,                                            # [4]
+            price_vs_start,                                     # [5]
+            trend_short,                                        # [6]
+            value_gap,                                          # [7]
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -1032,11 +1108,11 @@ def run_zi_baseline(
         for step in range(T):
             if da.done:
                 break
-            order = da.rng.permutation(agent_ids)
-            for aid in order:
-                obs = da.get_observation(aid)
-                action = zi[aid].act(obs)
-                da.execute_single_action(aid, action)
+            actions = {
+                aid: zi[aid].act(da.get_observation(aid))
+                for aid in agent_ids
+            }
+            da.execute_parallel_actions(actions)
             da.compute_step_rewards()
         all_m.append(da.episode_metrics())
 

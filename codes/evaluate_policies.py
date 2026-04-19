@@ -1,9 +1,9 @@
 """
 Wspólny evaluator polityk HTM.
 
-Każdy algorytm jest oceniany tym samym protokołem sekwencyjnym:
-losowa kolejność agentów, aktualna obserwacja, natychmiastowe wykonanie,
-reward po pełnym kroku.
+Każdy algorytm jest oceniany tym samym protokołem równoległym:
+wszyscy agenci obserwują ten sam stan rynku, akcje są wykonywane wspólnie,
+reward liczony jest po pełnym kroku.
 """
 
 from __future__ import annotations
@@ -56,17 +56,22 @@ def evaluate_policy(
             for i, (aid, p) in enumerate(da.population.agents.items())
         }
 
-    rng = np.random.default_rng(seed + 90_000)
     records: List[dict] = []
 
     for episode in range(n_episodes):
         da.reset_episode()
 
         while not da.done:
-            for aid in rng.permutation(agent_ids):
-                obs = da.get_observation(aid)
-                action = _action_for_policy(algorithm_name, policy, obs, aid)
-                da.execute_single_action(aid, action)
+            actions = {
+                aid: _action_for_policy(
+                    algorithm_name,
+                    policy,
+                    da.get_observation(aid),
+                    aid,
+                )
+                for aid in agent_ids
+            }
+            da.execute_parallel_actions(actions)
             da.compute_step_rewards()
 
         metrics = da.episode_metrics()
