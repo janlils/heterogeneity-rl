@@ -27,6 +27,7 @@ import logging
 import time
 from pathlib import Path
 from typing import List, Dict
+from collections import deque
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.environ.setdefault("MPLCONFIGDIR", str(PROJECT_ROOT / ".matplotlib_cache"))
@@ -62,7 +63,6 @@ logging.basicConfig(
         logging.FileHandler(PROJECT_ROOT / "logs" / "deep_sarsa.log", mode="w"),
     ],
 )
-UPDATE_EVERY = 1   # aktualizuj sieć co krok — przy batch=1 numpy jest wystarczająco szybki
 log = logging.getLogger("htm.train")
 
 
@@ -89,12 +89,13 @@ MARKET = MarketDynamics.random_eq()
 
 # Hiperparametry sieci
 SARSA_CFG = DeepSARSAConfig(
-    hidden_size   = 32,
+    hidden_size   = 64,
     lr            = 1e-3,
     epsilon_start = 0.35,
     epsilon_end   = 0.05,
     epsilon_decay = 0.993,
     grad_clip     = 1.0,
+    n_step        = 10,
 )
 
 
@@ -233,19 +234,23 @@ def run_training(
 
     step_rng = np.random.default_rng(seed + 1000)
 
+    n_step = sarsa_cfg.n_step
+    traj_buffers: Dict[str, deque] = {aid: deque() for aid in agent_ids}
+
     for episode in range(n_episodes):
 
         # Nowy epizod: reset portfeli, wyceny dryfują, cena zostaje
         da.reset_episode()
         ep_rewards = {aid: 0.0 for aid in agent_ids}
-        step = 0
+        for aid in agent_ids:
+            traj_buffers[aid].clear()
 
         while not da.done:
             # Sekwencyjne wykonanie — losowa kolejność agentów per krok
             # Każdy agent obserwuje rynek ZAKTUALIZOWANY przez poprzedników
             agent_order = step_rng.permutation(agent_ids)
-            obs_at_action  = {}
-            actions_taken  = {}
+            obs_at_action: Dict[str, np.ndarray] = {}
+            actions_taken: Dict[str, int]        = {}
 
             for aid in agent_order:
                 obs = da.get_observation(aid)          # aktualny stan rynku
@@ -256,21 +261,48 @@ def run_training(
 
             # Nagrody na końcu kroku (po wszystkich agentach)
             rewards, dones = da.compute_step_rewards()
+            episode_done = any(dones.values())
 
-            # Aktualizacja SARSA dla każdego agenta
             for aid in agent_ids:
                 r = rewards.get(aid, 0.0)
                 ep_rewards[aid] += r
-                next_obs = da.get_observation(aid)
-                sarsa.agents[aid].update(
-                    obs      = obs_at_action[aid],
-                    action   = actions_taken[aid],
-                    reward   = r,
-                    next_obs = next_obs,
-                    done     = dones.get(aid, False),
+
+                traj_buffers[aid].append(
+                    (obs_at_action[aid], actions_taken[aid], r)
                 )
 
-            step += 1
+                if len(traj_buffers[aid]) >= n_step:
+                    agent = sarsa.agents[aid]
+                    obs_0, action_0, _ = traj_buffers[aid][0]
+
+                    G = sum(
+                        agent.gamma ** k * traj_buffers[aid][k][2]
+                        for k in range(n_step)
+                    )
+                    if not episode_done:
+                        next_obs = da.get_observation(aid)
+                        can_b, can_s = agent._mask(next_obs)
+                        q_next = agent.net.predict(next_obs)
+                        if not can_b:
+                            q_next[1] = -np.inf
+                        if not can_s:
+                            q_next[2] = -np.inf
+                        G += agent.gamma ** n_step * float(np.max(q_next))
+
+                    agent.update_with_target(obs_0, action_0, G)
+                    traj_buffers[aid].popleft()
+
+        for aid in agent_ids:
+            buf = list(traj_buffers[aid])
+            agent = sarsa.agents[aid]
+            for i in range(len(buf)):
+                obs_i, action_i, _ = buf[i]
+                G = sum(
+                    agent.gamma ** k * buf[i + k][2]
+                    for k in range(len(buf) - i)
+                )
+                agent.update_with_target(obs_i, action_i, G)
+            traj_buffers[aid].clear()
 
         # Metryki epizodu
         m     = da.episode_metrics()
@@ -639,7 +671,7 @@ def build_run_settings(args: argparse.Namespace) -> dict:
     if args.quick:
         settings = {
             "run_name": "quick",
-            "diversity_scores": [0.0, 0.3, 0.5, 0.7, 0.9, 1.0],
+            "diversity_scores": [0.0, 0.3, 0.7, 1.0],
             "n_agents": 20,
             "n_episodes": 40,
             "episode_steps": 800,
@@ -650,12 +682,13 @@ def build_run_settings(args: argparse.Namespace) -> dict:
             "rolling_window": 5,
             "n_workers": 1,
             "sarsa_cfg": DeepSARSAConfig(
-                hidden_size=32,
-                lr=1e-3,
-                epsilon_start=0.20,
-                epsilon_end=0.02,
-                epsilon_decay=0.90,
-                grad_clip=1.0,
+                hidden_size   = 32,
+                lr            = 1e-3,
+                epsilon_start = 0.30,
+                epsilon_end   = 0.1,
+                epsilon_decay = 0.97,
+                grad_clip     = 1.0,
+                n_step        = 5,
             ),
         }
     else:
@@ -722,7 +755,7 @@ def main():
     log.info("HTM Benchmark — Deep SARSA (model spekulacyjny)")
     log.info(f"Tryb: {run_name}")
     log.info(f"N={n_agents} | D={diversity_scores} | ep={n_episodes} | steps/ep={episode_steps} | seeds={n_seeds}")
-    log.info(f"Łączne kroki per agent per D: {n_episodes}×{episode_steps}={n_episodes*episode_steps} | update_every={UPDATE_EVERY}")
+    log.info(f"Łączne kroki per agent per D: {n_episodes}×{episode_steps}={n_episodes*episode_steps}")
     log.info(
         f"SARSA epsilon: start={sarsa_cfg.epsilon_start:.3f} | "
         f"end={sarsa_cfg.epsilon_end:.3f} | decay={sarsa_cfg.epsilon_decay:.3f}"

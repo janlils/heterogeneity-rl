@@ -49,13 +49,14 @@ class AgentParams:
     Główna zmiana vs poprzedniej wersji:
       - expected_price / long_run_fair_price zastąpione przez sentiment ∈ [-1, +1]
       - belief: BeliefState usunięty
-      - Dodane: alpha_i, beta_i, news_sensitivity
+      - Dodane: alpha_i, beta_i, news_sensitivity, V_perceived
     """
     agent_id:           str
     sentiment:          float = 0.0    # ∈ [-1, +1]: -1 = silnie niedźwiedzi, +1 = byczo
     alpha_i:            float = 0.08   # momentum: waga sygnału cenowego per krok
     beta_i:             float = 0.06   # mean reversion: powrót do neutralu (0.0)
     news_sensitivity:   float = 0.12   # waga sygnału informacyjnego z V_t
+    V_perceived:        float = 0.5    # prywatna wycena fundamentalna agenta
 
     threshold:          float = 0.20   # min |sentiment| żeby mieć sygnał handlowy
     gamma:              float = 0.90   # discount factor (indywidualny, wchodzi do TD)
@@ -89,6 +90,7 @@ class AgentParams:
     def __repr__(self) -> str:
         return (
             f"Agent({self.agent_id}, sent={self.sentiment:.3f}, "
+            f"V_perc={self.V_perceived:.3f}, "
             f"thr={self.threshold:.3f}, γ={self.gamma:.2f}, "
             f"α={self.alpha_i:.3f}, β={self.beta_i:.3f})"
         )
@@ -148,6 +150,10 @@ class AgentPopulation:
             wealth      = self._sample_wealth(d, cfg)
             max_pos     = self._wealth_to_max_position(wealth, d)
             risk_av     = self._sample_risk_aversion(d, cfg)
+            V_perceived_init = float(np.clip(
+                self.rng.normal(self.eq_price, 0.015 * d + 0.005),
+                self.env_cfg.p_min, self.env_cfg.p_max,
+            ))
 
             self.agents[aid] = AgentParams(
                 agent_id        = aid,
@@ -155,6 +161,7 @@ class AgentPopulation:
                 alpha_i         = alpha_i,
                 beta_i          = beta_i,
                 news_sensitivity= news_sens,
+                V_perceived     = V_perceived_init,
                 threshold       = threshold,
                 gamma           = gamma,
                 wealth          = wealth,
@@ -206,18 +213,18 @@ class AgentPopulation:
         Discount factor γ — horyzont czasowy agenta.
 
         Interpretacja:
-          γ=0.70 → efektywny horyzont ≈ 3–5 kroków  (scalper)
+          γ=0.80 → efektywny horyzont ≈ 5 kroków    (short-term)
           γ=0.90 → horyzont ≈ 15–20 kroków           (swing trader)
           γ=0.99 → horyzont ≈ 100 kroków              (pozycyjny)
 
-        Dolna granica 0.70: agent z γ<0.70 ma horyzont <4 kroków
+        Dolna granica 0.80: agent z γ<0.80 ma bardzo krótki horyzont
         przy T=200 — niestabilna nauka, bez sensu ekonomicznego.
         """
         if not cfg.gamma_spread or d < 1e-6:
             return 0.90
-        low  = 0.90 - 0.20 * d   # D=0.5: 0.80,  D=1.0: 0.70
+        low  = 0.90 - 0.10 * d   # D=0.5: 0.85,  D=1.0: 0.80
         high = 0.90 + 0.09 * d   # D=0.5: 0.945, D=1.0: 0.99
-        return float(np.clip(self.rng.uniform(low, high), 0.70, 0.99))
+        return float(np.clip(self.rng.uniform(low, high), 0.80, 0.99))
 
     def _sample_threshold(self, d: float, cfg: DiversityConfig) -> float:
         """
@@ -284,6 +291,7 @@ class AgentPopulation:
         thrs       = [p.threshold for p in self.agents.values()]
         alphas     = [p.alpha_i   for p in self.agents.values()]
         betas      = [p.beta_i    for p in self.agents.values()]
+        v_perc     = [p.V_perceived for p in self.agents.values()]
 
         return {
             "D":                self.diversity_score,
@@ -300,179 +308,9 @@ class AgentPopulation:
             "alpha_std":        float(np.std(alphas)),
             "beta_mean":        float(np.mean(betas)),
             "beta_std":         float(np.std(betas)),
+            "v_perceived_mean": float(np.mean(v_perc)),
+            "v_perceived_std":  float(np.std(v_perc)),
         }
-
-
-# ===========================================================================
-# Order i Trade
-# ===========================================================================
-
-@dataclass
-class Order:
-    agent_id:   str
-    order_type: str    # "bid" lub "ask"
-    price:      float
-    valuation:  float = 0.0  # legacy: expected_price/fair price przy starym OrderBook
-    timestamp:  int = 0
-
-
-@dataclass
-class Trade:
-    buyer_id:       str
-    seller_id:      str
-    price:          float
-    timestamp:      int
-    buyer_val:      float = 0.0   # wycena kupca
-    seller_val:     float = 0.0   # wycena sprzedawcy
-    buyer_surplus:  float = 0.0   # buyer_val - price
-    seller_surplus: float = 0.0   # price - seller_val
-
-    @property
-    def total_surplus(self) -> float:
-        return self.buyer_surplus + self.seller_surplus
-
-    @property
-    def is_profitable(self) -> bool:
-        """True jeśli obie strony zarabiają."""
-        return self.buyer_surplus > 0 and self.seller_surplus > 0
-
-
-# ===========================================================================
-# OrderBook
-# ===========================================================================
-
-class OrderBook:
-    """
-    Continuous Double Auction z priorytetem cena-czas.
-    submit_batch() — dla parallel step (wszyscy jednocześnie).
-    submit()       — dla sekwencyjnego ZI baseline.
-    """
-
-    def __init__(self):
-        self.bids:          List[Order] = []
-        self.asks:          List[Order] = []
-        self.trade_history: List[Trade] = []
-        self.price_history: List[float] = []
-        self._step = 0
-
-    def reset(self):
-        self.bids.clear(); self.asks.clear()
-        self.trade_history.clear(); self.price_history.clear()
-        self._step = 0
-
-    @property
-    def best_bid(self) -> Optional[float]:
-        return self.bids[0].price if self.bids else None
-
-    @property
-    def best_ask(self) -> Optional[float]:
-        return self.asks[0].price if self.asks else None
-
-    @property
-    def last_price(self) -> Optional[float]:
-        return self.price_history[-1] if self.price_history else None
-
-    @property
-    def spread(self) -> Optional[float]:
-        bb, ba = self.best_bid, self.best_ask
-        return (ba - bb) if (bb is not None and ba is not None) else None
-
-    def submit_batch(self, orders: List[Order]) -> List[Trade]:
-        """
-        Parallel step: wszystkie oferty jednocześnie.
-        Sortuj bidy malejąco i aski rosnąco, matchuj chciwością.
-        """
-        bids = sorted(
-            [o for o in orders if o.order_type == "bid"], key=lambda o: -o.price
-        )
-        asks = sorted(
-            [o for o in orders if o.order_type == "ask"], key=lambda o: o.price
-        )
-
-        trades = []
-        bi = ai = 0
-        matched_buyers  = set()
-        matched_sellers = set()
-
-        while bi < len(bids) and ai < len(asks):
-            bid = bids[bi]
-            ask = asks[ai]
-
-            # Pomijaj agentów już dopasowanych w tej rundzie
-            if bid.agent_id in matched_buyers:
-                bi += 1; continue
-            if ask.agent_id in matched_sellers:
-                ai += 1; continue
-
-            if bid.price >= ask.price:
-                trade = self._execute(bid, ask)
-                trades.append(trade)
-                matched_buyers.add(bid.agent_id)
-                matched_sellers.add(ask.agent_id)
-                bi += 1; ai += 1
-            else:
-                break   # najlepszy bid < najlepszy ask → koniec dopasowań
-
-        # Niezrealizowane oferty trafiają do kolejki
-        for b in bids:
-            if b.agent_id not in matched_buyers:
-                b.timestamp = self._step; self._step += 1
-                self.bids = [o for o in self.bids if o.agent_id != b.agent_id]
-                self.bids.append(b)
-                self.bids.sort(key=lambda o: (-o.price, o.timestamp))
-
-        for a in asks:
-            if a.agent_id not in matched_sellers:
-                a.timestamp = self._step; self._step += 1
-                self.asks = [o for o in self.asks if o.agent_id != a.agent_id]
-                self.asks.append(a)
-                self.asks.sort(key=lambda o: (o.price, o.timestamp))
-
-        return trades
-
-    def submit(self, order: Order) -> Optional[Trade]:
-        """Sekwencyjne — dla ZI baseline."""
-        order.timestamp = self._step; self._step += 1
-        if order.order_type == "bid":
-            return self._process_bid(order)
-        return self._process_ask(order)
-
-    def remove_agent(self, agent_id: str):
-        self.bids = [o for o in self.bids if o.agent_id != agent_id]
-        self.asks = [o for o in self.asks if o.agent_id != agent_id]
-
-    def _process_bid(self, bid: Order) -> Optional[Trade]:
-        if self.asks and bid.price >= self.asks[0].price:
-            ask = self.asks.pop(0)
-            return self._execute(bid, ask)
-        self.bids = [o for o in self.bids if o.agent_id != bid.agent_id]
-        self.bids.append(bid)
-        self.bids.sort(key=lambda o: (-o.price, o.timestamp))
-        return None
-
-    def _process_ask(self, ask: Order) -> Optional[Trade]:
-        if self.bids and self.bids[0].price >= ask.price:
-            bid = self.bids.pop(0)
-            return self._execute(bid, ask)
-        self.asks = [o for o in self.asks if o.agent_id != ask.agent_id]
-        self.asks.append(ask)
-        self.asks.sort(key=lambda o: (o.price, o.timestamp))
-        return None
-
-    def _execute(self, bid: Order, ask: Order) -> Trade:
-        price = (bid.price + ask.price) / 2.0
-        trade = Trade(
-            buyer_id=bid.agent_id, seller_id=ask.agent_id,
-            price=price, timestamp=self._step,
-            buyer_val=bid.valuation, seller_val=ask.valuation,
-        )
-        self.price_history.append(price)
-        self.trade_history.append(trade)
-        _log.debug(
-            f"  TRADE {bid.agent_id}(v={bid.valuation:.2f}) × "
-            f"{ask.agent_id}(v={ask.valuation:.2f}) @ {price:.3f}"
-        )
-        return trade
 
 
 # ===========================================================================
@@ -488,28 +326,23 @@ class DoubleAuction:
 
     Przestrzeń akcji: 0=HOLD, 1=BUY, 2=SELL.
 
-    Obserwacja (15D):
-      patrz get_observation(); wektor opisuje oczekiwaną cenę, cenę rynku,
-      sygnał wartości, trend/zmienność, pozycję, unrealized P&L, czas,
-      gamma, awersję do ryzyka, kotwicę oczekiwań, próg, drift oczekiwań
-      i skumulowany realized P&L epizodu.
+    Obserwacja (10D):
+      patrz get_observation(); wektor opisuje sentiment, pozycję,
+      unrealized P&L, czas, awersję do ryzyka, próg, gamma,
+      ruch ceny od startu epizodu, krótki trend i value gap.
 
     Reward:
-      realized_pnl_this_step + alignment - risk_penalty.
+      realized_pnl_this_step (bez kar mid-episode).
     """
-
-    PASS_ACTION = None  # ustawiany z cfg.env.pass_action
 
     def __init__(self, cfg: HTMConfig, seed: Optional[int] = None):
         self.cfg        = cfg
         self.rng        = np.random.default_rng(seed)
-        # OrderBook zostaje jako artefakt kompatybilności, ale główna ścieżka
-        # egzekucji używa market makera i nie składa zleceń do książki.
-        self.order_book = OrderBook()
         self.population: Optional[AgentPopulation] = None
         self._eq_price  = cfg.market.eq_center
         self._ref_price = cfg.market.eq_center  # aktualizowany po transakcjach
-
+        self._episode_start_price: float = cfg.market.eq_center
+        self._step_prices: List[float]   = []
 
         # Stan epizodu
         self._step:               int              = 0
@@ -565,12 +398,13 @@ class DoubleAuction:
         )
         self._V_t_prev = self._eq_price
 
-        self.order_book.reset()
         self._step        = 0
         self._done        = False
         self._actions_log = []
         self._price_window= []
         self._price_history = [self._ref_price]
+        self._episode_start_price = self._ref_price
+        self._step_prices = []
         self._n_fills = 0
         self._n_position_closes = 0
 
@@ -613,25 +447,33 @@ f"N={self.cfg.env.n_agents}"
         V_change    = self._eq_price - self._V_t_prev
         V_direction = float(np.tanh(V_change / max(sc.sigma_macro, 1e-6)))
 
-        # 2. Aktualizacja sentimentów na nowy epizod
+        # 2. Aktualizacja sentimentów i V_perceived na nowy epizod
         for p in self.population.agents.values():
-            # Prywatna interpretacja sygnału z V_t
+            # Prywatna interpretacja kierunku zmiany V_t (dla sentimentu)
             private = float(np.clip(
                 V_direction + self.rng.normal(0, sc.sigma_news), -1.0, 1.0
             ))
-            # Blend: 40% stary sentiment + 60% nowy sygnał
+            # Blend sentimentu: 40% stary + 60% nowy sygnał
             p.sentiment = float(np.clip(
                 0.4 * p.sentiment + 0.6 * private, -1.0, 1.0
+            ))
+            private_V_change = V_change + self.rng.normal(0, sc.sigma_macro)
+            implied_V = p.V_perceived + private_V_change
+            p.V_perceived = float(np.clip(
+                (1.0 - p.news_sensitivity) * p.V_perceived
+                + p.news_sensitivity * implied_V,
+                self.cfg.env.p_min, self.cfg.env.p_max,
             ))
             p.reset_position()
 
         # 3. Reset stanu epizodu (nie: P_t, wagi sieci, epsilon)
-        self.order_book.reset()
         self._step            = 0
         self._done            = False
         self._actions_log     = []
         self._price_window    = []
         self._price_history   = [self._ref_price]
+        self._episode_start_price = self._ref_price
+        self._step_prices         = []
         self._n_fills         = 0
         self._n_position_closes = 0
         self._rewards             = {aid: 0.0 for aid in self.population.agents}
@@ -645,10 +487,6 @@ f"N={self.cfg.env.n_agents}"
     # backward compat alias
     def reset_market_only(self) -> Dict[str, np.ndarray]:
         return self.reset_episode()
-
-    # -----------------------------------------------------------------------
-    # Parallel step — główny interfejs dla RL
-    # -----------------------------------------------------------------------
 
     # -----------------------------------------------------------------------
     # Sekwencyjne wykonanie — właściwy interfejs dla RL
@@ -736,31 +574,24 @@ f"N={self.cfg.env.n_agents}"
         self._update_sentiments(self._prev_price)
 
         # 4. Oblicz nagrody
-        T              = e.episode_steps
-        time_remaining = max(0.0, 1.0 - self._step / max(T, 1))
-        time_urgency   = max(0.0, 1.0 - time_remaining / e.holding_urgency_horizon)
-
+        # Reward = wyłącznie zrealizowany PnL z tego kroku.
+        # Brak kar mid-episode za trzymanie pozycji: kary powodowały że sieć
+        # uczyła się zamykać pozycje zbyt wcześnie (po 1-5 krokach), co przy
+        # random-walk rynku i koszcie spreadu daje accuracy < 0.5.
+        # Naturalna kara za złe pozycje istnieje przez terminal liquidation
+        # w _liquidate_terminal_positions() przy done=True.
         rewards: Dict[str, float] = {}
         for aid, p in self.population.agents.items():
             realized = self._realized_this_step.get(aid, 0.0)
-
-            pos_norm     = p.position / max(p.max_position, 1)
-            risk_penalty = e.risk_penalty_kappa * p.risk_aversion * (pos_norm ** 2)
-
-            unrealized_raw = 0.0
-            if p.position != 0 and p.entry_price > 0:
-                unrealized_raw = (self._ref_price - p.entry_price) * p.position
-            holding_cost = e.holding_cost_kappa * max(0.0, unrealized_raw) * time_urgency
-
-            reward      = realized - risk_penalty - holding_cost
-            rewards[aid] = reward
+            rewards[aid] = realized
             self._episode_pnl[aid] = self._episode_pnl.get(aid, 0.0) + realized
 
+        self._step_prices.append(self._ref_price)
         self._prev_price         = self._ref_price
         self._realized_this_step = {}
 
         self._step += 1
-        done = self._step >= T
+        done = self._step >= e.episode_steps
         if done:
             if e.auto_liquidate_end:
                 terminal = self._liquidate_terminal_positions()
@@ -771,44 +602,6 @@ f"N={self.cfg.env.n_agents}"
 
         dones = {aid: done for aid in self.population.agents}
         return rewards, dones
-
-    def parallel_step(
-        self,
-        actions: Dict[str, int],
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], Dict[str, bool], Dict[str, dict]]:
-        """
-        Legacy wrapper dla starszych skryptów. Benchmark ZI i trening SARSA
-        używają bezpośrednio execute_single_action + compute_step_rewards.
-        """
-        if self._done:
-            all_agents = list(self.population.agents.keys())
-            return (
-                {aid: self.get_observation(aid) for aid in all_agents},
-                {aid: 0.0 for aid in all_agents},
-                {aid: True for aid in all_agents},
-                {},
-            )
-
-        # Losowa kolejność — każdy agent widzi rynek zaktualizowany przez poprzedników
-        agent_list = list(actions.keys())
-        self.rng.shuffle(agent_list)
-        for aid in agent_list:
-            if aid in actions:
-                self.execute_single_action(aid, actions[aid])
-
-        rewards, dones = self.compute_step_rewards()
-
-        all_agents = list(self.population.agents.keys())
-        obs   = {aid: self.get_observation(aid) for aid in all_agents}
-        infos = {
-            aid: {
-                "n_trades":  self._n_fills,
-                "ref_price": self._ref_price,
-                "position":  self.population.agents[aid].position,
-            }
-            for aid in all_agents
-        }
-        return obs, rewards, dones, infos
 
     def _execution_price(self, side: str) -> float:
         """Cena egzekucji market makera z kosztem płynności."""
@@ -929,115 +722,53 @@ f"N={self.cfg.env.n_agents}"
         self._terminal_pnl = realized_by_agent
         return realized_by_agent
 
-
-    def _settle_ct(self, trade: Trade) -> Tuple[float, float]:
-        """
-        Rozliczenie transakcji z śledzeniem realized PnL.
-
-        Używa average cost basis:
-          - Otwierasz: entry_price = trade_price
-          - Zwiększasz: entry_price = średnia ważona pozycjami
-          - Zamykasz: realized = (trade_price - entry_price) × zamknięte_jednostki
-          - Odwracasz (np. long→short): realizujesz całość, otwierasz nową stronę
-
-        Zwraca (buyer_realized, seller_realized).
-        """
-        buyer  = self.population.agents[trade.buyer_id]
-        seller = self.population.agents[trade.seller_id]
-        p      = trade.price
-        buy_r  = sell_r = 0.0
-
-        # ── Kupujący: position += 1 ──────────────────────────────────────
-        old_b = buyer.position
-        if old_b < 0:
-            # Zamknięcie shorta (lub przejście na long)
-            buy_r = buyer.entry_price - p          # profit: sprzedałeś drogo, odkupujesz tanio
-            buyer.n_trades_closed += 1
-            if buy_r > 0:
-                buyer.n_trades_won += 1
-            if old_b + 1 == 0:
-                buyer.entry_price = 0.0            # pozycja neutralna
-            elif old_b + 1 > 0:
-                buyer.entry_price = p              # odwrócenie: nowy long po tej cenie
-            # else: nadal short ale mniejszy — entry_price bez zmian
-        elif old_b == 0:
-            buyer.entry_price = p                  # otwierasz long
-        else:
-            # Zwiększasz long — average cost
-            buyer.entry_price = (buyer.entry_price * old_b + p) / (old_b + 1)
-
-        buyer.position  += 1
-        buyer.realized_pnl += buy_r
-
-        # ── Sprzedający: position -= 1 ───────────────────────────────────
-        old_s = seller.position
-        if old_s > 0:
-            # Zamknięcie longa (lub przejście na short)
-            sell_r = p - seller.entry_price        # profit: kupiłeś tanio, sprzedajesz drogo
-            seller.n_trades_closed += 1
-            if sell_r > 0:
-                seller.n_trades_won += 1
-            if old_s - 1 == 0:
-                seller.entry_price = 0.0
-            elif old_s - 1 < 0:
-                seller.entry_price = p             # odwrócenie: nowy short po tej cenie
-        elif old_s == 0:
-            seller.entry_price = p                 # otwierasz short
-        else:
-            # Zwiększasz short — average cost
-            seller.entry_price = (seller.entry_price * abs(old_s) + p) / (abs(old_s) + 1)
-
-        seller.position -= 1
-        seller.realized_pnl += sell_r
-
-        _log.debug(
-            f"  SETTLE {trade.buyer_id}(pos:{old_b}→{buyer.position} r={buy_r:.4f}) × "
-            f"{trade.seller_id}(pos:{old_s}→{seller.position} r={sell_r:.4f}) @ {p:.3f}"
-        )
-        return buy_r, sell_r
-
     def _update_sentiments(self, p_t_before: float) -> None:
         """
-        Aktualizacja sentimentów na podstawie ruchu ceny w tym kroku.
+        Aktualizacja sentimentów na podstawie ruchu ceny i wyceny fundamentalnej.
 
-        Wywołana RAZ per krok z compute_step_rewards(), po wszystkich transakcjach.
-        Używa różnicy między bieżącym ref_price a ceną na początku kroku.
+        Dwa składniki:
+          - momentum (alpha_i): reaguje na zmianę ceny w tym kroku
+          - value (beta_i): ciągnie sentiment w kierunku (V_perceived - P_t)
+            → agent z V_perceived > P_t staje się bardziej byczy (uważa że tanio)
+            → agent z V_perceived < P_t staje się bardziej niedźwiedzi (uważa że drogo)
 
-        Mechanizm:
-          - price_signal = tanh(ΔP_t / σ_P) ∈ (-1, +1)
-          - momentum:  s += α_i * (price_signal - s)
-          - reversion: s += β_i * (0 - s)
+        Wywoływana RAZ per krok z compute_step_rewards().
         """
         sc = self.cfg.sentiment
         delta_P      = self._ref_price - p_t_before
         price_signal = float(np.tanh(delta_P / max(sc.sigma_P, 1e-6)))
 
         for agent in self.population.agents.values():
-            s  = agent.sentiment
+            s = agent.sentiment
             s += agent.alpha_i * (price_signal - s)
-            s += agent.beta_i  * (0.0 - s)
+            value_signal = float(np.tanh(
+                (agent.V_perceived - self._ref_price) / 0.05
+            ))
+            s += agent.beta_i * (value_signal - s)
             agent.sentiment = float(np.clip(s, -1.0, 1.0))
 
     def _emit_info_signal(self) -> None:
         """
-        Periodyczny sygnał informacyjny z V_t do agentów.
+        Periodyczny sygnał informacyjny z V_t do prywatnej wyceny agentów.
 
-        Wywoływana z compute_step_rewards() z prawdopodobieństwem p_info.
-        Każdy agent interpretuje sygnał z własnym szumem prywatnym.
-        news_sensitivity kontroluje jak mocno agent reaguje.
+        Każdy agent aktualizuje swoje V_perceived — zaszumioną estymację V_t.
+        Agenci z wyższym news_sensitivity szybciej śledzą zmiany V_t.
+        Sentiment jest aktualizowany przez _update_sentiments() na podstawie
+        ruchu ceny — V_perceived to osobny kanał informacyjny.
         """
         sc = self.cfg.sentiment
         V_change = self._eq_price - self._V_t_prev
         if abs(V_change) < 1e-8:
             return
-        info_direction = float(np.tanh(V_change / max(sc.sigma_macro * 0.5, 1e-6)))
 
         for agent in self.population.agents.values():
-            private = float(np.clip(
-                info_direction + self.rng.normal(0, sc.sigma_news), -1.0, 1.0
+            private_V_change = V_change + self.rng.normal(0, sc.sigma_macro)
+            implied_V = agent.V_perceived + private_V_change
+            agent.V_perceived = float(np.clip(
+                (1.0 - agent.news_sensitivity) * agent.V_perceived
+                + agent.news_sensitivity * implied_V,
+                self.cfg.env.p_min, self.cfg.env.p_max,
             ))
-            agent.sentiment += agent.news_sensitivity * (private - agent.sentiment)
-            agent.sentiment  = float(np.clip(agent.sentiment, -1.0, 1.0))
 
     def _drift_V_t(self) -> None:
         """
@@ -1060,35 +791,23 @@ f"N={self.cfg.env.n_agents}"
         ))
 
     # -----------------------------------------------------------------------
-    # Sekwencyjne submit — dla ZI baseline
-    # -----------------------------------------------------------------------
-
-    def submit(self, agent_id: str, price: float, order_type: str) -> Optional[Trade]:
-        """Deprecated adapter: wykonuje natychmiastowy BUY/SELL przez market makera."""
-        if self._done:
-            return None
-
-        if order_type == "bid":
-            self.execute_single_action(agent_id, self.cfg.env.ACTION_BUY_MARKET)
-        elif order_type == "ask":
-            self.execute_single_action(agent_id, self.cfg.env.ACTION_SELL_MARKET)
-        return None
-
-    # -----------------------------------------------------------------------
     # Obserwacja
     # -----------------------------------------------------------------------
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        7D wektor obserwacji — Sentiment model.
+        10D wektor obserwacji — Sentiment model z informacją cenową.
 
           [0] sentiment       bear/bull state ∈ [-1, +1]
           [1] position_norm   position / max_position ∈ [-1, +1]
-          [2] unrealized_pnl  znormalizowany niezrealizowany P&L
+          [2] unrealized_pnl  znormalizowany niezrealizowany P&L ∈ [-2, +2]
           [3] time_remaining  (T - step) / T ∈ [0, 1]
-          [4] risk_aversion   znorm. ∈ [0, 1] — wchodzi do reward formula
-          [5] threshold       znorm. ∈ [0, 1] — wrażliwość sygnału
-          [6] gamma           discount factor ∈ [0.70, 0.99] — wchodzi do TD
+          [4] risk_aversion   znorm. ∈ [0, 1]
+          [5] threshold       znorm. ∈ [0, 1]
+          [6] gamma           discount factor ∈ [0.80, 0.99]
+          [7] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
+          [8] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
+          [9] value_gap       tanh((V_perceived - P_t) / 0.05) ∈ (-1, +1)
         """
         p    = self.population.agents[agent_id]
         T    = self.cfg.env.episode_steps
@@ -1105,6 +824,24 @@ f"N={self.cfg.env.n_agents}"
         else:
             unrealized = 0.0
 
+        price_vs_start = float(np.clip(
+            (self._ref_price - self._episode_start_price) / 0.1,
+            -3.0, 3.0
+        ))
+
+        sc = self.cfg.sentiment
+        if len(self._step_prices) >= 8:
+            old_price = self._step_prices[-8]
+        else:
+            old_price = self._episode_start_price
+        trend_short = float(np.tanh(
+            (self._ref_price - old_price) / max(sc.sigma_P, 1e-6)
+        ))
+
+        value_gap = float(np.tanh(
+            (p.V_perceived - self._ref_price) / 0.05
+        ))
+
         return np.array([
             float(np.clip(p.sentiment, -1.0, 1.0)),            # [0]
             pos_norm,                                           # [1]
@@ -1113,6 +850,9 @@ f"N={self.cfg.env.n_agents}"
             float(np.clip(p.risk_aversion / 3.0, 0.0, 1.0)),  # [4]
             float(np.clip(p.threshold / 0.45, 0.0, 1.0)),     # [5]
             p.gamma,                                            # [6]
+            price_vs_start,                                     # [7]
+            trend_short,                                        # [8]
+            value_gap,                                          # [9]
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -1216,6 +956,7 @@ f"N={self.cfg.env.n_agents}"
                 "alpha_i":         p.alpha_i,
                 "beta_i":          p.beta_i,
                 "news_sensitivity":p.news_sensitivity,
+                "V_perceived":     p.V_perceived,
                 "threshold":       p.threshold,
                 "gamma":           p.gamma,
                 "risk_aversion":   p.risk_aversion,
@@ -1320,14 +1061,6 @@ def _gini(values: List[float]) -> float:
     return float(
         (2 * np.sum(idx * arr) - (n + 1) * arr.sum()) / (n * arr.sum())
     )
-
-
-def _price_disc(prices, eq, threshold=0.05) -> int:
-    for t, p in enumerate(prices):
-        if abs(p - eq) <= threshold:
-            return t
-    return len(prices)
-
 
 # ===========================================================================
 # Walidacja

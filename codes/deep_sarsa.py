@@ -132,10 +132,10 @@ class NumpyMLP:
 
 class DeepSARSAAgent:
     """
-    On-policy SARSA z numpy MLP + Adam.
+    On-policy n-step SARSA z numpy MLP + Adam.
 
     Maskowanie akcji (CT — Continuous Trading):
-      obs[1]  = position_norm ∈ [-1,+1]
+      obs[1] = position_norm ∈ [-1,+1]  (indeks stały niezależnie od rozmiaru obs)
       can_buy  = position_norm < 0.99   (nie max long)
       can_sell = position_norm > -0.99  (nie max short, symetrycznie)
     """
@@ -163,7 +163,7 @@ class DeepSARSAAgent:
         self.total_updates:      int         = 0
 
     def _mask(self, obs: np.ndarray) -> Tuple[bool, bool]:
-        # obs[1] = position_norm = position / max_position ∈ [-1, +1]
+        # obs[1] = position_norm ∈ [-1,+1]  (indeks stały niezależnie od rozmiaru obs)
         pos_norm = float(obs[1])
         can_buy  = pos_norm < 0.99   # nie na maksimum long
         can_sell = pos_norm > -0.99  # nie na maksimum short
@@ -229,6 +229,26 @@ class DeepSARSAAgent:
         self.episode_td_errors.append(abs(td_error))
         self.episode_grad_norms.append(grad_norm)
 
+        return abs(td_error), grad_norm
+
+    def update_with_target(
+        self,
+        obs:    np.ndarray,
+        action: int,
+        target: float,
+    ) -> Tuple[float, float]:
+        """
+        Aktualizacja sieci z preobliczonym n-step targetem.
+        Używana przez pętlę n-step w train_deep_sarsa.py zamiast 1-step update().
+        """
+        q_vals, cache = self.net.forward(obs)
+        td_error  = float(target) - float(q_vals[action])
+        grad_norm = self.net.backward(
+            action, td_error, cache, self.cfg.lr, self.cfg.grad_clip
+        )
+        self.total_updates += 1
+        self.episode_td_errors.append(abs(td_error))
+        self.episode_grad_norms.append(grad_norm)
         return abs(td_error), grad_norm
 
     def decay_epsilon(self):

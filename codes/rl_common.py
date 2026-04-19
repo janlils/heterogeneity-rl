@@ -25,7 +25,7 @@ def set_global_seeds(seed: int) -> None:
 
 
 def action_mask_from_obs(obs: np.ndarray) -> np.ndarray:
-    pos_norm = float(obs[1])  # obs[1] = position_norm w nowym 7D obs
+    pos_norm = float(obs[1])  # obs[1] = position_norm (indeks stały, obs może mieć 7 lub 10 wymiarów)
     can_buy = pos_norm < 0.99
     can_sell = pos_norm > -0.99
     return np.array([True, can_buy, can_sell], dtype=bool)

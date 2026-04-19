@@ -33,12 +33,11 @@ class EnvConfig:
 
     Każdy agent handluje przez T=episode_steps kroków.
     Nikt nie 'wychodzi' po transakcji — agenci zarządzają portfolio.
-    Reward = realized_pnl_this_step - risk_penalty - holding_cost.
+    Reward = realized_pnl_this_step; złe otwarte pozycje rozlicza terminal liquidation.
     """
     n_agents:               int   = 20
     episode_steps:          int   = 200    # T: długość epizodu
     max_position:           int   = 3      # domyślne max |position| (może być nadpisane przez wealth)
-    risk_aversion_base:     float = 1.0    # bazowa kara za otwartą pozycję
 
     # Market maker / dealer execution
     use_market_maker:       bool  = True
@@ -47,14 +46,7 @@ class EnvConfig:
     perm_impact:            float = 0.0016
     p_min:                  float = 0.05
     p_max:                  float = 0.95
-    # alignment_scale usunięty (zawsze był 0)
-    risk_penalty_kappa:     float = 0.02
     auto_liquidate_end:     bool  = True
-
-    # Kara za trzymanie zysku bez zamknięcia (rośnie pod koniec epizodu)
-    holding_cost_kappa:      float = 0.03
-    # Ostatnie X% epizodu to "strefa urgency" dla holding_cost
-    holding_urgency_horizon: float = 0.30
 
     # deprecated fields removed
 
@@ -69,7 +61,8 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 7
+        return 10  # [sentiment, pos_norm, unrealized, time_rem, risk_av, threshold,
+                   #  gamma, price_vs_start, trend_short, value_gap]
 
     def action_name(self, idx: int) -> str:
         return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
@@ -133,10 +126,6 @@ class SentimentConfig:
     beta_spread:             float = 0.12    # → zakres [0.03, 0.15] przy D=1
     news_sensitivity_spread: float = 0.35   # → zakres [0.05, 0.40] przy D=1
 
-
-# BeliefConfig usunięty — zastąpiony przez SentimentConfig.
-
-
 # ---------------------------------------------------------------------------
 # Heterogeniczność
 # ---------------------------------------------------------------------------
@@ -181,6 +170,7 @@ class DeepSARSAConfig:
     epsilon_end:    float = 0.05
     epsilon_decay:  float = 0.993
     grad_clip:      float = 1.0     # gradient clipping
+    n_step:         int   = 10      # liczba kroków do przodu dla n-step returns
 
 
 # ---------------------------------------------------------------------------
