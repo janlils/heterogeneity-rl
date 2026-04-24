@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from codes.config import EnvConfig, HTMConfig, LogConfig, MarketDynamics, PPOConfig
 from codes.deep_sarsa import DeepSARSAMultiAgent
 from codes.double_auction import DoubleAuction
-from codes.evaluate_policies import evaluate_policy
+from codes.evaluate_policies import evaluate_policy, evaluate_ppo_no_impact
 from codes.ppo import SharedPPOTrainer
 from codes.rl_common import action_mask_from_obs
 
@@ -97,6 +97,7 @@ def test_common_evaluator_schema_for_zi_sarsa_ppo():
     zi_records = evaluate_policy("ZI", None, cfg, 0.5, n_episodes=1, seed=3)
     sarsa_records = evaluate_policy("DeepSARSA_EVAL", sarsa, cfg, 0.5, n_episodes=1, seed=3)
     ppo_records = evaluate_policy("PPO_EVAL", ppo, cfg, 0.5, n_episodes=1, seed=3)
+    ppo_no_impact_records = evaluate_ppo_no_impact(ppo, cfg, 0.5, n_episodes=1, seed=3)
 
     required = {
         "episode",
@@ -111,7 +112,11 @@ def test_common_evaluator_schema_for_zi_sarsa_ppo():
         "action_sell_frac",
         "action_hold_frac",
         "gini",
+        "same_action_frac",
+        "effective_N",
+        "gamma_std",
     }
-    schemas = [set(r[0]) for r in (zi_records, sarsa_records, ppo_records)]
+    schemas = [set(r[0]) for r in (zi_records, sarsa_records, ppo_records, ppo_no_impact_records)]
     assert all(required.issubset(schema) for schema in schemas)
-    assert all(r[0]["primary_metric"] == "trade_accuracy" for r in (zi_records, sarsa_records, ppo_records))
+    assert all(r[0]["primary_metric"] == "trade_accuracy" for r in (zi_records, sarsa_records, ppo_records, ppo_no_impact_records))
+    assert ppo_no_impact_records[0]["algorithm"] == "PPO_EVAL_NO_IMPACT"

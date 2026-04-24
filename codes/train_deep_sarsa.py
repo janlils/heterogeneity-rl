@@ -26,7 +26,7 @@ import argparse
 import logging
 import time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Sequence
 from collections import deque
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +49,7 @@ from multiprocessing import Pool, cpu_count
 from codes.config import HTMConfig, EnvConfig, MarketDynamics, LogConfig, DeepSARSAConfig
 from codes.double_auction import DoubleAuction, ZeroIntelligenceAgent, run_zi_baseline
 from codes.deep_sarsa import DeepSARSAMultiAgent
+from codes.evaluate_policies import evaluate_sarsa
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -71,7 +72,7 @@ log = logging.getLogger("htm.train")
 # ---------------------------------------------------------------------------
 
 DIVERSITY_SCORES = [0.0, 0.3, 0.5, 0.7, 1.0]   # wartości D do przetestowania
-N_AGENTS         = 20                             # liczba agentów
+N_AGENTS         = 50                             # liczba agentów
 N_EPISODES       = 500                            # epizodów CT (każdy = EPISODE_STEPS kroków)
 # N_ROUNDS usunięty — CT nie ma rund, epizod = T kroków
 N_SEEDS          = 10                             # powtórzeń (dla std)
@@ -128,19 +129,23 @@ def _build_record(
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
     extra: dict = None,
+    agent_gammas: Optional[Sequence[float]] = None,
 ) -> dict:
     """Kanoniczny rekord metryk epizodu dla CSV."""
     trade_acc = metrics.get("trade_accuracy", 0.0)
     positive_pnl_frac = metrics.get(
         "positive_pnl_frac", metrics.get("allocative_efficiency", 0.0)
     )
+    gamma_std = float(np.std(agent_gammas)) if agent_gammas is not None and len(agent_gammas) > 0 else 0.0
     record = {
         "episode":           episode,
         "diversity_score":   diversity_score,
         "seed":              seed,
         "algorithm":         algorithm,
         "n_agents":          cfg.env.n_agents,
+        "gamma_std":         gamma_std,
         "eq_price":          metrics.get("eq_price", 0.5),
+        "eq_price_start":    metrics.get("eq_price_start", 0.5),
         "ref_price_final":   metrics.get("ref_price_final", 0.5),
         "mean_pnl":          metrics.get("mean_pnl", 0.0),
         "pnl_positive_frac": positive_pnl_frac,
@@ -149,8 +154,13 @@ def _build_record(
         "n_trades_closed":   metrics.get("n_trades_closed", 0),
         "n_position_closes": metrics.get("n_position_closes", 0),
         "price_volatility":  metrics.get("price_volatility", 0.0),
+        "price_range":       metrics.get("price_range", 0.0),
         "open_positions":    metrics.get("open_positions_end", 0),
         "mean_abs_position": metrics.get("mean_abs_position", 0.0),
+        "mean_value_gap":    metrics.get("mean_value_gap", 0.0),
+        "v_perceived_std":   metrics.get("v_perceived_std", 0.0),
+        "pct_chartists":     metrics.get("pct_chartists", 0.0),
+        "corr_type_pnl":     metrics.get("corr_type_pnl", 0.0),
         "action_buy_frac":   metrics.get("action_buy_frac", 0.0),
         "action_sell_frac":  metrics.get("action_sell_frac", 0.0),
         "action_hold_frac":  metrics.get("action_hold_frac", 0.0),
@@ -171,6 +181,36 @@ def _build_record(
     return record
 
 
+def _agent_diagnostic_rows(
+    da: DoubleAuction,
+    episode: int,
+    diversity_score: float,
+    seed: int,
+) -> List[dict]:
+    rows: List[dict] = []
+    agent_metrics = da.agent_metrics()
+    for aid, meta in agent_metrics.items():
+        alpha_i = float(meta.get("alpha_i", 0.0))
+        beta_i = float(meta.get("beta_i", 0.0))
+        trader_type = alpha_i / max(alpha_i + beta_i, 1e-9)
+        rows.append({
+            "episode": episode,
+            "diversity_score": diversity_score,
+            "seed": seed,
+            "agent_id": aid,
+            "trader_type": trader_type,
+            "alpha_i": alpha_i,
+            "beta_i": beta_i,
+            "threshold": float(meta.get("threshold", 0.0)),
+            "gamma": float(meta.get("gamma", 0.0)),
+            "V_perceived": float(meta.get("V_perceived", 0.0)),
+            "realized_pnl": float(meta.get("realized_pnl", 0.0)),
+            "n_trades_closed": int(meta.get("n_trades_closed", 0)),
+            "trade_accuracy_agent": float(meta.get("trade_accuracy", 0.0)),
+        })
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Jeden run treningowy Deep SARSA
 # ---------------------------------------------------------------------------
@@ -184,7 +224,7 @@ def run_training(
     zi_baseline_positive_pnl_frac: float,
     sarsa_cfg:       DeepSARSAConfig,
     log_every:       int,
-) -> tuple[List[dict], DeepSARSAMultiAgent, DoubleAuction]:
+ ) -> tuple[List[dict], List[dict], List[dict], DeepSARSAMultiAgent, DoubleAuction]:
     """
     Trenuje Deep SARSA — Continuous Trading.
 
@@ -231,6 +271,8 @@ def run_training(
     }
 
     records  = []
+    learning_curve_records: List[dict] = []
+    agent_diagnostics: List[dict] = []
     t_start  = time.time()
 
     n_step = sarsa_cfg.n_step
@@ -324,8 +366,34 @@ def run_training(
             "mean_grad_norm":    pop_s.get("mean_grad_norm", 0.0),
             **pop_meta,
             },
+            agent_gammas=agent_gammas,
         )
         records.append(record)
+
+        if (episode + 1) % 50 == 0:
+            agent_diagnostics.extend(
+                _agent_diagnostic_rows(da, episode + 1, diversity_score, seed)
+            )
+            short_eval_records = evaluate_trained_sarsa(
+                da=da,
+                sarsa=sarsa,
+                diversity_score=diversity_score,
+                seed=seed + 1000,
+                cfg=cfg,
+                n_eval_episodes=5,
+                zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
+                zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+                log_trajectories=False,
+            )
+            learning_curve_records.append({
+                "episode": episode + 1,
+                "diversity_score": diversity_score,
+                "seed": seed,
+                "train_trade_accuracy": m.get("trade_accuracy", 0.0),
+                "eval_trade_accuracy": float(np.mean([r["trade_accuracy"] for r in short_eval_records])),
+                "mean_td_error": pop_s["mean_td_error"],
+                "gamma_std": float(np.std(agent_gammas)),
+            })
 
         if (episode + 1) % log_every == 0:
             recent     = records[-log_every:]
@@ -345,7 +413,7 @@ def run_training(
                 f"t={elapsed:.0f}s"
             )
 
-    return records, sarsa, da
+    return records, learning_curve_records, agent_diagnostics, sarsa, da
 
 
 def evaluate_trained_sarsa(
@@ -357,43 +425,25 @@ def evaluate_trained_sarsa(
     n_eval_episodes: int,
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
+    log_trajectories: bool = False,
 ) -> List[dict]:
     """
     Ewaluacja wytrenowanej polityki z końcowym epsilonem i bez update'ów sieci.
-    Używa tego samego równoległego protokołu kroku co trening.
+    Używa tego samego równoległego protokołu kroku co trening, ale na
+    osobnej populacji ewaluacyjnej z seedem przesuniętym względem treningu.
     """
-    eval_records: List[dict] = []
-    agent_ids = list(da.population.agents.keys())
-    for episode in range(n_eval_episodes):
-        da.reset_episode()
-
-        while not da.done:
-            actions = {
-                aid: sarsa.agents[aid].act(da.get_observation(aid), explore=True)
-                for aid in agent_ids
-            }
-            da.execute_parallel_actions(actions)
-            da.compute_step_rewards()
-
-        m = da.episode_metrics()
-        eval_records.append(_build_record(
-            episode=episode,
-            diversity_score=diversity_score,
-            seed=seed,
-            cfg=cfg,
-            metrics=m,
-            algorithm="DeepSARSA_EVAL",
-            zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
-            zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
-            extra={
-                "eval_trade_accuracy": m.get("trade_accuracy", 0.0),
-                "eval_mean_total_pnl": m.get("mean_total_pnl", 0.0),
-                "eval_n_trades": m.get("n_trades", 0),
-                "eval_mean_terminal_pnl": m.get("mean_terminal_pnl", 0.0),
-            },
-        ))
-
-    return eval_records
+    del da
+    eval_seed = seed if seed >= 1000 else seed + 1000
+    return evaluate_sarsa(
+        sarsa,
+        cfg,
+        diversity_score,
+        n_eval_episodes,
+        eval_seed,
+        zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
+        zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+        log_trajectories=log_trajectories,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -621,9 +671,9 @@ def _train_worker(args: tuple) -> list:
     (
         diversity_score, seed, cfg, zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac, n_episodes, n_eval_episodes,
-        sarsa_cfg, log_every,
+        sarsa_cfg, log_every, log_trajectories,
     ) = args
-    train_records, sarsa, da = run_training(
+    train_records, learning_curve_records, agent_diagnostics, sarsa, da = run_training(
         diversity_score = diversity_score,
         n_episodes      = n_episodes,
         seed            = seed,
@@ -637,13 +687,14 @@ def _train_worker(args: tuple) -> list:
         da=da,
         sarsa=sarsa,
         diversity_score=diversity_score,
-        seed=seed,
+        seed=seed + 1000,
         cfg=cfg,
         n_eval_episodes=n_eval_episodes,
         zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+        log_trajectories=log_trajectories,
     )
-    return train_records, eval_records
+    return train_records, learning_curve_records, agent_diagnostics, eval_records
 
 
 def parse_args() -> argparse.Namespace:
@@ -668,7 +719,7 @@ def build_run_settings(args: argparse.Namespace) -> dict:
         settings = {
             "run_name": "quick",
             "diversity_scores": [0.0, 0.3, 0.7, 1.0],
-            "n_agents": 20,
+            "n_agents": 50,
             "n_episodes": 40,
             "episode_steps": 800,
             "n_seeds": 1,
@@ -735,6 +786,9 @@ def build_run_settings(args: argparse.Namespace) -> dict:
 def main():
     args = parse_args()
     settings = build_run_settings(args)
+    trajectories_csv = PROJECT_ROOT / "results" / "trajectories_eval.csv"
+    if trajectories_csv.exists():
+        trajectories_csv.unlink()
     diversity_scores = settings["diversity_scores"]
     n_agents = settings["n_agents"]
     n_episodes = settings["n_episodes"]
@@ -773,23 +827,21 @@ def main():
     log.info(cfg.summary())
     log.info(f"episode_steps={cfg.env.episode_steps} | n_actions={cfg.env.n_actions}")
 
-    # 1. ZI baseline — raz przed treningiem
-    log.info("\n--- Liczę ZI baseline ---")
-    zi_baselines = {}
-    zi_positive_baselines = {}
-    for d in diversity_scores:
-        zi_result = run_zi_baseline(cfg, diversity_score=d,
-                                    n_episodes=zi_episodes, seed=42)
-        zi_acc = zi_result.get("trade_accuracy", {}).get("mean", 0.0)
-        zi_positive = zi_result.get("positive_pnl_frac", {}).get("mean", 0.0)
-        zi_pnl = zi_result.get("mean_pnl", {}).get("mean", 0.0)
-        zi_term = zi_result.get("mean_terminal_pnl", {}).get("mean", 0.0)
-        zi_baselines[d] = zi_acc
-        zi_positive_baselines[d] = zi_positive
-        log.info(
-            f"  ZI | D={d:.1f} | eff={zi_positive:.3f} | "
-            f"acc={zi_acc:.3f} | pnl={zi_pnl:.4f} | term={zi_term:.4f}"
-        )
+    # 1. ZI baseline — raz przed treningiem, wspólny dla wszystkich D
+    log.info("\n--- Liczę wspólny ZI baseline ---")
+    baseline_d = float(diversity_scores[0]) if diversity_scores else 0.0
+    zi_result = run_zi_baseline(cfg, diversity_score=baseline_d,
+                                n_episodes=zi_episodes, seed=42)
+    shared_zi_acc = zi_result.get("trade_accuracy", {}).get("mean", 0.0)
+    shared_zi_positive = zi_result.get("positive_pnl_frac", {}).get("mean", 0.0)
+    zi_pnl = zi_result.get("mean_pnl", {}).get("mean", 0.0)
+    zi_term = zi_result.get("mean_terminal_pnl", {}).get("mean", 0.0)
+    zi_baselines = {d: shared_zi_acc for d in diversity_scores}
+    zi_positive_baselines = {d: shared_zi_positive for d in diversity_scores}
+    log.info(
+        f"  ZI | D_ref={baseline_d:.1f} | eff={shared_zi_positive:.3f} | "
+        f"acc={shared_zi_acc:.3f} | pnl={zi_pnl:.4f} | term={zi_term:.4f}"
+    )
 
     # 2. Trening — równoległy (multiprocessing.Pool)
     log.info(f"\n--- Start treningu ({n_workers} równoległych procesów) ---")
@@ -800,6 +852,7 @@ def main():
         (
             d, seed, cfg, zi_baselines[d], zi_positive_baselines[d],
             n_episodes, n_eval_episodes, sarsa_cfg, settings["log_every"],
+            seed == 0 and abs(d - 1.0) < 1e-9,
         )
         for d in diversity_scores
         for seed in range(n_seeds)
@@ -810,6 +863,8 @@ def main():
     # Pool: każde zadanie to osobny proces, brak konfliktów między sieciami
     # imap_unordered: zapisuje wyniki na bieżąco — nie traci danych gdy worker pada
     all_records = []
+    all_learning_curve_records = []
+    all_agent_diagnostics = []
     all_eval_records = []
     if n_workers == 1:
         iterator = map(_train_worker, tasks)
@@ -820,8 +875,10 @@ def main():
 
     try:
         for i, worker_result in enumerate(iterator):
-            task_records, eval_records = worker_result
+            task_records, learning_curve_records, agent_diagnostics, eval_records = worker_result
             all_records.extend(task_records)
+            all_learning_curve_records.extend(learning_curve_records)
+            all_agent_diagnostics.extend(agent_diagnostics)
             all_eval_records.extend(eval_records)
             d_done = task_records[0]["diversity_score"] if task_records else "?"
             s_done = task_records[0]["seed"]            if task_records else "?"
@@ -836,6 +893,18 @@ def main():
             )
             pd.DataFrame(all_eval_records).to_csv(
                 PROJECT_ROOT / "results" / f"{output_stem}_eval_results_partial.csv",
+                index=False
+            )
+            pd.DataFrame(all_learning_curve_records).to_csv(
+                PROJECT_ROOT / "results" / (
+                    "deep_sarsa_learning_curve.csv"
+                    if run_name == "full"
+                    else f"{output_stem}_learning_curve.csv"
+                ),
+                index=False
+            )
+            pd.DataFrame(all_agent_diagnostics).to_csv(
+                PROJECT_ROOT / "results" / "deep_sarsa_agent_diagnostics.csv",
                 index=False
             )
     finally:
@@ -854,6 +923,15 @@ def main():
     eval_csv_path = PROJECT_ROOT / "results" / f"{output_stem}_eval_results.csv"
     eval_df.to_csv(eval_csv_path, index=False)
     log.info(f"Ewaluacja: {eval_csv_path} ({len(eval_df)} wierszy)")
+    learning_curve_csv = PROJECT_ROOT / "results" / (
+        "deep_sarsa_learning_curve.csv"
+        if run_name == "full"
+        else f"{output_stem}_learning_curve.csv"
+    )
+    pd.DataFrame(all_learning_curve_records).to_csv(learning_curve_csv, index=False)
+    agent_diagnostics_csv = PROJECT_ROOT / "results" / "deep_sarsa_agent_diagnostics.csv"
+    pd.DataFrame(all_agent_diagnostics).to_csv(agent_diagnostics_csv, index=False)
+    log.info(f"Learning curve: {learning_curve_csv} ({len(all_learning_curve_records)} wierszy)")
 
     # 4. Wykresy
     plot_learning_curves(
@@ -927,6 +1005,8 @@ def main():
     log.info(f"         plots/{output_stem}_final_comparison.png")
     log.info(f"Dane:    results/{output_stem}_results.csv")
     log.info(f"Eval:    results/{output_stem}_eval_results.csv")
+    log.info(f"Curve:   {learning_curve_csv.relative_to(PROJECT_ROOT)}")
+    log.info(f"Agents:  {agent_diagnostics_csv.relative_to(PROJECT_ROOT)}")
 
 
 if __name__ == "__main__":

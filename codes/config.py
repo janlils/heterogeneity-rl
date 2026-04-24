@@ -35,13 +35,13 @@ class EnvConfig:
     Nikt nie 'wychodzi' po transakcji — agenci zarządzają portfolio.
     Reward = realized_pnl_this_step; złe otwarte pozycje rozlicza terminal liquidation.
     """
-    n_agents:               int   = 20
+    n_agents:               int   = 50
     episode_steps:          int   = 200    # T: długość epizodu
-    max_position:           int   = 3      # domyślne max |position| (może być nadpisane przez wealth)
+    max_position:           int   = 3      # domyślne max |position|
 
     # Market maker / dealer execution
     use_market_maker:       bool  = True
-    half_spread:            float = 0.0008
+    half_spread:            float = 0.0005
     temp_impact:            float = 0.000
     perm_impact:            float = 0.0016
     p_min:                  float = 0.05
@@ -61,8 +61,13 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 8   # [sentiment, pos_norm, unrealized, time_rem,
-                   #  gamma, price_vs_start, trend_short, value_gap]
+        return 11  # [sentiment, pos_norm, unrealized, time_rem,
+                   #  gamma, price_vs_start, trend_short, value_gap,
+                   #  alpha_norm, beta_norm, threshold_norm]
+
+    @classmethod
+    def no_impact(cls) -> "EnvConfig":
+        return cls(perm_impact=0.0, half_spread=0.0001)
 
     def action_name(self, idx: int) -> str:
         return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
@@ -112,13 +117,13 @@ class SentimentConfig:
     # Dynamika V_t
     sigma_intra:             float = 0.003   # dryft V_t per krok (wewnątrz epizodu)
     sigma_macro:             float = 0.015   # skok V_t między epizodami
-    p_info:                  float = 0.04    # prawdopodobieństwo sygnału info per krok
+    p_info:                  float = 0.12    # prawdopodobieństwo sygnału info per krok
     sigma_news:              float = 0.04    # szum prywatnej interpretacji newsa
     sigma_P:                 float = 0.003   # normalizacja zmiany ceny do tanh
 
     # Centra parametrów behawioralnych (przy D=0 wszyscy mają te wartości)
-    alpha_center:            float = 0.08    # momentum: waga sygnału cenowego
-    beta_center:             float = 0.06    # mean reversion: powrót do neutralu
+    alpha_center:            float = 0.07    # momentum: waga sygnału cenowego
+    beta_center:             float = 0.07    # mean reversion: powrót do neutralu
     news_sensitivity_center: float = 0.12   # waga sygnału informacyjnego z V_t
 
     # Zakresy przy D=1 (losowane jednostajnie: center ± half_range)
@@ -139,7 +144,6 @@ class DiversityConfig:
     sentiment_spread:    bool = True   # rozrzut początkowego sentimentu agentów
     threshold_spread:    bool = True   # różne progi decyzji o handlu
     gamma_spread:        bool = True   # horyzonty czasowe
-    wealth_spread:       bool = True   # majątek (Pareto)
     risk_aversion_spread:bool = True   # awersja do ryzyka pozycji
     behavioral_spread:   bool = True   # parametry α_i, β_i, news_sensitivity
 
@@ -147,7 +151,7 @@ class DiversityConfig:
     def sentiment_only(cls) -> "DiversityConfig":
         """Tylko sentiment — najczystszy test modelu spekulacyjnego."""
         return cls(threshold_spread=False, gamma_spread=False,
-                   wealth_spread=False, behavioral_spread=False)
+                   behavioral_spread=False)
 
     @classmethod
     def full(cls) -> "DiversityConfig":
@@ -243,7 +247,7 @@ class ExpConfig:
         return cls(
             diversity_scores=[0.0, 0.5, 1.0],
             algorithms=["ZI", "DeepSARSA"],
-            n_agents_list=[20],
+            n_agents_list=[50],
             market_conditions=["stable"],
             n_seeds=3, n_train_episodes=200, n_eval_episodes=30,
         )

@@ -11,7 +11,7 @@ Kluczowa zmiana względem modelu G&S:
     - PnL wynika wyłącznie z cen wejścia i wyjścia, nie z sentimentu.
 
 Klasy:
-  AgentParams      — profil agenta (sentiment, threshold, gamma, wealth)
+  AgentParams      — profil agenta (sentiment, threshold, gamma)
   AgentPopulation  — generuje N agentów bez stałych ról
   DoubleAuction    — główne środowisko CT z równoległą egzekucją market maker
   ZeroIntelligence — baseline (losowa agresywność, losowa decyzja buy/sell/pass)
@@ -60,7 +60,6 @@ class AgentParams:
 
     threshold:          float = 0.20   # min |sentiment| żeby mieć sygnał handlowy
     gamma:              float = 0.90   # discount factor (indywidualny, wchodzi do TD)
-    wealth:             float = 1.00   # majątek → max_position
     risk_aversion:      float = 1.00   # λ: kara za otwartą pozycję w reward
     max_position:       int   = 5      # maks |position|
 
@@ -147,13 +146,21 @@ class AgentPopulation:
             sentiment_0, alpha_i, beta_i, news_sens = self._sample_sentiment_params(d, cfg, sc)
             gamma       = self._sample_gamma(d, cfg)
             threshold   = self._sample_threshold(d, cfg)
-            wealth      = self._sample_wealth(d, cfg)
-            max_pos     = self._wealth_to_max_position(wealth, d)
+            max_pos     = self.env_cfg.max_position
             risk_av     = self._sample_risk_aversion(d, cfg)
             V_perceived_init = float(np.clip(
                 self.rng.normal(self.eq_price, 0.015 * d + 0.005),
                 self.env_cfg.p_min, self.env_cfg.p_max,
             ))
+
+            # Sentiment startowy z value_gap agenta + mały szum
+            # Agent który uważa że jest tanio (V_perceived > P_t) zaczyna byczy
+            if cfg.sentiment_spread and d > 1e-6:
+                value_gap_init = float(np.tanh(
+                    (V_perceived_init - self.eq_price) / 0.05
+                ))
+                noise = float(self.rng.normal(0.0, 0.15 * d))
+                sentiment_0 = float(np.clip(value_gap_init + noise, -1.0, 1.0))
 
             self.agents[aid] = AgentParams(
                 agent_id        = aid,
@@ -164,7 +171,6 @@ class AgentPopulation:
                 V_perceived     = V_perceived_init,
                 threshold       = threshold,
                 gamma           = gamma,
-                wealth          = wealth,
                 risk_aversion   = risk_av,
                 max_position    = max_pos,
             )
@@ -175,37 +181,67 @@ class AgentPopulation:
         """
         Losuje (sentiment_0, alpha_i, beta_i, news_sensitivity) dla agenta.
 
-        D=0: wszyscy identyczni (centra parametrów, sentiment=0).
-        D=1: pełny rozrzut → heterogeniczne typy agentów.
+        D=0: wszyscy identyczni — trader_type=0.5 (centrum), sentiment_0=0.
+        D=1: pełny rozrzut — trader_type ~ Beta(0.3, 0.3), silnie spolaryzowany.
+
+        trader_type ∈ [0, 1]:
+          0.0 → pure VALUE:     alpha=alpha_lo, beta=beta_hi
+          0.5 → balanced:       alpha≈0.07,     beta≈0.07
+          1.0 → pure MOMENTUM:  alpha=alpha_hi, beta=beta_lo
+
+        Alpha i beta są antykorelowane przez trader_type — agent jest albo
+        fundamentalistą (beta > alpha) albo chartistą (alpha > beta).
+
+        Sentiment startowy pochodzi z value_gap agenta (+mały szum), dzięki
+        czemu agent który uważa że jest tanio (V_perceived > P_t) zaczyna byczy,
+        a nie z losowym sentymentem niezależnym od przekonań.
         """
-        if not cfg.sentiment_spread or d < 1e-6:
-            sentiment_0 = 0.0
-        else:
-            sentiment_0 = float(np.clip(self.rng.normal(0, 0.35 * d), -1.0, 1.0))
 
         if not cfg.behavioral_spread or d < 1e-6:
             alpha_i = sc.alpha_center
             beta_i  = sc.beta_center
             news    = sc.news_sensitivity_center
+            trader_type = 0.5
         else:
-            half_a = sc.alpha_spread / 2.0
-            half_b = sc.beta_spread / 2.0
-            half_n = sc.news_sensitivity_spread / 2.0
+            # Jeden parametr decyduje o typie tradera; kształt Beta zależy od D.
+            d_knots = np.array([0.2, 0.4, 0.6, 0.8, 1.0], dtype=np.float64)
+            a_knots = np.array([2.0, 1.0, 0.7, 0.5, 0.3], dtype=np.float64)
+            b_knots = np.array([2.0, 1.0, 0.7, 0.5, 0.3], dtype=np.float64)
+            a_beta = float(np.interp(d, d_knots, a_knots))
+            b_beta = float(np.interp(d, d_knots, b_knots))
+            trader_type = float(self.rng.beta(a_beta, b_beta))
+
+            alpha_lo = max(0.01, sc.alpha_center - sc.alpha_spread / 2.0 * d)
+            alpha_hi = sc.alpha_center + sc.alpha_spread / 2.0 * d
+            beta_lo  = max(0.01, sc.beta_center  - sc.beta_spread  / 2.0 * d)
+            beta_hi  = sc.beta_center  + sc.beta_spread  / 2.0 * d
+
+            # Alpha rośnie z trader_type, beta spada — antykorelacja
             alpha_i = float(np.clip(
-                self.rng.uniform(sc.alpha_center - half_a * d,
-                                 sc.alpha_center + half_a * d),
+                alpha_lo + trader_type * (alpha_hi - alpha_lo),
                 0.01, 0.40
             ))
             beta_i = float(np.clip(
-                self.rng.uniform(sc.beta_center - half_b * d,
-                                 sc.beta_center + half_b * d),
+                beta_hi - trader_type * (beta_hi - beta_lo),
                 0.01, 0.25
             ))
+
+            half_n = sc.news_sensitivity_spread / 2.0
             news = float(np.clip(
                 self.rng.uniform(sc.news_sensitivity_center - half_n * d,
                                  sc.news_sensitivity_center + half_n * d),
                 0.01, 0.50
             ))
+
+        if not cfg.sentiment_spread or d < 1e-6:
+            sentiment_0 = 0.0
+        else:
+            # Sentiment startowy z value_gap (V_perceived vs eq_price) + mały szum
+            # V_perceived nie jest jeszcze znane tu — wyliczamy je po generacji agenta.
+            # Dlatego sentiment_0 jest ustawiony tymczasowo na 0.0 i korygowany
+            # w _generate() po ustaleniu V_perceived.
+            sentiment_0 = 0.0  # zostanie nadpisany w _generate()
+
         return sentiment_0, alpha_i, beta_i, news
 
     def _sample_gamma(self, d: float, cfg: DiversityConfig) -> float:
@@ -259,26 +295,6 @@ class AgentPopulation:
         raw = self.rng.lognormal(mean=-sigma**2/2, sigma=sigma)  # median=1.0
         return float(np.clip(raw, 0.05, 3.0))
 
-    def _sample_wealth(self, d, cfg) -> float:
-        if not cfg.wealth_spread or d < 1e-6:
-            return 1.0
-        # Pareto(1.5): realistyczna nierówność majątku
-        raw = float(self.rng.pareto(1.5) + 1.0)
-        return float(np.clip(raw * d + 1.0 * (1.0 - d), 0.05, 20.0))
-
-    def _wealth_to_max_position(self, wealth: float, d: float) -> int:
-        """
-        Bogaty agent może trzymać większą pozycję.
-        D=0: wszyscy = env_cfg.max_position (domyślne 5)
-        D>0: max_pos = round(wealth × default), clip [1, default×2]
-        wealth=1.0 → max_pos=5 (bez zmiany)
-        wealth=2.0 → max_pos=10, wealth=0.5 → max_pos=2
-        """
-        base = self.env_cfg.max_position
-        if d < 1e-6:
-            return base
-        return max(1, min(base * 2, round(wealth * base)))
-
     def max_theoretical_surplus(self) -> float:
         """Legacy metric: model sentimentu nie ma statycznego surplusu."""
         return 0.0
@@ -287,7 +303,6 @@ class AgentPopulation:
         """Statystyki opisowe populacji — do logowania i wykresów."""
         sentiments = [p.sentiment for p in self.agents.values()]
         gammas     = [p.gamma     for p in self.agents.values()]
-        wealth     = [p.wealth    for p in self.agents.values()]
         thrs       = [p.threshold for p in self.agents.values()]
         alphas     = [p.alpha_i   for p in self.agents.values()]
         betas      = [p.beta_i    for p in self.agents.values()]
@@ -301,7 +316,6 @@ class AgentPopulation:
             "sentiment_range":  float(np.ptp(sentiments)),
             "gamma_mean":       float(np.mean(gammas)),
             "gamma_std":        float(np.std(gammas)),
-            "wealth_gini":      _gini(wealth),
             "threshold_mean":   float(np.mean(thrs)),
             "threshold_std":    float(np.std(thrs)),
             "alpha_mean":       float(np.mean(alphas)),
@@ -326,10 +340,10 @@ class DoubleAuction:
 
     Przestrzeń akcji: 0=HOLD, 1=BUY, 2=SELL.
 
-    Obserwacja (8D):
+    Obserwacja (11D):
       patrz get_observation(); wektor opisuje sentiment, pozycję,
       unrealized P&L, czas, gamma, ruch ceny od startu epizodu,
-      krótki trend i value gap.
+      krótki trend, value gap oraz cechy typu behawioralnego agenta.
 
     Reward:
       realized_pnl_this_step (bez kar mid-episode).
@@ -342,6 +356,7 @@ class DoubleAuction:
         self._eq_price  = cfg.market.eq_center
         self._ref_price = cfg.market.eq_center  # aktualizowany po transakcjach
         self._episode_start_price: float = cfg.market.eq_center
+        self._eq_price_start:      float = cfg.market.eq_center
         self._step_prices: List[float]   = []
 
         # Stan epizodu
@@ -404,6 +419,7 @@ class DoubleAuction:
         self._price_window= []
         self._price_history = [self._ref_price]
         self._episode_start_price = self._ref_price
+        self._eq_price_start = self._eq_price
         self._step_prices = []
         self._n_fills = 0
         self._n_position_closes = 0
@@ -473,6 +489,7 @@ f"N={self.cfg.env.n_agents}"
         self._price_window    = []
         self._price_history   = [self._ref_price]
         self._episode_start_price = self._ref_price
+        self._eq_price_start      = self._eq_price
         self._step_prices         = []
         self._n_fills         = 0
         self._n_position_closes = 0
@@ -605,7 +622,7 @@ f"N={self.cfg.env.n_agents}"
         # Przesuń cenę raz na podstawie net_flow.
         if net_flow != 0:
             self._ref_price = float(np.clip(
-                P_before + e.perm_impact * net_flow,
+                P_before + e.perm_impact * np.sign(net_flow) * np.sqrt(abs(net_flow)),
                 e.p_min,
                 e.p_max,
             ))
@@ -876,7 +893,7 @@ f"N={self.cfg.env.n_agents}"
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        8D wektor obserwacji — Sentiment model z informacją cenową.
+        11D wektor obserwacji — Sentiment model z informacją cenową.
 
           [0] sentiment       bear/bull state ∈ [-1, +1]
           [1] position_norm   position / max_position ∈ [-1, +1]
@@ -886,6 +903,9 @@ f"N={self.cfg.env.n_agents}"
           [5] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
           [6] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
           [7] value_gap       tanh((V_perceived - P_t) / 0.05) ∈ (-1, +1)
+          [8] alpha_norm      alpha_i / 0.40 ∈ [0, 1]
+          [9] beta_norm       beta_i / 0.25 ∈ [0, 1]
+          [10] threshold_norm threshold / 0.45 ∈ [0, 1]
         """
         p    = self.population.agents[agent_id]
         T    = self.cfg.env.episode_steps
@@ -919,6 +939,9 @@ f"N={self.cfg.env.n_agents}"
         value_gap = float(np.tanh(
             (p.V_perceived - self._ref_price) / 0.05
         ))
+        alpha_norm = float(np.clip(p.alpha_i / 0.40, 0.0, 1.0))
+        beta_norm = float(np.clip(p.beta_i / 0.25, 0.0, 1.0))
+        threshold_norm = float(np.clip(p.threshold / 0.45, 0.0, 1.0))
 
         return np.array([
             float(np.clip(p.sentiment, -1.0, 1.0)),            # [0]
@@ -929,6 +952,9 @@ f"N={self.cfg.env.n_agents}"
             price_vs_start,                                     # [5]
             trend_short,                                        # [6]
             value_gap,                                          # [7]
+            alpha_norm,                                         # [8]
+            beta_norm,                                          # [9]
+            threshold_norm,                                     # [10]
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -959,6 +985,7 @@ f"N={self.cfg.env.n_agents}"
     def episode_metrics(self) -> dict:
         """Metryki epizodu — Continuous Trading."""
         prices  = self._price_history
+        agents = list(self.population.agents.values())
 
         # Realized P&L agentów (z zamkniętych pozycji)
         pnls     = self._episode_pnl   # realized PnL per agent
@@ -994,6 +1021,28 @@ f"N={self.cfg.env.n_agents}"
         terminal_pnl_vals  = list(self._terminal_pnl.values())
         mean_terminal_pnl  = float(np.mean(terminal_pnl_vals)) if terminal_pnl_vals else 0.0
         terminal_positive  = sum(1 for v in terminal_pnl_vals if v > 0)
+        value_gaps = [
+            float(np.tanh((p.V_perceived - self._ref_price) / 0.05))
+            for p in agents
+        ]
+        v_perceived_vals = [p.V_perceived for p in agents]
+        pct_chartists = float(
+            sum(1 for p in agents if p.alpha_i > p.beta_i) / max(len(agents), 1)
+        )
+        type_proxy = np.array(
+            [p.alpha_i / max(p.alpha_i + p.beta_i, 1e-9) for p in agents],
+            dtype=np.float64,
+        )
+        pnl_array = np.array([pnls.get(p.agent_id, 0.0) for p in agents], dtype=np.float64)
+        if (
+            len(type_proxy) >= 2
+            and float(np.std(type_proxy)) > 1e-12
+            and float(np.std(pnl_array)) > 1e-12
+        ):
+            corr_type_pnl = float(np.corrcoef(type_proxy, pnl_array)[0, 1])
+        else:
+            corr_type_pnl = 0.0
+        price_range = float(max(prices) - min(prices)) if prices else 0.0
 
         return {
             "mean_pnl":            mean_pnl,
@@ -1006,15 +1055,21 @@ f"N={self.cfg.env.n_agents}"
             "n_position_closes":   self._n_position_closes,
             "n_trades":            self._n_fills,
             "price_volatility":    price_volatility,
+            "price_range":         price_range,
             "mean_price_deviation":mean_dev,
             "ref_price_final":     self._ref_price,
             "eq_price":            self._eq_price,
+            "eq_price_start":      self._eq_price_start,
             "diversity_score":     self.population.diversity_score,
             "n_agents":            self.cfg.env.n_agents,
             "n_steps":             self._step,
             "open_positions_end":  open_pos,
             "mean_position_end":   mean_pos,
             "mean_abs_position":   mean_abs_pos,
+            "mean_value_gap":      float(np.mean(value_gaps)) if value_gaps else 0.0,
+            "v_perceived_std":     float(np.std(v_perceived_vals)) if v_perceived_vals else 0.0,
+            "pct_chartists":       pct_chartists,
+            "corr_type_pnl":       corr_type_pnl,
             "action_buy_frac":     n_buy  / n_acts,
             "action_sell_frac":    n_sell / n_acts,
             "action_hold_frac":    n_hold / n_acts,

@@ -224,9 +224,10 @@ class SharedPPOTrainer:
         rng: np.random.Generator,
         deterministic: bool = False,
         rollout_episodes: Optional[int] = None,
-    ) -> List[dict]:
+    ) -> tuple[List[dict], List[Dict[str, dict]]]:
         self.buffer.clear()
         episode_metrics: List[dict] = []
+        episode_agent_metrics: List[Dict[str, dict]] = []
         n_rollout = rollout_episodes or self.cfg.rollout_episodes
 
         for rollout_ep in range(n_rollout):
@@ -277,9 +278,10 @@ class SharedPPOTrainer:
                 step_idx += 1
 
             episode_metrics.append(da.episode_metrics())
+            episode_agent_metrics.append(da.agent_metrics())
 
         self.buffer.compute_advantages_and_returns(self.cfg.gamma, self.cfg.gae_lambda)
-        return episode_metrics
+        return episode_metrics, episode_agent_metrics
 
     def update(self) -> Dict[str, float]:
         if len(self.buffer) == 0:

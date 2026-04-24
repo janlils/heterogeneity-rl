@@ -165,10 +165,9 @@ def _baseline_by_d(df):
     if "zi_baseline_trade_accuracy" not in df.columns:
         print("  [!] Brak zi_baseline_trade_accuracy w CSV — pomijam linię ZI.")
         return {}
-    return {
-        d: float(v)
-        for d, v in df.groupby("diversity_score")["zi_baseline_trade_accuracy"].first().items()
-    }
+    d_vals = sorted(df["diversity_score"].unique())
+    baseline = float(df["zi_baseline_trade_accuracy"].dropna().iloc[0])
+    return {d: baseline for d in d_vals}
 
 
 # ===========================================================================
@@ -238,7 +237,6 @@ def plot_heterogeneity_parameters(n_agents: int = 60, n_seeds: int = 10) -> None
         ("gamma",          "Discount factor gamma",     [0.5, 1.0],  "Horyzont czasowy"),
         ("threshold",      "Prog decyzji",              [0.0, 0.30], "Min |val-price| do handlu"),
         ("risk_aversion",  "Awersja do ryzyka lambda",  [0.0, 3.0],  "Kara za duza pozycje (CT)"),
-        ("wealth",         "Majatek (wealth)",          [0.0, 6.0],  "Pareto(1.5) -> max_position"),
         ("sentiment",      "Sentiment",                 [-1.0, 1.0], "Nastroj poczatkowy"),
         ("alpha_i",        "alpha_i",                   [0.0, 0.4],  "Momentum ceny"),
         ("beta_i",         "beta_i",                    [0.0, 0.25], "Powrot do neutralu"),
@@ -473,21 +471,21 @@ def plot_valuation_vs_pnl(n_episodes: int = 30) -> None:
 # ===========================================================================
 
 def plot_zi_validation(n_episodes: int = 150) -> None:
-    """Walidacja: metryki ZI vs D. trade_accuracy powinno byc ~0.50 niezaleznie od D."""
+    """Walidacja: wspólny ZI baseline dla zadanej konfiguracji środowiska."""
     cfg = _cfg()
-    results = {}
     print("  Licze ZI baseline...")
-    for d in D_VALUES:
-        results[d] = run_zi_baseline(cfg, diversity_score=d,
-                                     n_episodes=n_episodes, seed=42)
-        print(f"    D={d:.1f} | "
-              f"acc={results[d]['trade_accuracy']['mean']:.3f} | "
-              f"trades={results[d]['n_trades']['mean']:.0f}")
+    ref_d = float(D_VALUES[0])
+    baseline = run_zi_baseline(cfg, diversity_score=ref_d,
+                               n_episodes=n_episodes, seed=42)
+    results = {d: baseline for d in D_VALUES}
+    print(f"    wspolny | D_ref={ref_d:.1f} | "
+          f"acc={baseline['trade_accuracy']['mean']:.3f} | "
+          f"trades={baseline['n_trades']['mean']:.0f}")
 
     fig, axes = plt.subplots(1, 4, figsize=(18, 5))
     fig.suptitle(
-        "ZI Baseline — walidacja srodowiska spekulacyjnego CT\n"
-        "(trade_accuracy liczona empirycznie w benchmarkowym protokole ZI)",
+        "ZI Baseline — wspolny punkt odniesienia dla CT\n"
+        "(ta sama wartosc dla wszystkich D, bo ZI nie korzysta z typu agenta)",
         fontsize=12, fontweight="bold",
     )
 
@@ -603,56 +601,7 @@ def plot_action_heatmap(n_episodes: int = 50, d: float = 0.7) -> None:
 
 
 # ===========================================================================
-# 08. Rozklad majatku (Pareto -> max_position)
-# ===========================================================================
-
-def plot_wealth_distribution() -> None:
-    """Rozklad majatku i max_position przy D=0, 0.5, 1.0."""
-    cfg = _cfg(n_agents=200)
-    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
-    fig.suptitle(
-        "Rozklad majatku (Pareto) i wynikowy max_position\n"
-        "Bogatszy agent moze trzymac wieksza pozycje",
-        fontsize=12, fontweight="bold",
-    )
-
-    for col, (d, color) in enumerate([(0.0, D_COLORS[0]),
-                                       (0.5, D_COLORS[3]),
-                                       (1.0, D_COLORS[5])]):
-        pop = AgentPopulation(
-            n_agents=200, diversity_score=d,
-            diversity_cfg=cfg.diversity, sentiment_cfg=cfg.sentiment,
-            env_cfg=cfg.env, eq_price=0.5, seed=42,
-        )
-        wealth   = np.array([p.wealth       for p in pop.agents.values()])
-        max_pos  = np.array([p.max_position for p in pop.agents.values()])
-        gini_w   = _gini(wealth.tolist())
-
-        ax = axes[0, col]
-        ax.hist(np.clip(wealth, 0, 8), bins=40, color=color, alpha=0.8,
-                density=True, edgecolor="white", lw=0.5)
-        ax.set_xlabel("Majatek (wealth)")
-        ax.set_ylabel("Gestosc")
-        ax.set_title(f"D={d:.1f} | Gini={gini_w:.3f}")
-        ax.text(0.7, 0.95, f"sigma={wealth.std():.2f}\nmax={wealth.max():.1f}",
-                transform=ax.transAxes, fontsize=9, va="top",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
-        ax.grid(True, alpha=0.3)
-
-        ax = axes[1, col]
-        vals, cnts = np.unique(max_pos, return_counts=True)
-        ax.bar(vals, cnts / len(max_pos), color=color, alpha=0.8, edgecolor="white")
-        ax.set_xlabel("max_position")
-        ax.set_ylabel("Frakcja agentow")
-        ax.set_title(f"D={d:.1f} | mean={max_pos.mean():.1f}")
-        ax.grid(True, axis="y", alpha=0.3)
-
-    _tight()
-    _save(fig, "08_wealth_distribution.png")
-
-
-# ===========================================================================
-# 09. Ewolucja cen i sentimentu przez kolejne epizody
+# 08. Ewolucja cen i sentimentu przez kolejne epizody
 # ===========================================================================
 
 def plot_price_valuation_evolution(n_episodes: int = 60,
@@ -757,7 +706,7 @@ def plot_price_valuation_evolution(n_episodes: int = 60,
 
 
 # ===========================================================================
-# 10. Ewolucja pozycji przez epizod (CT)
+# 09. Ewolucja pozycji przez epizod (CT)
 # ===========================================================================
 
 def plot_position_evolution(diversity_scores: List[float] = None,
@@ -1432,9 +1381,6 @@ def main() -> None:
 
         print("[simulate] Heatmapa akcji...")
         plot_action_heatmap(n_episodes=50, d=0.7)
-
-        print("[simulate] Rozklad majatku i max_position...")
-        plot_wealth_distribution()
 
         print("[simulate] Ewolucja cen i wycen przez epizody...")
         plot_price_valuation_evolution(n_episodes=60)

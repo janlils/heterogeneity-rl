@@ -5,7 +5,7 @@ Wspólne helpery dla algorytmów RL w środowisku HTM.
 from __future__ import annotations
 
 import random
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 
@@ -51,14 +51,18 @@ def build_episode_record(
     cfg: HTMConfig,
     metrics: dict,
     extra: Optional[dict] = None,
+    agent_gammas: Optional[Sequence[float]] = None,
 ) -> dict:
+    gamma_std = float(np.std(agent_gammas)) if agent_gammas is not None and len(agent_gammas) > 0 else 0.0
     record = {
         "episode": episode,
         "diversity_score": diversity_score,
         "seed": seed,
         "algorithm": algorithm,
         "n_agents": cfg.env.n_agents,
+        "gamma_std": gamma_std,
         "eq_price": metrics.get("eq_price", 0.5),
+        "eq_price_start": metrics.get("eq_price_start", 0.5),
         "ref_price_final": metrics.get("ref_price_final", 0.5),
         "trade_accuracy": metrics.get("trade_accuracy", 0.0),
         "mean_pnl": metrics.get("mean_pnl", 0.0),
@@ -70,7 +74,12 @@ def build_episode_record(
         "n_trades_closed": metrics.get("n_trades_closed", 0),
         "n_position_closes": metrics.get("n_position_closes", 0),
         "price_volatility": metrics.get("price_volatility", 0.0),
+        "price_range": metrics.get("price_range", 0.0),
         "mean_abs_position": metrics.get("mean_abs_position", 0.0),
+        "mean_value_gap": metrics.get("mean_value_gap", 0.0),
+        "v_perceived_std": metrics.get("v_perceived_std", 0.0),
+        "pct_chartists": metrics.get("pct_chartists", 0.0),
+        "corr_type_pnl": metrics.get("corr_type_pnl", 0.0),
         "action_buy_frac": metrics.get("action_buy_frac", 0.0),
         "action_sell_frac": metrics.get("action_sell_frac", 0.0),
         "action_hold_frac": metrics.get("action_hold_frac", 0.0),

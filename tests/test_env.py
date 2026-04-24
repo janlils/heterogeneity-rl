@@ -59,6 +59,12 @@ def test_position_limits_block_extra_actions():
     assert da.population.agents[aid].position == 1
 
 
+def test_no_impact_env_factory_sets_zero_perm_impact():
+    env = EnvConfig.no_impact()
+    assert env.perm_impact == 0.0
+    assert env.half_spread == 0.0001
+
+
 def test_parallel_actions_execute_at_same_price_and_move_once():
     cfg = make_cfg(n_agents=4, episode_steps=5, half_spread=0.0, perm_impact=0.01)
     da = DoubleAuction(cfg, seed=8)
