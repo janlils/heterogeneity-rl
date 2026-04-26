@@ -143,8 +143,8 @@ class AgentPopulation:
         for i in range(self.n_agents):
             aid = f"agent_{i}"
 
-            sentiment_0, alpha_i, beta_i, news_sens = self._sample_sentiment_params(d, cfg, sc)
-            gamma       = self._sample_gamma(d, cfg)
+            sentiment_0, alpha_i, beta_i, news_sens, trader_type = self._sample_sentiment_params(d, cfg, sc)
+            gamma       = self._sample_gamma(d, cfg, trader_type)
             threshold   = self._sample_threshold(d, cfg)
             max_pos     = self.env_cfg.max_position
             risk_av     = self._sample_risk_aversion(d, cfg)
@@ -179,7 +179,7 @@ class AgentPopulation:
         self, d: float, cfg: DiversityConfig, sc: SentimentConfig
     ) -> tuple:
         """
-        Losuje (sentiment_0, alpha_i, beta_i, news_sensitivity) dla agenta.
+        Losuje (sentiment_0, alpha_i, beta_i, news_sensitivity, trader_type) dla agenta.
 
         D=0: wszyscy identyczni — trader_type=0.5 (centrum), sentiment_0=0.
         D=1: pełny rozrzut — trader_type ~ Beta(0.3, 0.3), silnie spolaryzowany.
@@ -242,9 +242,9 @@ class AgentPopulation:
             # w _generate() po ustaleniu V_perceived.
             sentiment_0 = 0.0  # zostanie nadpisany w _generate()
 
-        return sentiment_0, alpha_i, beta_i, news
+        return sentiment_0, alpha_i, beta_i, news, trader_type
 
-    def _sample_gamma(self, d: float, cfg: DiversityConfig) -> float:
+    def _sample_gamma(self, d: float, cfg: DiversityConfig, trader_type: float) -> float:
         """
         Discount factor γ — horyzont czasowy agenta.
 
@@ -258,9 +258,9 @@ class AgentPopulation:
         """
         if not cfg.gamma_spread or d < 1e-6:
             return 0.90
-        low  = 0.90 - 0.10 * d   # D=0.5: 0.85,  D=1.0: 0.80
-        high = 0.90 + 0.09 * d   # D=0.5: 0.945, D=1.0: 0.99
-        return float(np.clip(self.rng.uniform(low, high), 0.80, 0.99))
+        gamma_lo = 0.95 - trader_type * 0.15
+        gamma_hi = 0.99 - trader_type * 0.11
+        return float(np.clip(self.rng.uniform(gamma_lo, gamma_hi), 0.80, 0.99))
 
     def _sample_threshold(self, d: float, cfg: DiversityConfig) -> float:
         """
@@ -340,13 +340,14 @@ class DoubleAuction:
 
     Przestrzeń akcji: 0=HOLD, 1=BUY, 2=SELL.
 
-    Obserwacja (11D):
+    Obserwacja (12D):
       patrz get_observation(); wektor opisuje sentiment, pozycję,
       unrealized P&L, czas, gamma, ruch ceny od startu epizodu,
-      krótki trend, value gap oraz cechy typu behawioralnego agenta.
+      krótki trend, value gap, cechy typu behawioralnego agenta
+      oraz nadwyżkę popytu z poprzedniego kroku.
 
     Reward:
-      realized_pnl_this_step (bez kar mid-episode).
+      realized_pnl_this_step + składnik MTM (bez kar mid-episode).
     """
 
     def __init__(self, cfg: HTMConfig, seed: Optional[int] = None):
@@ -373,6 +374,7 @@ class DoubleAuction:
         self._n_fills:            int              = 0
         self._n_position_closes:  int              = 0
         self._terminal_pnl:       Dict[str, float] = {}
+        self._prev_net_flow:      int              = 0
 
     # -----------------------------------------------------------------------
     # Reset
@@ -433,6 +435,7 @@ class DoubleAuction:
         self._episode_pnl = {aid: 0.0 for aid in self.population.agents}
         self._realized_this_step = {}
         self._terminal_pnl = {}
+        self._prev_net_flow = 0
 
         _log.debug(
             f"RESET | D={diversity_score:.2f} | eq={self._eq_price:.3f} | "
@@ -498,6 +501,7 @@ f"N={self.cfg.env.n_agents}"
         self._episode_pnl         = {aid: 0.0 for aid in self.population.agents}
         self._realized_this_step  = {}
         self._terminal_pnl        = {}
+        self._prev_net_flow       = 0
 
         return {aid: self.get_observation(aid) for aid in self.population.agents}
 
@@ -566,9 +570,9 @@ f"N={self.cfg.env.n_agents}"
 
     def execute_parallel_actions(self, actions: dict) -> None:
         """
-        Parallel execution: wszyscy agenci obserwują ten sam P_t,
-        składają akcje jednocześnie. Cena przesuwa się RAZ na podstawie
-        net_flow = liczba_BUY - liczba_SELL.
+        Matching atomowy w obrębie jednego kroku:
+        BUY i SELL są dobierane w pary, a cena przesuwa się tylko od
+        niezrealizowanej nadwyżki popytu/podaży.
 
         Zastępuje sekwencyjne wywołania execute_single_action w pętli.
         Używane przez: train_deep_sarsa.py, train_ppo.py, run_zi_baseline.
@@ -580,53 +584,56 @@ f"N={self.cfg.env.n_agents}"
             return None
 
         e = self.cfg.env
-
-        buys = [
+        P_before = self._ref_price
+        buy_agents = [
             aid for aid, action in actions.items()
             if aid in self.population.agents
             and action == e.ACTION_BUY_MARKET
-            and self.population.agents[aid].position
-                < self.population.agents[aid].max_position
+            and self.population.agents[aid].position < self.population.agents[aid].max_position
         ]
-        sells = [
+        sell_agents = [
             aid for aid, action in actions.items()
             if aid in self.population.agents
             and action == e.ACTION_SELL_MARKET
-            and self.population.agents[aid].position
-                > -self.population.agents[aid].max_position
+            and self.population.agents[aid].position > -self.population.agents[aid].max_position
         ]
+        excess = len(buy_agents) - len(sell_agents)
+        flow_fraction = excess / max(self.cfg.env.n_agents, 1)
+        p_exec_buy = float(np.clip(
+            P_before + e.half_spread + e.market_impact * flow_fraction,
+            e.p_min,
+            e.p_max,
+        ))
+        p_exec_sell = float(np.clip(
+            P_before - e.half_spread + e.market_impact * flow_fraction,
+            e.p_min,
+            e.p_max,
+        ))
 
-        net_flow = len(buys) - len(sells)
-        P_before = self._ref_price
-
-        # Rozlicz kupujących — wszyscy po tej samej cenie przed ruchem.
-        for aid in buys:
-            p_exec = float(np.clip(P_before + e.half_spread, e.p_min, e.p_max))
-            realized = self._execute_fill(aid, "buy", p_exec)
-            self._record_fill_price(p_exec)
+        for aid in buy_agents:
+            realized = self._execute_fill(aid, "buy", p_exec_buy)
+            self._record_fill_price(p_exec_buy)
             if realized != 0.0:
                 self._realized_this_step[aid] = (
                     self._realized_this_step.get(aid, 0.0) + realized
                 )
 
-        # Rozlicz sprzedających — wszyscy po tej samej cenie przed ruchem.
-        for aid in sells:
-            p_exec = float(np.clip(P_before - e.half_spread, e.p_min, e.p_max))
-            realized = self._execute_fill(aid, "sell", p_exec)
-            self._record_fill_price(p_exec)
+        for aid in sell_agents:
+            realized = self._execute_fill(aid, "sell", p_exec_sell)
+            self._record_fill_price(p_exec_sell)
             if realized != 0.0:
                 self._realized_this_step[aid] = (
                     self._realized_this_step.get(aid, 0.0) + realized
                 )
 
-        # Przesuń cenę raz na podstawie net_flow.
-        if net_flow != 0:
+        self._prev_net_flow = excess
+        if excess != 0:
             self._ref_price = float(np.clip(
-                P_before + e.perm_impact * np.sign(net_flow) * np.sqrt(abs(net_flow)),
+                P_before + e.perm_impact * np.sign(excess) * np.sqrt(abs(excess)),
                 e.p_min,
                 e.p_max,
             ))
-            self._price_history.append(self._ref_price)
+        self._price_history.append(self._ref_price)
 
         # Zaloguj akcje.
         for aid, action in actions.items():
@@ -671,21 +678,23 @@ f"N={self.cfg.env.n_agents}"
         self._update_sentiments(self._prev_price)
 
         # 4. Oblicz nagrody
-        # Reward = wyłącznie zrealizowany PnL z tego kroku.
-        # Brak kar mid-episode za trzymanie pozycji: kary powodowały że sieć
-        # uczyła się zamykać pozycje zbyt wcześnie (po 1-5 krokach), co przy
-        # random-walk rynku i koszcie spreadu daje accuracy < 0.5.
-        # Naturalna kara za złe pozycje istnieje przez terminal liquidation
-        # w _liquidate_terminal_positions() przy done=True.
+        # Reward = zrealizowany PnL z tego kroku + mark-to-market od ruchu ceny.
         rewards: Dict[str, float] = {}
+        price_delta = self._ref_price - self._prev_price
         for aid, p in self.population.agents.items():
             realized = self._realized_this_step.get(aid, 0.0)
-            rewards[aid] = realized
+            mtm = e.mtm_weight * p.position * price_delta
+            rewards[aid] = realized + mtm
             self._episode_pnl[aid] = self._episode_pnl.get(aid, 0.0) + realized
 
         self._step_prices.append(self._ref_price)
         self._prev_price         = self._ref_price
         self._realized_this_step = {}
+        self._ref_price = float(np.clip(
+            self._ref_price + self.cfg.env.mv_speed * (self._eq_price - self._ref_price),
+            self.cfg.env.p_min,
+            self.cfg.env.p_max,
+        ))
 
         self._step += 1
         done = self._step >= e.episode_steps
@@ -893,7 +902,7 @@ f"N={self.cfg.env.n_agents}"
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        11D wektor obserwacji — Sentiment model z informacją cenową.
+        12D wektor obserwacji — Sentiment model z informacją cenową.
 
           [0] sentiment       bear/bull state ∈ [-1, +1]
           [1] position_norm   position / max_position ∈ [-1, +1]
@@ -906,6 +915,7 @@ f"N={self.cfg.env.n_agents}"
           [8] alpha_norm      alpha_i / 0.40 ∈ [0, 1]
           [9] beta_norm       beta_i / 0.25 ∈ [0, 1]
           [10] threshold_norm threshold / 0.45 ∈ [0, 1]
+          [11] prev_net_flow_norm clip(prev_net_flow / n_agents, -1, 1)
         """
         p    = self.population.agents[agent_id]
         T    = self.cfg.env.episode_steps
@@ -942,6 +952,11 @@ f"N={self.cfg.env.n_agents}"
         alpha_norm = float(np.clip(p.alpha_i / 0.40, 0.0, 1.0))
         beta_norm = float(np.clip(p.beta_i / 0.25, 0.0, 1.0))
         threshold_norm = float(np.clip(p.threshold / 0.45, 0.0, 1.0))
+        prev_net_flow_norm = float(np.clip(
+            self._prev_net_flow / max(self.cfg.env.n_agents, 1),
+            -1.0,
+            1.0,
+        ))
 
         return np.array([
             float(np.clip(p.sentiment, -1.0, 1.0)),            # [0]
@@ -955,6 +970,7 @@ f"N={self.cfg.env.n_agents}"
             alpha_norm,                                         # [8]
             beta_norm,                                          # [9]
             threshold_norm,                                     # [10]
+            prev_net_flow_norm,                                 # [11]
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------

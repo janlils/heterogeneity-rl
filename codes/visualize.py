@@ -53,6 +53,7 @@ from codes.double_auction import (
     DoubleAuction, AgentPopulation, ZeroIntelligenceAgent,
     run_zi_baseline, _gini,
 )
+from codes.results_store import latest_run_dir
 
 logging.basicConfig(level=logging.WARNING)
 PLOTS_DIR = Path(__file__).parent.parent / "plots"
@@ -134,26 +135,26 @@ def _load_results_csv(csv_path: Optional[str] = None, quick: bool = False):
         return None, None
 
     if csv_path is None:
-        candidates = []
-        if quick:
-            candidates.append(PROJECT_ROOT / "results" / "deep_sarsa_quick_results.csv")
-        else:
-            candidates.extend([
-                PROJECT_ROOT / "results" / "deep_sarsa_results.csv",
-                PROJECT_ROOT / "results" / "deep_sarsa_quick_results.csv",
-            ])
-        existing = [p for p in candidates if p.exists()]
-        if not existing:
-            print("  [!] Brak CSV treningu. Uruchom najpierw train_deep_sarsa.")
+        run_dir = latest_run_dir()
+        if run_dir is None:
+            print("  [!] Brak results/run_*/episodes.csv. Uruchom najpierw trening.")
             return None, None
-        path = max(existing, key=lambda p: p.stat().st_mtime)
+        path = run_dir / "episodes.csv"
     else:
         path = Path(csv_path)
         if not path.exists():
             print(f"  [!] Brak CSV: {path}")
             return None, None
 
-    return pd.read_csv(path), path
+    df = pd.read_csv(path)
+    if "phase" in df.columns:
+        df = df[df["phase"] == "train"].copy()
+    if "algorithm" in df.columns:
+        df = df[df["algorithm"].astype(str).str.contains("SARSA", case=False, na=False)].copy()
+    if df.empty:
+        print(f"  [!] Brak rekordów treningowych SARSA w {path}")
+        return None, None
+    return df, path
 
 
 def _result_colors(d_vals):
@@ -1087,22 +1088,9 @@ def plot_sarsa_vs_zi(csv_path: Optional[str] = None,
     Glowny wykres artykulu (wersja rozbudowana z krzywymi uczenia i TD error).
     Czyta wyniki treningu z CSV.
     """
-    try:
-        import pandas as pd
-    except ImportError:
-        print("  [!] pandas nie dostepny")
+    df, path = _load_results_csv(csv_path)
+    if df is None:
         return
-
-    if csv_path is None:
-        csv_path = str(
-            Path(__file__).parent.parent / "results" / "deep_sarsa_results.csv"
-        )
-
-    if not Path(csv_path).exists():
-        print(f"  [!] Brak CSV: {csv_path} — uruchom trening najpierw")
-        return
-
-    df = pd.read_csv(csv_path)
     metric_col = "trade_accuracy"
     if metric_col not in df.columns:
         print("  [!] Brak trade_accuracy w CSV")
@@ -1229,22 +1217,9 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
     Jeden panel per D — trade_accuracy SARSA vs empiryczny baseline ZI.
     Najbardziej czytelny wykres do artykulu.
     """
-    try:
-        import pandas as pd
-    except ImportError:
-        print("  [!] pandas nie dostepny")
+    df, path = _load_results_csv(csv_path)
+    if df is None:
         return
-
-    if csv_path is None:
-        csv_path = str(
-            Path(__file__).parent.parent / "results" / "deep_sarsa_results.csv"
-        )
-
-    if not Path(csv_path).exists():
-        print(f"  [!] Brak CSV: {csv_path} — uruchom trening najpierw")
-        return
-
-    df = pd.read_csv(csv_path)
     if "trade_accuracy" not in df.columns:
         print("  [!] Brak trade_accuracy w CSV — uruchom nowy trening")
         return
@@ -1312,13 +1287,13 @@ def plot_trade_accuracy_curves(csv_path: Optional[str] = None,
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Wykresy HTM. Domyslnie czyta wyniki train_deep_sarsa z CSV.",
+        description="Wykresy HTM. Domyslnie czyta najnowszy results/run_*/episodes.csv.",
     )
-    parser.add_argument("--csv", type=str, help="Sciezka do CSV z treningu.")
+    parser.add_argument("--csv", type=str, help="Sciezka do episodes.csv z run folderu.")
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Uzyj results/deep_sarsa_quick_results.csv.",
+        help="Zachowane dla zgodnosci; loader i tak czyta run_*/episodes.csv.",
     )
     parser.add_argument(
         "--rolling-window",

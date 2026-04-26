@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from codes.results_store import latest_run_dir, prepare_run_dir, write_run_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -41,6 +42,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Uruchom PPO z one-hot agent_id doklejonym do obserwacji.",
     )
+    parser.add_argument("--run-tag", type=str, default="run", help="Krótki tag do nazwy folderu run.")
     return parser.parse_args()
 
 
@@ -49,7 +51,7 @@ def _add_optional(cmd: List[str], flag: str, value) -> None:
         cmd.extend([flag, str(value)])
 
 
-def build_sarsa_cmd(args: argparse.Namespace) -> List[str]:
+def build_sarsa_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
     cmd = [sys.executable, "-m", "codes.train_deep_sarsa"]
     if args.quick:
         cmd.append("--quick")
@@ -60,16 +62,18 @@ def build_sarsa_cmd(args: argparse.Namespace) -> List[str]:
     _add_optional(cmd, "--zi-episodes", args.zi_episodes)
     _add_optional(cmd, "--eval-episodes", args.eval_episodes)
     _add_optional(cmd, "--workers", args.workers)
+    cmd.extend(["--run-tag", args.run_tag, "--run-id", run_id, "--run-dir", str(run_dir)])
     return cmd
 
 
-def build_ppo_cmd(args: argparse.Namespace) -> List[str]:
+def build_ppo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
     cmd = [sys.executable, "-m", "codes.train_ppo"]
     if args.quick:
         cmd.append("--quick")
     if args.agent_id_features:
         cmd.append("--agent-id-features")
     _add_optional(cmd, "--workers", args.workers)
+    cmd.extend(["--run-tag", args.run_tag, "--run-id", run_id, "--run-dir", str(run_dir)])
     return cmd
 
 
@@ -85,18 +89,6 @@ def run_command(label: str, cmd: List[str]) -> None:
     print("=" * 78, flush=True)
 
 
-def _eval_csv_paths(quick: bool) -> tuple[Path, Path]:
-    if quick:
-        return (
-            PROJECT_ROOT / "results" / "deep_sarsa_quick_eval_results.csv",
-            PROJECT_ROOT / "results" / "ppo_quick_eval_results.csv",
-        )
-    return (
-        PROJECT_ROOT / "results" / "deep_sarsa_eval_results.csv",
-        PROJECT_ROOT / "results" / "ppo_eval_results.csv",
-    )
-
-
 def _mean_or_none(df, column: str) -> Optional[float]:
     if column not in df.columns or df.empty:
         return None
@@ -110,19 +102,30 @@ def _fmt(value: Optional[float], width: int, decimals: int = 3) -> str:
 
 
 def print_eval_comparison(quick: bool) -> None:
-    sarsa_csv, ppo_csv = _eval_csv_paths(quick)
-    if not sarsa_csv.exists() or not ppo_csv.exists():
+    run_dir = latest_run_dir()
+    episodes_csv = None if run_dir is None else run_dir / "episodes.csv"
+    if episodes_csv is None or not episodes_csv.exists():
         print()
         print("=" * 78, flush=True)
         print("PORÓWNANIE EVAL POMINIĘTE", flush=True)
-        print(f"Brak pliku: {sarsa_csv if not sarsa_csv.exists() else ppo_csv}", flush=True)
+        print("Brak results/run_*/episodes.csv", flush=True)
         print("=" * 78, flush=True)
         return
 
     import pandas as pd
 
-    sarsa = pd.read_csv(sarsa_csv)
-    ppo = pd.read_csv(ppo_csv)
+    episodes = pd.read_csv(episodes_csv)
+    eval_df = episodes[episodes["phase"].astype(str).str.startswith("eval")].copy()
+    sarsa = eval_df[eval_df["algorithm"].astype(str).str.contains("SARSA", case=False, na=False)]
+    ppo = eval_df[eval_df["algorithm"].astype(str).str.contains("PPO", case=False, na=False)]
+    ppo = ppo[~ppo["algorithm"].astype(str).str.contains("NO_IMPACT", case=False, na=False)]
+    if sarsa.empty or ppo.empty:
+        print()
+        print("=" * 78, flush=True)
+        print("PORÓWNANIE EVAL POMINIĘTE", flush=True)
+        print(f"Brak odpowiednich rekordów eval w {episodes_csv}", flush=True)
+        print("=" * 78, flush=True)
+        return
     d_vals = sorted(set(sarsa["diversity_score"].unique()) | set(ppo["diversity_score"].unique()))
 
     print()
@@ -163,27 +166,44 @@ def print_eval_comparison(quick: bool) -> None:
         )
 
     print("-" * 118, flush=True)
-    print(f"SARSA eval CSV: {sarsa_csv.relative_to(PROJECT_ROOT)}", flush=True)
-    print(f"PPO eval CSV:   {ppo_csv.relative_to(PROJECT_ROOT)}", flush=True)
+    print(f"Run folder: {run_dir.relative_to(PROJECT_ROOT)}", flush=True)
+    print(f"Episodes CSV: {episodes_csv.relative_to(PROJECT_ROOT)}", flush=True)
     print("=" * 118, flush=True)
 
 
 def main() -> None:
     args = parse_args()
     total_t0 = time.time()
+    run_id, run_dir = prepare_run_dir(args.run_tag)
+    write_run_config(run_dir / "run_config.json", {
+        "run_id": run_id,
+        "run_tag": args.run_tag,
+        "timestamp": run_id.split("_", 1)[1] if run_id.startswith("run_") else run_id,
+        "algorithm": "train_all",
+        "quick": args.quick,
+        "only": args.only,
+        "episodes": args.episodes,
+        "steps": args.steps,
+        "seeds": args.seeds,
+        "agents": args.agents,
+        "zi_episodes": args.zi_episodes,
+        "eval_episodes": args.eval_episodes,
+        "workers": args.workers,
+        "agent_id_features": args.agent_id_features,
+    })
 
     if args.only in {"all", "sarsa"}:
-        run_command("Deep SARSA", build_sarsa_cmd(args))
+        run_command("Deep SARSA", build_sarsa_cmd(args, run_id, run_dir))
     if args.only in {"all", "ppo"}:
-        run_command("PPO", build_ppo_cmd(args))
+        run_command("PPO", build_ppo_cmd(args, run_id, run_dir))
 
     print_eval_comparison(args.quick)
 
     print()
     print("=" * 78, flush=True)
     print(f"WSZYSTKIE WYBRANE BENCHMARKI ZAKOŃCZONE: {time.time() - total_t0:.0f}s", flush=True)
-    print("Wyniki: results/deep_sarsa*_results.csv oraz results/ppo*_results.csv", flush=True)
-    print("Eval:  results/deep_sarsa*_eval_results.csv oraz results/ppo*_eval_results.csv", flush=True)
+    print(f"Wyniki: {run_dir.relative_to(PROJECT_ROOT)}/episodes.csv", flush=True)
+    print(f"Próbka: {run_dir.relative_to(PROJECT_ROOT)}/agents_sample.csv", flush=True)
     print("=" * 78, flush=True)
 
 

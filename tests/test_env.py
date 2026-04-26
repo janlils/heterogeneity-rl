@@ -65,7 +65,7 @@ def test_no_impact_env_factory_sets_zero_perm_impact():
     assert env.half_spread == 0.0001
 
 
-def test_parallel_actions_execute_at_same_price_and_move_once():
+def test_parallel_actions_match_pairs_and_move_from_excess():
     cfg = make_cfg(n_agents=4, episode_steps=5, half_spread=0.0, perm_impact=0.01)
     da = DoubleAuction(cfg, seed=8)
     da.reset(diversity_score=0.5, seed=8)
@@ -79,11 +79,42 @@ def test_parallel_actions_execute_at_same_price_and_move_once():
         agent_ids[3]: cfg.env.ACTION_HOLD,
     })
 
-    assert da.population.agents[agent_ids[0]].entry_price == p0
-    assert da.population.agents[agent_ids[1]].entry_price == p0
+    buy_positions = [da.population.agents[aid].position for aid in agent_ids[:2]]
+    buy_entries = [da.population.agents[aid].entry_price for aid in agent_ids[:2]]
+    assert sorted(buy_positions) == [0, 1]
+    assert sorted(buy_entries) == [0.0, p0]
+    assert da.population.agents[agent_ids[2]].position == -1
     assert da.population.agents[agent_ids[2]].entry_price == p0
     assert da.ref_price == np.clip(p0 + cfg.env.perm_impact, cfg.env.p_min, cfg.env.p_max)
-    assert da.episode_metrics()["n_trades"] == 3
+    assert da.episode_metrics()["n_trades"] == 2
+
+
+def test_parallel_matching_with_excess_keeps_unmatched_buys_unchanged():
+    cfg = make_cfg(n_agents=20, episode_steps=5, half_spread=0.0, perm_impact=0.01)
+    da = DoubleAuction(cfg, seed=11)
+    da.reset(diversity_score=0.5, seed=11)
+    agent_ids = list(da.population.agents)
+    p0 = da.ref_price
+    actions = {
+        aid: cfg.env.ACTION_HOLD for aid in agent_ids
+    }
+    for aid in agent_ids[:10]:
+        actions[aid] = cfg.env.ACTION_BUY_MARKET
+    for aid in agent_ids[10:15]:
+        actions[aid] = cfg.env.ACTION_SELL_MARKET
+
+    da.execute_parallel_actions(actions)
+
+    buy_positions = [da.population.agents[aid].position for aid in agent_ids[:10]]
+    sell_positions = [da.population.agents[aid].position for aid in agent_ids[10:15]]
+    assert sum(pos == 1 for pos in buy_positions) == 5
+    assert sum(pos == 0 for pos in buy_positions) == 5
+    assert all(pos == -1 for pos in sell_positions)
+    assert da.ref_price == np.clip(
+        p0 + cfg.env.perm_impact * np.sqrt(5),
+        cfg.env.p_min,
+        cfg.env.p_max,
+    )
 
 
 def test_realized_pnl_uses_entry_and_exit_prices_only():

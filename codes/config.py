@@ -33,17 +33,20 @@ class EnvConfig:
 
     Każdy agent handluje przez T=episode_steps kroków.
     Nikt nie 'wychodzi' po transakcji — agenci zarządzają portfolio.
-    Reward = realized_pnl_this_step; złe otwarte pozycje rozlicza terminal liquidation.
+    Reward = realized_pnl_this_step + MTM; złe otwarte pozycje rozlicza terminal liquidation.
     """
     n_agents:               int   = 50
     episode_steps:          int   = 200    # T: długość epizodu
-    max_position:           int   = 3      # domyślne max |position|
+    max_position:           int   = 1      # domyślne max |position|
 
     # Market maker / dealer execution
     use_market_maker:       bool  = True
     half_spread:            float = 0.0005
+    market_impact:          float = 0.006
     temp_impact:            float = 0.000
     perm_impact:            float = 0.0016
+    mtm_weight:             float = 0.3
+    mv_speed:               float = 0.01
     p_min:                  float = 0.05
     p_max:                  float = 0.95
     auto_liquidate_end:     bool  = True
@@ -61,9 +64,9 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 11  # [sentiment, pos_norm, unrealized, time_rem,
+        return 12  # [sentiment, pos_norm, unrealized, time_rem,
                    #  gamma, price_vs_start, trend_short, value_gap,
-                   #  alpha_norm, beta_norm, threshold_norm]
+                   #  alpha_norm, beta_norm, threshold_norm, prev_net_flow_norm]
 
     @classmethod
     def no_impact(cls) -> "EnvConfig":
