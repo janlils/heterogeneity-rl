@@ -44,7 +44,9 @@ class NumpyMLP:
         self.b1 = np.zeros(n_hidden, np.float32)
         self.W2 = rng.standard_normal((n_hidden, n_hidden)).astype(np.float32) * scale2
         self.b2 = np.zeros(n_hidden, np.float32)
-        self.W3 = rng.standard_normal((n_out, n_hidden)).astype(np.float32) * scale2
+        # Q-head startuje blisko zera, żeby bootstrap nie był zdominowany
+        # przez przypadkowe duże wartości Q przed pojawieniem się sygnału z rewardu.
+        self.W3 = rng.standard_normal((n_out, n_hidden)).astype(np.float32) * 1e-2
         self.b3 = np.zeros(n_out, np.float32)
 
         # Adam moments
@@ -186,6 +188,37 @@ class DeepSARSAAgent:
         if not can_sell: q[2] = -np.inf
         return int(np.argmax(q))
 
+    def expected_next_q(self, obs: np.ndarray) -> float:
+        """
+        Expected SARSA bootstrap pod polityką epsilon-greedy.
+
+        Zamiast losować jedną następną akcję i brać Q(s', a'), liczymy
+        wartość oczekiwaną po wszystkich dozwolonych akcjach. To zmniejsza
+        wariancję targetu przy zachowaniu on-policy charakteru aktualizacji.
+        """
+        can_buy, can_sell = self._mask(obs)
+        valid = [0]
+        if can_buy:
+            valid.append(1)
+        if can_sell:
+            valid.append(2)
+        if len(valid) == 1 and valid[0] == 0 and not can_buy and not can_sell:
+            return 0.0
+
+        q_next = self.net.predict(obs)
+        if not can_buy:
+            q_next[1] = -np.inf
+        if not can_sell:
+            q_next[2] = -np.inf
+
+        greedy = int(np.argmax(q_next))
+        eps_share = self.epsilon / len(valid)
+        expected = 0.0
+        for action in valid:
+            prob = eps_share + (1.0 - self.epsilon if action == greedy else 0.0)
+            expected += prob * float(q_next[action])
+        return expected
+
     def update(
         self,
         obs:      np.ndarray,
@@ -202,22 +235,7 @@ class DeepSARSAAgent:
         if done:
             td_target = float(reward)
         else:
-            can_b, can_s = self._mask(next_obs)
-            if not can_b and not can_s:
-                next_q = 0.0
-            else:
-                q_next = self.net.predict(next_obs)
-                if not can_b: q_next[1] = -np.inf
-                if not can_s: q_next[2] = -np.inf
-                # on-policy: epsilon-greedy next action
-                if self.rng.random() < self.epsilon:
-                    valid = [0]
-                    if can_b: valid += [1]
-                    if can_s: valid += [2]
-                    next_a = int(self.rng.choice(valid))
-                else:
-                    next_a = int(np.argmax(q_next))
-                next_q = float(q_next[next_a])
+            next_q = self.expected_next_q(next_obs)
             td_target = float(reward) + self.gamma * next_q
 
         td_error  = td_target - q_current

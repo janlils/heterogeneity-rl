@@ -41,12 +41,13 @@ class EnvConfig:
 
     # Market maker / dealer execution
     use_market_maker:       bool  = True
-    half_spread:            float = 0.0005
-    market_impact:          float = 0.006
+    half_spread:            float = 0.0
+    market_impact:          float = 0.0
     temp_impact:            float = 0.000
-    perm_impact:            float = 0.0016
+    perm_impact:            float = 0.0
     mtm_weight:             float = 0.3
-    mv_speed:               float = 0.01
+    mv_speed:               float = 0.1
+    sigma_P_noise:          float = 0.003
     p_min:                  float = 0.05
     p_max:                  float = 0.95
     auto_liquidate_end:     bool  = True
@@ -64,13 +65,12 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 12  # [sentiment, pos_norm, unrealized, time_rem,
-                   #  gamma, price_vs_start, trend_short, value_gap,
-                   #  alpha_norm, beta_norm, threshold_norm, prev_net_flow_norm]
+        return 8   # [signal_i, pos_norm, unrealized, time_rem,
+                   #  gamma, price_vs_start, trend_short, sigma_norm]
 
     @classmethod
     def no_impact(cls) -> "EnvConfig":
-        return cls(perm_impact=0.0, half_spread=0.0001)
+        return cls(perm_impact=0.0, half_spread=0.0)
 
     def action_name(self, idx: int) -> str:
         return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
@@ -119,20 +119,12 @@ class SentimentConfig:
     """
     # Dynamika V_t
     sigma_intra:             float = 0.003   # dryft V_t per krok (wewnątrz epizodu)
-    sigma_macro:             float = 0.015   # skok V_t między epizodami
-    p_info:                  float = 0.12    # prawdopodobieństwo sygnału info per krok
-    sigma_news:              float = 0.04    # szum prywatnej interpretacji newsa
-    sigma_P:                 float = 0.003   # normalizacja zmiany ceny do tanh
-
-    # Centra parametrów behawioralnych (przy D=0 wszyscy mają te wartości)
-    alpha_center:            float = 0.07    # momentum: waga sygnału cenowego
-    beta_center:             float = 0.07    # mean reversion: powrót do neutralu
-    news_sensitivity_center: float = 0.12   # waga sygnału informacyjnego z V_t
-
-    # Zakresy przy D=1 (losowane jednostajnie: center ± half_range)
-    alpha_spread:            float = 0.22    # → zakres [0.03, 0.25] przy D=1
-    beta_spread:             float = 0.12    # → zakres [0.03, 0.15] przy D=1
-    news_sensitivity_spread: float = 0.35   # → zakres [0.05, 0.40] przy D=1
+    sigma_macro:             float = 0.006   # skok V_t między epizodami
+    sigma_P:                 float = 0.010   # normalizacja zmiany ceny do tanh
+    drift_persistence:       float = 0.80
+    sigma_fund:              float = 0.02    # szum fundamentalisty (trader_type=0)
+    sigma_chart:             float = 0.15    # szum chartysty (trader_type=1)
+    signal_scale:            float = 0.20    # normalizacja sygnału
 
 # ---------------------------------------------------------------------------
 # Heterogeniczność
@@ -148,13 +140,13 @@ class DiversityConfig:
     threshold_spread:    bool = True   # różne progi decyzji o handlu
     gamma_spread:        bool = True   # horyzonty czasowe
     risk_aversion_spread:bool = True   # awersja do ryzyka pozycji
-    behavioral_spread:   bool = True   # parametry α_i, β_i, news_sensitivity
+    sigma_spread:        bool = True   # poziom szumu prywatnego sygnału
 
     @classmethod
     def sentiment_only(cls) -> "DiversityConfig":
         """Tylko sentiment — najczystszy test modelu spekulacyjnego."""
         return cls(threshold_spread=False, gamma_spread=False,
-                   behavioral_spread=False)
+                   sigma_spread=False)
 
     @classmethod
     def full(cls) -> "DiversityConfig":
@@ -177,7 +169,7 @@ class DeepSARSAConfig:
     epsilon_end:    float = 0.05
     epsilon_decay:  float = 0.993
     grad_clip:      float = 1.0     # gradient clipping
-    n_step:         int   = 10      # liczba kroków do przodu dla n-step returns
+    n_step:         int   = 1       # liczba kroków do przodu dla n-step returns
 
 
 # ---------------------------------------------------------------------------

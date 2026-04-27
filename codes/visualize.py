@@ -10,8 +10,8 @@ Wersja zsynchronizowana z aktualnym API:
   - obs[1] = position_norm
 
 Wykresy:
-  01  Rozklady sentimentu agentow przy roznych D
-  02  Parametry heterogenicznosci (gamma, threshold, risk_aversion, sentiment)
+  01  Rozklady sygnalu/sentimentu agentow przy roznych D
+  02  Parametry heterogenicznosci (gamma, threshold, risk_aversion, sigma_i, sentiment)
   03  Emergencja rol BUY/SELL/HOLD jako funkcja D
   04  Dynamika ceny rynkowej w jednym epizodzie
   05  Sentiment vs realized P&L (kolorowany trade_accuracy per agent)
@@ -228,20 +228,18 @@ def plot_valuation_distributions(n_agents: int = 40, n_seeds: int = 20) -> None:
 # ===========================================================================
 
 def plot_heterogeneity_parameters(n_agents: int = 60, n_seeds: int = 10) -> None:
-    """Rozklady gamma, threshold, risk_aversion i parametrow behawioralnych."""
-    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    """Rozklady gamma, threshold, risk_aversion, sentiment i sigma_i."""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     fig.suptitle("Rozklady parametrow heterogenicznosci — D = 0 / 0.5 / 1.0",
                  fontsize=13, fontweight="bold")
     cfg = _cfg(n_agents=n_agents)
 
     params = [
         ("gamma",          "Discount factor gamma",     [0.5, 1.0],  "Horyzont czasowy"),
-        ("threshold",      "Prog decyzji",              [0.0, 0.30], "Min |val-price| do handlu"),
+        ("threshold",      "Prog decyzji",              [0.0, 0.30], "Kompatybilnosc / stale pole"),
         ("risk_aversion",  "Awersja do ryzyka lambda",  [0.0, 3.0],  "Kara za duza pozycje (CT)"),
         ("sentiment",      "Sentiment",                 [-1.0, 1.0], "Nastroj poczatkowy"),
-        ("alpha_i",        "alpha_i",                   [0.0, 0.4],  "Momentum ceny"),
-        ("beta_i",         "beta_i",                    [0.0, 0.25], "Powrot do neutralu"),
-        ("news_sensitivity","news_sensitivity",         [0.0, 0.5],  "Reakcja na news"),
+        ("sigma_i",        "sigma_i",                   [0.0, 0.18], "Poziom szumu sygnalu"),
     ]
     d_sub    = [0.0, 0.5, 1.0]
     d_colors = [COLORS["D0.0"], COLORS["D0.4"], COLORS["D1.0"]]
@@ -266,6 +264,9 @@ def plot_heterogeneity_parameters(n_agents: int = 60, n_seeds: int = 10) -> None
         ax.set_xlim(xlim)
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
+
+    for ax in axes.flat[len(params):]:
+        ax.set_visible(False)
 
     _tight()
     _save(fig, "02_heterogeneity_parameters.png")

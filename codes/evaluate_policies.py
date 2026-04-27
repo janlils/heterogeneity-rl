@@ -15,7 +15,7 @@ import numpy as np
 
 from codes.config import EnvConfig, HTMConfig
 from codes.double_auction import DoubleAuction, ZeroIntelligenceAgent
-from codes.rl_common import build_episode_record, set_global_seeds
+from codes.rl_common import build_agent_sample_row, build_env_step_row, build_episode_record, set_global_seeds
 
 
 def _action_for_policy(algorithm_name: str, policy, obs, aid: str) -> int:
@@ -68,7 +68,7 @@ def evaluate_policy(
     seed: int,
     zi_baseline_trade_accuracy: Optional[float] = None,
     zi_baseline_positive_pnl_frac: Optional[float] = None,
-) -> tuple[List[dict], List[dict]]:
+) -> tuple[List[dict], List[dict], List[dict]]:
     set_global_seeds(seed)
     da = DoubleAuction(cfg, seed=seed)
     da.reset(diversity_score=diversity_score, seed=seed)
@@ -83,11 +83,12 @@ def evaluate_policy(
     records: List[dict] = []
     agent_gammas = [da.population.agents[aid].gamma for aid in agent_ids]
     sample_rows: List[dict] = []
-    sample_episodes = {0, n_episodes // 2, max(n_episodes - 1, 0)}
+    env_step_rows: List[dict] = []
+    sample_episodes = {0}
     trader_meta = []
     for aid in agent_ids:
         agent = da.population.agents[aid]
-        trader_type = agent.alpha_i / max(agent.alpha_i + agent.beta_i, 1e-9)
+        trader_type = agent.sigma_i / max(cfg.sentiment.sigma_chart, 1e-9)
         trader_meta.append((aid, trader_type))
     trader_meta.sort(key=lambda item: item[1])
     fundamentalist_id, fundamentalist_type = trader_meta[0]
@@ -102,12 +103,24 @@ def evaluate_policy(
     for episode in range(n_episodes):
         da.reset_episode()
         step_actions: List[np.ndarray] = []
-        prev_positions = {aid: da.population.agents[aid].position for aid in sampled_agents}
-        sample_this_episode = episode in sample_episodes
+        prev_positions = {aid: da.population.agents[aid].position for aid in agent_ids}
+        sample_this_episode = episode in sample_episodes and seed == 0 and abs(diversity_score - 1.0) < 1e-9
 
         while not da.done:
             obs_by_agent = {}
             actions = {}
+            positions_before = dict(prev_positions)
+            eq_price_before = float(da.eq_price)
+            ref_price_before = float(da.ref_price)
+            public_gap = float(np.clip(
+                (eq_price_before - ref_price_before) / max(cfg.sentiment.signal_scale, 1e-9),
+                -1.0,
+                1.0,
+            ))
+            realized_before = {
+                aid: da.population.agents[aid].realized_pnl
+                for aid in agent_ids
+            }
             for aid in agent_ids:
                 obs = da.get_observation(aid)
                 obs_by_agent[aid] = obs
@@ -120,34 +133,100 @@ def evaluate_policy(
             step_actions.append(np.array([actions[aid] for aid in agent_ids], dtype=np.int32))
             da.execute_parallel_actions(actions)
             rewards, _ = da.compute_step_rewards()
-            if sample_this_episode and da._step % 5 == 0:
-                for aid, (agent_type, trader_type) in sampled_agents.items():
+            if sample_this_episode:
+                public_gap_after = float(np.clip(
+                    (da.eq_price - da.ref_price) / max(cfg.sentiment.signal_scale, 1e-9),
+                    -1.0,
+                    1.0,
+                ))
+                for aid in agent_ids:
                     agent = da.population.agents[aid]
                     obs = obs_by_agent[aid]
-                    executed = agent.position != prev_positions[aid]
-                    sample_rows.append({
-                        "algorithm": algorithm_name,
-                        "phase": "eval",
-                        "diversity_score": diversity_score,
-                        "seed": seed,
-                        "episode": episode,
-                        "step": da._step,
-                        "agent_id": aid,
-                        "trader_type": trader_type,
-                        "agent_type": agent_type,
-                        "action": actions[aid],
-                        "action_name": cfg.env.action_name(actions[aid]),
-                        "executed": executed,
-                        "sentiment": float(agent.sentiment),
-                        "value_gap": float(obs[7]),
-                        "position": int(agent.position),
-                        "realized_pnl_this_step": float(rewards.get(aid, 0.0)),
-                        "prev_net_flow_norm": float(obs[-1]),
-                        "alpha_i": float(agent.alpha_i),
-                        "beta_i": float(agent.beta_i),
-                        "threshold": float(agent.threshold),
-                    })
+                    trader_type = agent.sigma_i / max(cfg.sentiment.sigma_chart, 1e-9)
+                    if trader_type <= 0.33:
+                        agent_type = "fundamentalista"
+                    elif trader_type >= 0.67:
+                        agent_type = "chartista"
+                    else:
+                        agent_type = "mieszany"
+                    executed = agent.position != positions_before.get(aid, agent.position)
+                    realized_pnl_this_step = float(agent.realized_pnl - realized_before[aid])
+                    sample_rows.append(build_agent_sample_row(
+                        algorithm=algorithm_name,
+                        phase="eval",
+                        diversity_score=diversity_score,
+                        seed=seed,
+                        episode=episode,
+                        step=da._step,
+                        agent_id=aid,
+                        trader_type=trader_type,
+                        agent_type=agent_type,
+                        action=actions[aid],
+                        action_name=cfg.env.action_name(actions[aid]),
+                        executed=executed,
+                        obs=obs,
+                        public_gap_before=public_gap,
+                        eq_price_before=eq_price_before,
+                        ref_price_before=ref_price_before,
+                        public_gap_after=public_gap_after,
+                        eq_price_after=da.eq_price,
+                        ref_price_after=da.ref_price,
+                        position_before=positions_before.get(aid, agent.position),
+                        position=agent.position,
+                        entry_price_after=agent.entry_price,
+                        reward_this_step=float(rewards.get(aid, 0.0)),
+                        realized_pnl_this_step=realized_pnl_this_step,
+                        realized_pnl_cum=agent.realized_pnl,
+                        n_trades_closed=agent.n_trades_closed,
+                        sentiment=agent.sentiment,
+                        sigma_i=agent.sigma_i,
+                        threshold=agent.threshold,
+                    ))
                     prev_positions[aid] = agent.position
+                mean_signal = float(np.mean([float(obs_by_agent[aid][0]) for aid in agent_ids]))
+                std_signal = float(np.std([float(obs_by_agent[aid][0]) for aid in agent_ids]))
+                mean_sigma = float(np.mean([float(da.population.agents[aid].sigma_i) for aid in agent_ids]))
+                mean_position_before = float(np.mean([positions_before.get(aid, 0) for aid in agent_ids]))
+                mean_position_after = float(np.mean([da.population.agents[aid].position for aid in agent_ids]))
+                n_buy = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_BUY_MARKET)
+                n_sell = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_SELL_MARKET)
+                n_hold = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_HOLD)
+                realized_vals = [
+                    float(da.population.agents[aid].realized_pnl - realized_before[aid])
+                    for aid in agent_ids
+                ]
+                reward_vals = [float(rewards.get(aid, 0.0)) for aid in agent_ids]
+                env_step_rows.append(build_env_step_row(
+                    algorithm=algorithm_name,
+                    phase="eval",
+                    diversity_score=diversity_score,
+                    seed=seed,
+                    episode=episode,
+                    step=da._step,
+                    eq_price_before=eq_price_before,
+                    ref_price_before=ref_price_before,
+                    public_gap_before=public_gap,
+                    eq_price_after=da.eq_price,
+                    ref_price_after=da.ref_price,
+                    public_gap_after=public_gap_after,
+                    price_delta_step=da.ref_price - ref_price_before,
+                    mean_signal=mean_signal,
+                    std_signal=std_signal,
+                    mean_sigma=mean_sigma,
+                    mean_position_before=mean_position_before,
+                    mean_position_after=mean_position_after,
+                    n_buy=n_buy,
+                    n_sell=n_sell,
+                    n_hold=n_hold,
+                    net_flow=n_buy - n_sell,
+                    mean_reward=float(np.mean(reward_vals)),
+                    mean_realized_pnl=float(np.mean(realized_vals)),
+                    mean_mtm=float(np.mean([r - x for r, x in zip(reward_vals, realized_vals)])),
+                    n_executed=sum(
+                        1 for aid in agent_ids if da.population.agents[aid].position != positions_before.get(aid, 0)
+                    ),
+                    n_trades_closed_cum=sum(da.population.agents[aid].n_trades_closed for aid in agent_ids),
+                ))
 
         metrics = da.episode_metrics()
         same_action_frac, effective_n = _coordination_stats(step_actions, cfg.env.n_actions)
@@ -171,7 +250,7 @@ def evaluate_policy(
             agent_gammas=agent_gammas,
         ))
 
-    return records, sample_rows
+    return records, sample_rows, env_step_rows
 
 
 def evaluate_zi(
@@ -179,7 +258,7 @@ def evaluate_zi(
     diversity_score: float,
     n_episodes: int,
     seed: int,
-) -> tuple[List[dict], List[dict]]:
+) -> tuple[List[dict], List[dict], List[dict]]:
     return evaluate_policy("ZI", None, cfg, diversity_score, n_episodes, seed)
 
 
@@ -191,7 +270,7 @@ def evaluate_sarsa(
     seed: int,
     zi_baseline_trade_accuracy: Optional[float] = None,
     zi_baseline_positive_pnl_frac: Optional[float] = None,
- ) -> tuple[List[dict], List[dict]]:
+ ) -> tuple[List[dict], List[dict], List[dict]]:
     return evaluate_policy(
         "DeepSARSA_EVAL",
         policy,
@@ -212,7 +291,7 @@ def evaluate_ppo(
     seed: int,
     zi_baseline_trade_accuracy: Optional[float] = None,
     zi_baseline_positive_pnl_frac: Optional[float] = None,
- ) -> tuple[List[dict], List[dict]]:
+ ) -> tuple[List[dict], List[dict], List[dict]]:
     return evaluate_policy(
         "PPO_EVAL",
         policy,
@@ -233,7 +312,7 @@ def evaluate_ppo_no_impact(
     seed: int,
     zi_baseline_trade_accuracy: Optional[float] = None,
     zi_baseline_positive_pnl_frac: Optional[float] = None,
-) -> tuple[List[dict], List[dict]]:
+) -> tuple[List[dict], List[dict], List[dict]]:
     env_no_impact = dataclasses.replace(
         EnvConfig.no_impact(),
         n_agents=cfg.env.n_agents,

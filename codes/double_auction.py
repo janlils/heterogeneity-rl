@@ -4,15 +4,16 @@ codes/double_auction.py — Model spekulacyjny HTM
 Kluczowa zmiana względem modelu G&S:
 
   Model docelowy:
-    - Brak stałych ról. Każdy agent ma sentiment ∈ [-1, +1].
-    - Jeśli sentiment > threshold → sygnał KUP / long.
-    - Jeśli sentiment < -threshold → sygnał SPRZEDAJ / short.
+    - Brak stałych ról i brak statycznej prywatnej wyceny.
+    - Każdy agent obserwuje per krok prywatny sygnał:
+      (V_t - P_t + noise_i) / signal_scale.
+    - Heterogeniczność pochodzi z sigma_i: niski szum = lepszy sygnał.
     - BUY/SELL są wykonywane natychmiast przez market makera.
-    - PnL wynika wyłącznie z cen wejścia i wyjścia, nie z sentimentu.
+    - PnL wynika wyłącznie z cen wejścia i wyjścia.
 
 Klasy:
-  AgentParams      — profil agenta (sentiment, threshold, gamma)
-  AgentPopulation  — generuje N agentów bez stałych ról
+  AgentParams      — profil agenta (sigma_i, gamma, threshold)
+  AgentPopulation  — generuje N agentów z różnym poziomem szumu sygnału
   DoubleAuction    — główne środowisko CT z równoległą egzekucją market maker
   ZeroIntelligence — baseline (losowa agresywność, losowa decyzja buy/sell/pass)
 """
@@ -47,18 +48,13 @@ class AgentParams:
     Profil agenta w modelu sentiment.
 
     Główna zmiana vs poprzedniej wersji:
-      - expected_price / long_run_fair_price zastąpione przez sentiment ∈ [-1, +1]
-      - belief: BeliefState usunięty
-      - Dodane: alpha_i, beta_i, news_sensitivity, V_perceived
+      - prywatny sygnał jest liczony per krok z (V_t - P_t + noise)
+      - heterogeniczność pochodzi z sigma_i
     """
     agent_id:           str
-    sentiment:          float = 0.0    # ∈ [-1, +1]: -1 = silnie niedźwiedzi, +1 = byczo
-    alpha_i:            float = 0.08   # momentum: waga sygnału cenowego per krok
-    beta_i:             float = 0.06   # mean reversion: powrót do neutralu (0.0)
-    news_sensitivity:   float = 0.12   # waga sygnału informacyjnego z V_t
-    V_perceived:        float = 0.5    # prywatna wycena fundamentalna agenta
-
-    threshold:          float = 0.20   # min |sentiment| żeby mieć sygnał handlowy
+    sentiment:          float = 0.0
+    sigma_i:            float = 0.08   # poziom szumu prywatnego sygnału
+    threshold:          float = 0.0
     gamma:              float = 0.90   # discount factor (indywidualny, wchodzi do TD)
     risk_aversion:      float = 1.00   # λ: kara za otwartą pozycję w reward
     max_position:       int   = 5      # maks |position|
@@ -69,14 +65,6 @@ class AgentParams:
     realized_pnl:       float = 0.0
     n_trades_closed:    int   = 0
     n_trades_won:       int   = 0
-
-    def trade_signal(self) -> str:
-        """Sygnał handlowy na podstawie sentimentu i progu."""
-        if self.sentiment > self.threshold:
-            return "buy"
-        elif self.sentiment < -self.threshold:
-            return "sell"
-        return "none"
 
     def reset_position(self) -> None:
         """Reset pozycji i P&L na początku epizodu."""
@@ -89,9 +77,8 @@ class AgentParams:
     def __repr__(self) -> str:
         return (
             f"Agent({self.agent_id}, sent={self.sentiment:.3f}, "
-            f"V_perc={self.V_perceived:.3f}, "
             f"thr={self.threshold:.3f}, γ={self.gamma:.2f}, "
-            f"α={self.alpha_i:.3f}, β={self.beta_i:.3f})"
+            f"sigma={self.sigma_i:.3f})"
         )
 
 
@@ -101,17 +88,12 @@ class AgentParams:
 
 class AgentPopulation:
     """
-    Generuje N agentów z prywatną wyceną fundamentalną aktywa.
+    Generuje N agentów z różnym poziomem szumu prywatnego sygnału.
 
     Mechanizm heterogeniczności:
-      D=0: wszyscy mają valuation = eq_price → brak transakcji (no-trade theorem)
-      D=0.5: wyceny w [eq-0.2, eq+0.2] → umiarkowane różnice, sporo handlu
-      D=1: wyceny w [0.05, 0.95] → duże różnice zdań, intensywny handel
-
-    Dlaczego to lepsze niż model G&S:
-      W G&S efficiency ≈ 1 zawsze bo wyceny są z definicji po właściwych
-      stronach ceny równowagi. Tu agent MOŻE mieć sygnał po złej stronie
-      (val > price ale cena potem rośnie) — to jest realne ryzyko rynkowe.
+      D=0: wszyscy mają ten sam sigma_i i trader_type=0.5
+      D=1: trader_type jest spolaryzowany, więc sigma_i rozciąga się
+           od prawie fundamentalistów do mocno zaszumionych chartystów.
     """
 
     def __init__(
@@ -143,106 +125,36 @@ class AgentPopulation:
         for i in range(self.n_agents):
             aid = f"agent_{i}"
 
-            sentiment_0, alpha_i, beta_i, news_sens, trader_type = self._sample_sentiment_params(d, cfg, sc)
+            if d < 1e-6:
+                trader_type = 0.5
+            else:
+                d_knots = np.array([0.2, 0.4, 0.6, 0.8, 1.0], dtype=np.float64)
+                a_knots = np.array([2.0, 1.0, 0.7, 0.5, 0.3], dtype=np.float64)
+                b_knots = np.array([2.0, 1.0, 0.7, 0.5, 0.3], dtype=np.float64)
+                a_beta = float(np.interp(d, d_knots, a_knots))
+                b_beta = float(np.interp(d, d_knots, b_knots))
+                trader_type = float(self.rng.beta(a_beta, b_beta))
+
+            if cfg.sigma_spread and d > 1e-6:
+                sigma_i = sc.sigma_fund + trader_type * (sc.sigma_chart - sc.sigma_fund)
+            else:
+                sigma_i = (sc.sigma_fund + sc.sigma_chart) / 2.0
+
+            sentiment_0 = 0.0
             gamma       = self._sample_gamma(d, cfg, trader_type)
-            threshold   = self._sample_threshold(d, cfg)
+            threshold   = 0.0
             max_pos     = self.env_cfg.max_position
             risk_av     = self._sample_risk_aversion(d, cfg)
-            V_perceived_init = float(np.clip(
-                self.rng.normal(self.eq_price, 0.015 * d + 0.005),
-                self.env_cfg.p_min, self.env_cfg.p_max,
-            ))
-
-            # Sentiment startowy z value_gap agenta + mały szum
-            # Agent który uważa że jest tanio (V_perceived > P_t) zaczyna byczy
-            if cfg.sentiment_spread and d > 1e-6:
-                value_gap_init = float(np.tanh(
-                    (V_perceived_init - self.eq_price) / 0.05
-                ))
-                noise = float(self.rng.normal(0.0, 0.15 * d))
-                sentiment_0 = float(np.clip(value_gap_init + noise, -1.0, 1.0))
 
             self.agents[aid] = AgentParams(
                 agent_id        = aid,
                 sentiment       = sentiment_0,
-                alpha_i         = alpha_i,
-                beta_i          = beta_i,
-                news_sensitivity= news_sens,
-                V_perceived     = V_perceived_init,
+                sigma_i         = float(sigma_i),
                 threshold       = threshold,
                 gamma           = gamma,
                 risk_aversion   = risk_av,
                 max_position    = max_pos,
             )
-
-    def _sample_sentiment_params(
-        self, d: float, cfg: DiversityConfig, sc: SentimentConfig
-    ) -> tuple:
-        """
-        Losuje (sentiment_0, alpha_i, beta_i, news_sensitivity, trader_type) dla agenta.
-
-        D=0: wszyscy identyczni — trader_type=0.5 (centrum), sentiment_0=0.
-        D=1: pełny rozrzut — trader_type ~ Beta(0.3, 0.3), silnie spolaryzowany.
-
-        trader_type ∈ [0, 1]:
-          0.0 → pure VALUE:     alpha=alpha_lo, beta=beta_hi
-          0.5 → balanced:       alpha≈0.07,     beta≈0.07
-          1.0 → pure MOMENTUM:  alpha=alpha_hi, beta=beta_lo
-
-        Alpha i beta są antykorelowane przez trader_type — agent jest albo
-        fundamentalistą (beta > alpha) albo chartistą (alpha > beta).
-
-        Sentiment startowy pochodzi z value_gap agenta (+mały szum), dzięki
-        czemu agent który uważa że jest tanio (V_perceived > P_t) zaczyna byczy,
-        a nie z losowym sentymentem niezależnym od przekonań.
-        """
-
-        if not cfg.behavioral_spread or d < 1e-6:
-            alpha_i = sc.alpha_center
-            beta_i  = sc.beta_center
-            news    = sc.news_sensitivity_center
-            trader_type = 0.5
-        else:
-            # Jeden parametr decyduje o typie tradera; kształt Beta zależy od D.
-            d_knots = np.array([0.2, 0.4, 0.6, 0.8, 1.0], dtype=np.float64)
-            a_knots = np.array([2.0, 1.0, 0.7, 0.5, 0.3], dtype=np.float64)
-            b_knots = np.array([2.0, 1.0, 0.7, 0.5, 0.3], dtype=np.float64)
-            a_beta = float(np.interp(d, d_knots, a_knots))
-            b_beta = float(np.interp(d, d_knots, b_knots))
-            trader_type = float(self.rng.beta(a_beta, b_beta))
-
-            alpha_lo = max(0.01, sc.alpha_center - sc.alpha_spread / 2.0 * d)
-            alpha_hi = sc.alpha_center + sc.alpha_spread / 2.0 * d
-            beta_lo  = max(0.01, sc.beta_center  - sc.beta_spread  / 2.0 * d)
-            beta_hi  = sc.beta_center  + sc.beta_spread  / 2.0 * d
-
-            # Alpha rośnie z trader_type, beta spada — antykorelacja
-            alpha_i = float(np.clip(
-                alpha_lo + trader_type * (alpha_hi - alpha_lo),
-                0.01, 0.40
-            ))
-            beta_i = float(np.clip(
-                beta_hi - trader_type * (beta_hi - beta_lo),
-                0.01, 0.25
-            ))
-
-            half_n = sc.news_sensitivity_spread / 2.0
-            news = float(np.clip(
-                self.rng.uniform(sc.news_sensitivity_center - half_n * d,
-                                 sc.news_sensitivity_center + half_n * d),
-                0.01, 0.50
-            ))
-
-        if not cfg.sentiment_spread or d < 1e-6:
-            sentiment_0 = 0.0
-        else:
-            # Sentiment startowy z value_gap (V_perceived vs eq_price) + mały szum
-            # V_perceived nie jest jeszcze znane tu — wyliczamy je po generacji agenta.
-            # Dlatego sentiment_0 jest ustawiony tymczasowo na 0.0 i korygowany
-            # w _generate() po ustaleniu V_perceived.
-            sentiment_0 = 0.0  # zostanie nadpisany w _generate()
-
-        return sentiment_0, alpha_i, beta_i, news, trader_type
 
     def _sample_gamma(self, d: float, cfg: DiversityConfig, trader_type: float) -> float:
         """
@@ -261,20 +173,6 @@ class AgentPopulation:
         gamma_lo = 0.95 - trader_type * 0.15
         gamma_hi = 0.99 - trader_type * 0.11
         return float(np.clip(self.rng.uniform(gamma_lo, gamma_hi), 0.80, 0.99))
-
-    def _sample_threshold(self, d: float, cfg: DiversityConfig) -> float:
-        """
-        Minimalny |sentiment| żeby agent miał sygnał handlowy.
-
-        D=0: wszyscy = 0.20 (neutralna strefa ±0.20)
-        D=1: uniform [0.08, 0.38] — od bardzo reaktywnych do ostrożnych
-        """
-        base = 0.20
-        if not cfg.threshold_spread or d < 1e-6:
-            return base
-        low  = max(0.05, base * (1.0 - 0.60 * d))
-        high = min(0.45, base * (1.0 + 0.90 * d))
-        return float(np.clip(self.rng.uniform(low, high), 0.05, 0.45))
 
     def _sample_risk_aversion(self, d, cfg) -> float:
         """
@@ -304,9 +202,7 @@ class AgentPopulation:
         sentiments = [p.sentiment for p in self.agents.values()]
         gammas     = [p.gamma     for p in self.agents.values()]
         thrs       = [p.threshold for p in self.agents.values()]
-        alphas     = [p.alpha_i   for p in self.agents.values()]
-        betas      = [p.beta_i    for p in self.agents.values()]
-        v_perc     = [p.V_perceived for p in self.agents.values()]
+        sigmas     = [p.sigma_i   for p in self.agents.values()]
 
         return {
             "D":                self.diversity_score,
@@ -318,12 +214,8 @@ class AgentPopulation:
             "gamma_std":        float(np.std(gammas)),
             "threshold_mean":   float(np.mean(thrs)),
             "threshold_std":    float(np.std(thrs)),
-            "alpha_mean":       float(np.mean(alphas)),
-            "alpha_std":        float(np.std(alphas)),
-            "beta_mean":        float(np.mean(betas)),
-            "beta_std":         float(np.std(betas)),
-            "v_perceived_mean": float(np.mean(v_perc)),
-            "v_perceived_std":  float(np.std(v_perc)),
+            "sigma_mean":       float(np.mean(sigmas)),
+            "sigma_std":        float(np.std(sigmas)),
         }
 
 
@@ -340,11 +232,10 @@ class DoubleAuction:
 
     Przestrzeń akcji: 0=HOLD, 1=BUY, 2=SELL.
 
-    Obserwacja (12D):
-      patrz get_observation(); wektor opisuje sentiment, pozycję,
-      unrealized P&L, czas, gamma, ruch ceny od startu epizodu,
-      krótki trend, value gap, cechy typu behawioralnego agenta
-      oraz nadwyżkę popytu z poprzedniego kroku.
+    Obserwacja (8D):
+      patrz get_observation(); wektor opisuje prywatny sygnał,
+      pozycję, unrealized P&L, czas, gamma, ruch ceny od startu,
+      krótki trend oraz poziom szumu agenta.
 
     Reward:
       realized_pnl_this_step + składnik MTM (bez kar mid-episode).
@@ -375,6 +266,8 @@ class DoubleAuction:
         self._n_position_closes:  int              = 0
         self._terminal_pnl:       Dict[str, float] = {}
         self._prev_net_flow:      int              = 0
+        self._V_drift:            float            = 0.0
+        self._signal_cache:       Dict[str, float] = {}
 
     # -----------------------------------------------------------------------
     # Reset
@@ -436,6 +329,7 @@ class DoubleAuction:
         self._realized_this_step = {}
         self._terminal_pnl = {}
         self._prev_net_flow = 0
+        self._refresh_signal_cache()
 
         _log.debug(
             f"RESET | D={diversity_score:.2f} | eq={self._eq_price:.3f} | "
@@ -461,28 +355,14 @@ f"N={self.cfg.env.n_agents}"
             self.cfg.env.p_min, self.cfg.env.p_max,
         ))
         self._eq_price = V_new
+        self._V_drift = 0.0
 
         # Kierunek dryfu V_t jako sygnał dla agentów
         V_change    = self._eq_price - self._V_t_prev
         V_direction = float(np.tanh(V_change / max(sc.sigma_macro, 1e-6)))
 
-        # 2. Aktualizacja sentimentów i V_perceived na nowy epizod
+        # 2. Reset portfeli agentów na nowy epizod.
         for p in self.population.agents.values():
-            # Prywatna interpretacja kierunku zmiany V_t (dla sentimentu)
-            private = float(np.clip(
-                V_direction + self.rng.normal(0, sc.sigma_news), -1.0, 1.0
-            ))
-            # Blend sentimentu: 40% stary + 60% nowy sygnał
-            p.sentiment = float(np.clip(
-                0.4 * p.sentiment + 0.6 * private, -1.0, 1.0
-            ))
-            private_V_change = V_change + self.rng.normal(0, sc.sigma_macro)
-            implied_V = p.V_perceived + private_V_change
-            p.V_perceived = float(np.clip(
-                (1.0 - p.news_sensitivity) * p.V_perceived
-                + p.news_sensitivity * implied_V,
-                self.cfg.env.p_min, self.cfg.env.p_max,
-            ))
             p.reset_position()
 
         # 3. Reset stanu epizodu (nie: P_t, wagi sieci, epsilon)
@@ -502,6 +382,7 @@ f"N={self.cfg.env.n_agents}"
         self._realized_this_step  = {}
         self._terminal_pnl        = {}
         self._prev_net_flow       = 0
+        self._refresh_signal_cache()
 
         return {aid: self.get_observation(aid) for aid in self.population.agents}
 
@@ -598,17 +479,8 @@ f"N={self.cfg.env.n_agents}"
             and self.population.agents[aid].position > -self.population.agents[aid].max_position
         ]
         excess = len(buy_agents) - len(sell_agents)
-        flow_fraction = excess / max(self.cfg.env.n_agents, 1)
-        p_exec_buy = float(np.clip(
-            P_before + e.half_spread + e.market_impact * flow_fraction,
-            e.p_min,
-            e.p_max,
-        ))
-        p_exec_sell = float(np.clip(
-            P_before - e.half_spread + e.market_impact * flow_fraction,
-            e.p_min,
-            e.p_max,
-        ))
+        p_exec_buy = float(np.clip(P_before + e.half_spread, e.p_min, e.p_max))
+        p_exec_sell = float(np.clip(P_before - e.half_spread, e.p_min, e.p_max))
 
         for aid in buy_agents:
             realized = self._execute_fill(aid, "buy", p_exec_buy)
@@ -655,46 +527,47 @@ f"N={self.cfg.env.n_agents}"
         self,
     ) -> Tuple[Dict[str, float], Dict[str, bool]]:
         """
-        Oblicza nagrody, dryfuje V_t i aktualizuje sentimenty.
+        Oblicza nagrody i przygotowuje stan na następny krok.
 
         Kolejność per krok:
-          1. Intra-episode dryft V_t
-          2. Ewentualny sygnał informacyjny (p_info)
-          3. Update sentimentów z ruchu ceny (raz per krok)
-          4. Obliczenie nagród (3 składniki)
-          5. Terminacja jeśli step >= T
+          1. Ruch ceny po decyzjach agentów względem aktualnego V_t
+          2. Obliczenie nagród
+          3. Drift V_t na potrzeby kolejnego kroku
+          4. Terminacja jeśli step >= T
         """
         e  = self.cfg.env
-        sc = self.cfg.sentiment
 
-        # 1. Dryft V_t
-        self._drift_V_t()
+        # 1. Ruch ceny po decyzjach agentów.
+        # Agenci wybierają akcje przy bieżącym P_t, po czym rynek przechodzi do P_{t+1}.
+        # Reward za ten krok powinien więc używać ruchu ceny, który nastąpił PO akcji.
+        ref_price_before = self._ref_price
+        noise_P = self.rng.normal(0.0, self.cfg.env.sigma_P_noise)
+        self._ref_price = float(np.clip(
+            self._ref_price
+            + self.cfg.env.mv_speed * (self._eq_price - self._ref_price)
+            + noise_P,
+            self.cfg.env.p_min,
+            self.cfg.env.p_max,
+        ))
+        price_delta = self._ref_price - ref_price_before
 
-        # 2. Sygnał informacyjny z V_t (stochastycznie)
-        if self.rng.random() < sc.p_info:
-            self._emit_info_signal()
-
-        # 3. Update sentimentów na podstawie ruchu ceny w tym kroku
-        self._update_sentiments(self._prev_price)
-
-        # 4. Oblicz nagrody
-        # Reward = zrealizowany PnL z tego kroku + mark-to-market od ruchu ceny.
+        # 2. Oblicz nagrody
+        # MTM = mark-to-market: niezrealizowany zysk/strata z otwartej pozycji
+        # po ruchu ceny, który wydarzył się po bieżącej decyzji.
         rewards: Dict[str, float] = {}
-        price_delta = self._ref_price - self._prev_price
         for aid, p in self.population.agents.items():
             realized = self._realized_this_step.get(aid, 0.0)
             mtm = e.mtm_weight * p.position * price_delta
             rewards[aid] = realized + mtm
             self._episode_pnl[aid] = self._episode_pnl.get(aid, 0.0) + realized
 
+        # 3. Drift V_t na kolejny krok.
+        self._drift_V_t()
+
         self._step_prices.append(self._ref_price)
-        self._prev_price         = self._ref_price
+        self._prev_price = self._ref_price
         self._realized_this_step = {}
-        self._ref_price = float(np.clip(
-            self._ref_price + self.cfg.env.mv_speed * (self._eq_price - self._ref_price),
-            self.cfg.env.p_min,
-            self.cfg.env.p_max,
-        ))
+        self._refresh_signal_cache()
 
         self._step += 1
         done = self._step >= e.episode_steps
@@ -730,6 +603,7 @@ f"N={self.cfg.env.n_agents}"
         else:
             raise ValueError(f"Unknown side: {side}")
         self._price_history.append(self._ref_price)
+        self._refresh_signal_cache()
 
     def _record_fill_price(self, price: float) -> None:
         self._n_fills += 1
@@ -828,54 +702,6 @@ f"N={self.cfg.env.n_agents}"
         self._terminal_pnl = realized_by_agent
         return realized_by_agent
 
-    def _update_sentiments(self, p_t_before: float) -> None:
-        """
-        Aktualizacja sentimentów na podstawie ruchu ceny i wyceny fundamentalnej.
-
-        Dwa składniki:
-          - momentum (alpha_i): reaguje na zmianę ceny w tym kroku
-          - value (beta_i): ciągnie sentiment w kierunku (V_perceived - P_t)
-            → agent z V_perceived > P_t staje się bardziej byczy (uważa że tanio)
-            → agent z V_perceived < P_t staje się bardziej niedźwiedzi (uważa że drogo)
-
-        Wywoływana RAZ per krok z compute_step_rewards().
-        """
-        sc = self.cfg.sentiment
-        delta_P      = self._ref_price - p_t_before
-        price_signal = float(np.tanh(delta_P / max(sc.sigma_P, 1e-6)))
-
-        for agent in self.population.agents.values():
-            s = agent.sentiment
-            s += agent.alpha_i * (price_signal - s)
-            value_signal = float(np.tanh(
-                (agent.V_perceived - self._ref_price) / 0.05
-            ))
-            s += agent.beta_i * (value_signal - s)
-            agent.sentiment = float(np.clip(s, -1.0, 1.0))
-
-    def _emit_info_signal(self) -> None:
-        """
-        Periodyczny sygnał informacyjny z V_t do prywatnej wyceny agentów.
-
-        Każdy agent aktualizuje swoje V_perceived — zaszumioną estymację V_t.
-        Agenci z wyższym news_sensitivity szybciej śledzą zmiany V_t.
-        Sentiment jest aktualizowany przez _update_sentiments() na podstawie
-        ruchu ceny — V_perceived to osobny kanał informacyjny.
-        """
-        sc = self.cfg.sentiment
-        V_change = self._eq_price - self._V_t_prev
-        if abs(V_change) < 1e-8:
-            return
-
-        for agent in self.population.agents.values():
-            private_V_change = V_change + self.rng.normal(0, sc.sigma_macro)
-            implied_V = agent.V_perceived + private_V_change
-            agent.V_perceived = float(np.clip(
-                (1.0 - agent.news_sensitivity) * agent.V_perceived
-                + agent.news_sensitivity * implied_V,
-                self.cfg.env.p_min, self.cfg.env.p_max,
-            ))
-
     def _drift_V_t(self) -> None:
         """
         Intra-episode dryft V_t — wywoływany z compute_step_rewards().
@@ -887,7 +713,11 @@ f"N={self.cfg.env.n_agents}"
         md  = self.cfg.market
         self._V_t_prev = self._eq_price
 
-        drift = self.rng.normal(0, sc.sigma_intra)
+        self._V_drift = (
+            self.cfg.sentiment.drift_persistence * self._V_drift
+            + self.rng.normal(0, sc.sigma_intra)
+        )
+        drift = self._V_drift
         if md.drift_enabled and self.rng.random() < md.shock_probability:
             drift += float(self.rng.choice([-1, 1])) * md.shock_size
 
@@ -896,26 +726,41 @@ f"N={self.cfg.env.n_agents}"
             self.cfg.env.p_min, self.cfg.env.p_max,
         ))
 
+    def _refresh_signal_cache(self) -> None:
+        if self.population is None:
+            self._signal_cache = {}
+            return
+        sc = self.cfg.sentiment
+        signal_cache: Dict[str, float] = {}
+        for aid, p in self.population.agents.items():
+            noise = float(self.rng.normal(0.0, p.sigma_i))
+            signal_cache[aid] = float(np.clip(
+                (self._eq_price - self._ref_price + noise) / sc.signal_scale,
+                -1.0,
+                1.0,
+            ))
+        self._signal_cache = signal_cache
+
     # -----------------------------------------------------------------------
     # Obserwacja
     # -----------------------------------------------------------------------
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        12D wektor obserwacji — Sentiment model z informacją cenową.
+        8D wektor obserwacji — prywatny sygnał fundamentalny + stan portfela.
 
-          [0] sentiment       bear/bull state ∈ [-1, +1]
+          [0] signal_i        prywatny sygnał (V_t - P_t + noise) / scale
           [1] position_norm   position / max_position ∈ [-1, +1]
           [2] unrealized_pnl  znormalizowany niezrealizowany P&L ∈ [-2, +2]
           [3] time_remaining  (T - step) / T ∈ [0, 1]
           [4] gamma           discount factor ∈ [0.80, 0.99]
           [5] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
           [6] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
-          [7] value_gap       tanh((V_perceived - P_t) / 0.05) ∈ (-1, +1)
-          [8] alpha_norm      alpha_i / 0.40 ∈ [0, 1]
-          [9] beta_norm       beta_i / 0.25 ∈ [0, 1]
-          [10] threshold_norm threshold / 0.45 ∈ [0, 1]
-          [11] prev_net_flow_norm clip(prev_net_flow / n_agents, -1, 1)
+          [7] sigma_norm      sigma_i / sigma_chart ∈ [0, 1]
+
+        public_gap jest liczony lokalnie, ale celowo pominięty z obserwacji:
+        to niezaszumiony sygnał identyczny dla wszystkich agentów, który
+        osłabiał heterogeniczność opartą na sigma_i.
         """
         p    = self.population.agents[agent_id]
         T    = self.cfg.env.episode_steps
@@ -945,32 +790,26 @@ f"N={self.cfg.env.n_agents}"
         trend_short = float(np.tanh(
             (self._ref_price - old_price) / max(sc.sigma_P, 1e-6)
         ))
-
-        value_gap = float(np.tanh(
-            (p.V_perceived - self._ref_price) / 0.05
-        ))
-        alpha_norm = float(np.clip(p.alpha_i / 0.40, 0.0, 1.0))
-        beta_norm = float(np.clip(p.beta_i / 0.25, 0.0, 1.0))
-        threshold_norm = float(np.clip(p.threshold / 0.45, 0.0, 1.0))
-        prev_net_flow_norm = float(np.clip(
-            self._prev_net_flow / max(self.cfg.env.n_agents, 1),
+        signal_i = self._signal_cache.get(agent_id)
+        if signal_i is None:
+            self._refresh_signal_cache()
+            signal_i = self._signal_cache[agent_id]
+        public_gap = float(np.clip(
+            (self._eq_price - self._ref_price) / sc.signal_scale,
             -1.0,
             1.0,
         ))
+        sigma_norm = float(np.clip(p.sigma_i / sc.sigma_chart, 0.0, 1.0))
 
         return np.array([
-            float(np.clip(p.sentiment, -1.0, 1.0)),            # [0]
+            signal_i,                                           # [0]
             pos_norm,                                           # [1]
             unrealized,                                         # [2]
             time_rem,                                           # [3]
             p.gamma,                                            # [4]
             price_vs_start,                                     # [5]
             trend_short,                                        # [6]
-            value_gap,                                          # [7]
-            alpha_norm,                                         # [8]
-            beta_norm,                                          # [9]
-            threshold_norm,                                     # [10]
-            prev_net_flow_norm,                                 # [11]
+            sigma_norm,                                         # [7]
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -1037,16 +876,19 @@ f"N={self.cfg.env.n_agents}"
         terminal_pnl_vals  = list(self._terminal_pnl.values())
         mean_terminal_pnl  = float(np.mean(terminal_pnl_vals)) if terminal_pnl_vals else 0.0
         terminal_positive  = sum(1 for v in terminal_pnl_vals if v > 0)
-        value_gaps = [
-            float(np.tanh((p.V_perceived - self._ref_price) / 0.05))
-            for p in agents
-        ]
-        v_perceived_vals = [p.V_perceived for p in agents]
+        sc = self.cfg.sentiment
+        value_gap_value = float(np.clip(
+            (self._eq_price - self._ref_price) / sc.signal_scale,
+            -1.0,
+            1.0,
+        ))
+        value_gaps = [value_gap_value for _ in agents]
+        midpoint = (sc.sigma_fund + sc.sigma_chart) / 2.0
         pct_chartists = float(
-            sum(1 for p in agents if p.alpha_i > p.beta_i) / max(len(agents), 1)
+            sum(1 for p in agents if p.sigma_i > midpoint) / max(len(agents), 1)
         )
         type_proxy = np.array(
-            [p.alpha_i / max(p.alpha_i + p.beta_i, 1e-9) for p in agents],
+            [p.sigma_i for p in agents],
             dtype=np.float64,
         )
         pnl_array = np.array([pnls.get(p.agent_id, 0.0) for p in agents], dtype=np.float64)
@@ -1083,7 +925,6 @@ f"N={self.cfg.env.n_agents}"
             "mean_position_end":   mean_pos,
             "mean_abs_position":   mean_abs_pos,
             "mean_value_gap":      float(np.mean(value_gaps)) if value_gaps else 0.0,
-            "v_perceived_std":     float(np.std(v_perceived_vals)) if v_perceived_vals else 0.0,
             "pct_chartists":       pct_chartists,
             "corr_type_pnl":       corr_type_pnl,
             "action_buy_frac":     n_buy  / n_acts,
@@ -1100,10 +941,7 @@ f"N={self.cfg.env.n_agents}"
         return {
             aid: {
                 "sentiment":       p.sentiment,
-                "alpha_i":         p.alpha_i,
-                "beta_i":          p.beta_i,
-                "news_sensitivity":p.news_sensitivity,
-                "V_perceived":     p.V_perceived,
+                "sigma_i":         p.sigma_i,
                 "threshold":       p.threshold,
                 "gamma":           p.gamma,
                 "risk_aversion":   p.risk_aversion,

@@ -40,12 +40,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from codes.config import HTMConfig, EnvConfig, LogConfig, MarketDynamics, PPOConfig
 from codes.double_auction import DoubleAuction
-from codes.evaluate_policies import evaluate_policy, evaluate_ppo_no_impact, evaluate_zi
+from codes.evaluate_policies import evaluate_policy, evaluate_zi
 from codes.ppo import SharedPPOTrainer
-from codes.rl_common import build_episode_record, set_global_seeds
+from codes.rl_common import build_agent_sample_row, build_env_step_row, build_episode_record, set_global_seeds
 from codes.results_store import (
     AGENT_SAMPLE_FIELDS,
     EPISODE_FIELDS,
+    ENV_STEP_FIELDS,
     append_rows,
     prepare_run_dir,
     write_run_config,
@@ -73,7 +74,7 @@ ZI_EPISODES = 30
 EVAL_EPISODES = 30
 LOG_EVERY = 25
 ROLLING_WINDOW = 30
-MARKET = MarketDynamics.drifting()
+MARKET = MarketDynamics.stable()
 PPO_CFG = PPOConfig()
 
 
@@ -122,7 +123,7 @@ def _coordination_stats(step_actions: List[np.ndarray], n_actions: int) -> tuple
 def _sampled_agent_types(da: DoubleAuction) -> dict[str, tuple[str, float]]:
     trader_meta = []
     for aid, agent in da.population.agents.items():
-        trader_type = agent.alpha_i / max(agent.alpha_i + agent.beta_i, 1e-9)
+        trader_type = agent.sigma_i / max(da.cfg.sentiment.sigma_chart, 1e-9)
         trader_meta.append((aid, trader_type))
     trader_meta.sort(key=lambda item: item[1])
     fundamentalist_id, fundamentalist_type = trader_meta[0]
@@ -146,13 +147,12 @@ def evaluate_trained_ppo_same_population(
     zi_baseline_positive_pnl_frac: float,
     deterministic: bool = False,
     algorithm_name: Optional[str] = None,
-) -> tuple[List[dict], List[dict]]:
+) -> tuple[List[dict], List[dict], List[dict]]:
     agent_ids = list(da.population.agents.keys())
     agent_gammas = [da.population.agents[aid].gamma for aid in agent_ids]
-    sampled_agents = _sampled_agent_types(da)
-    sample_episodes = {0, n_eval_episodes // 2, max(n_eval_episodes - 1, 0)}
     records: List[dict] = []
     sample_rows: List[dict] = []
+    env_step_rows: List[dict] = []
     algorithm_name = algorithm_name or (
         "PPO_EVAL_SAME_POPULATION_DETERMINISTIC"
         if deterministic else
@@ -161,13 +161,25 @@ def evaluate_trained_ppo_same_population(
 
     for episode in range(n_eval_episodes):
         da.reset_episode()
-        prev_positions = {aid: da.population.agents[aid].position for aid in sampled_agents}
-        sample_this_episode = episode in sample_episodes
+        prev_positions = {aid: da.population.agents[aid].position for aid in agent_ids}
+        sample_this_episode = seed == 0 and abs(diversity_score - 1.0) < 1e-9 and episode == 0
         step_actions: List[np.ndarray] = []
 
         while not da.done:
             obs_by_agent: Dict[str, np.ndarray] = {}
             actions: Dict[str, int] = {}
+            positions_before = dict(prev_positions)
+            eq_price_before = float(da.eq_price)
+            ref_price_before = float(da.ref_price)
+            public_gap = float(np.clip(
+                (eq_price_before - ref_price_before) / max(cfg.sentiment.signal_scale, 1e-9),
+                -1.0,
+                1.0,
+            ))
+            realized_before = {
+                aid: da.population.agents[aid].realized_pnl
+                for aid in agent_ids
+            }
             for aid in agent_ids:
                 obs = da.get_observation(aid)
                 obs_by_agent[aid] = obs
@@ -178,34 +190,95 @@ def evaluate_trained_ppo_same_population(
             da.execute_parallel_actions(actions)
             rewards, _ = da.compute_step_rewards()
 
-            if sample_this_episode and da._step % 5 == 0:
-                for aid, (agent_type, trader_type) in sampled_agents.items():
+            if sample_this_episode:
+                public_gap_after = float(np.clip(
+                    (da.eq_price - da.ref_price) / max(cfg.sentiment.signal_scale, 1e-9),
+                    -1.0,
+                    1.0,
+                ))
+                for aid in agent_ids:
                     agent = da.population.agents[aid]
                     obs = obs_by_agent[aid]
-                    executed = agent.position != prev_positions[aid]
-                    sample_rows.append({
-                        "algorithm": algorithm_name,
-                        "phase": "eval_same_population",
-                        "diversity_score": diversity_score,
-                        "seed": seed,
-                        "episode": episode,
-                        "step": da._step,
-                        "agent_id": aid,
-                        "trader_type": trader_type,
-                        "agent_type": agent_type,
-                        "action": actions[aid],
-                        "action_name": cfg.env.action_name(actions[aid]),
-                        "executed": executed,
-                        "sentiment": float(agent.sentiment),
-                        "value_gap": float(obs[7]),
-                        "position": int(agent.position),
-                        "realized_pnl_this_step": float(rewards.get(aid, 0.0)),
-                        "prev_net_flow_norm": float(obs[-1]),
-                        "alpha_i": float(agent.alpha_i),
-                        "beta_i": float(agent.beta_i),
-                        "threshold": float(agent.threshold),
-                    })
+                    executed = agent.position != positions_before[aid]
+                    trader_type = agent.sigma_i / max(cfg.sentiment.sigma_chart, 1e-9)
+                    if trader_type <= 0.33:
+                        agent_type = "fundamentalista"
+                    elif trader_type >= 0.67:
+                        agent_type = "chartista"
+                    else:
+                        agent_type = "mieszany"
+                    realized_pnl_this_step = float(agent.realized_pnl - realized_before[aid])
+                    sample_rows.append(build_agent_sample_row(
+                        algorithm=algorithm_name,
+                        phase="eval_same_population",
+                        diversity_score=diversity_score,
+                        seed=seed,
+                        episode=episode,
+                        step=da._step,
+                        agent_id=aid,
+                        trader_type=trader_type,
+                        agent_type=agent_type,
+                        action=actions[aid],
+                        action_name=cfg.env.action_name(actions[aid]),
+                        executed=executed,
+                        obs=obs,
+                        public_gap_before=public_gap,
+                        eq_price_before=eq_price_before,
+                        ref_price_before=ref_price_before,
+                        public_gap_after=public_gap_after,
+                        eq_price_after=da.eq_price,
+                        ref_price_after=da.ref_price,
+                        position_before=positions_before[aid],
+                        position=agent.position,
+                        entry_price_after=agent.entry_price,
+                        reward_this_step=float(rewards.get(aid, 0.0)),
+                        realized_pnl_this_step=realized_pnl_this_step,
+                        realized_pnl_cum=agent.realized_pnl,
+                        n_trades_closed=agent.n_trades_closed,
+                        sentiment=agent.sentiment,
+                        sigma_i=agent.sigma_i,
+                        threshold=agent.threshold,
+                    ))
                     prev_positions[aid] = agent.position
+                mean_signal = float(np.mean([float(obs_by_agent[aid][0]) for aid in agent_ids]))
+                std_signal = float(np.std([float(obs_by_agent[aid][0]) for aid in agent_ids]))
+                mean_sigma = float(np.mean([float(da.population.agents[aid].sigma_i) for aid in agent_ids]))
+                mean_position_before = float(np.mean([positions_before[aid] for aid in agent_ids]))
+                mean_position_after = float(np.mean([da.population.agents[aid].position for aid in agent_ids]))
+                n_buy = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_BUY_MARKET)
+                n_sell = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_SELL_MARKET)
+                n_hold = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_HOLD)
+                realized_vals = [float(da.population.agents[aid].realized_pnl - realized_before[aid]) for aid in agent_ids]
+                reward_vals = [float(rewards.get(aid, 0.0)) for aid in agent_ids]
+                env_step_rows.append(build_env_step_row(
+                    algorithm=algorithm_name,
+                    phase="eval_same_population",
+                    diversity_score=diversity_score,
+                    seed=seed,
+                    episode=episode,
+                    step=da._step,
+                    eq_price_before=eq_price_before,
+                    ref_price_before=ref_price_before,
+                    public_gap_before=public_gap,
+                    eq_price_after=da.eq_price,
+                    ref_price_after=da.ref_price,
+                    public_gap_after=public_gap_after,
+                    price_delta_step=da.ref_price - ref_price_before,
+                    mean_signal=mean_signal,
+                    std_signal=std_signal,
+                    mean_sigma=mean_sigma,
+                    mean_position_before=mean_position_before,
+                    mean_position_after=mean_position_after,
+                    n_buy=n_buy,
+                    n_sell=n_sell,
+                    n_hold=n_hold,
+                    net_flow=n_buy - n_sell,
+                    mean_reward=float(np.mean(reward_vals)),
+                    mean_realized_pnl=float(np.mean(realized_vals)),
+                    mean_mtm=float(np.mean([r - x for r, x in zip(reward_vals, realized_vals)])),
+                    n_executed=sum(1 for aid in agent_ids if da.population.agents[aid].position != positions_before[aid]),
+                    n_trades_closed_cum=sum(da.population.agents[aid].n_trades_closed for aid in agent_ids),
+                ))
 
         metrics = da.episode_metrics()
         same_action_frac, effective_n = _coordination_stats(step_actions, cfg.env.n_actions)
@@ -233,7 +306,7 @@ def evaluate_trained_ppo_same_population(
         )
         records.append(record)
 
-    return records, sample_rows
+    return records, sample_rows, env_step_rows
 
 
 def build_run_settings(quick: bool, args) -> dict:
@@ -257,7 +330,7 @@ def build_run_settings(quick: bool, args) -> dict:
             "log_every": 1,
             "rolling_window": 2,
             "n_workers": 1,
-            "market": MarketDynamics.drifting(),
+            "market": MarketDynamics.stable(),
             "ppo_cfg": ppo_cfg,
         }
     else:
@@ -310,7 +383,7 @@ def run_training(
     checkpoint_dir: Path,
     log_every: int,
     eval_new_population: bool,
-) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], SharedPPOTrainer, Path]:
+) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], SharedPPOTrainer, Path]:
     set_global_seeds(seed)
     da = DoubleAuction(cfg, seed=seed)
     da.reset(diversity_score=diversity_score, seed=seed)
@@ -374,24 +447,21 @@ def run_training(
 
             if episode % 50 == 0:
                 for aid, meta in agent_metrics.items():
-                    alpha_i = float(meta.get("alpha_i", 0.0))
-                    beta_i = float(meta.get("beta_i", 0.0))
+                    sigma_i = float(meta.get("sigma_i", 0.0))
                     agent_diagnostics.append({
                         "episode": episode,
                         "diversity_score": diversity_score,
                         "seed": seed,
                         "agent_id": aid,
-                        "trader_type": alpha_i / max(alpha_i + beta_i, 1e-9),
-                        "alpha_i": alpha_i,
-                        "beta_i": beta_i,
+                        "trader_type": sigma_i / max(cfg.sentiment.sigma_chart, 1e-9),
+                        "sigma_i": sigma_i,
                         "threshold": float(meta.get("threshold", 0.0)),
                         "gamma": float(meta.get("gamma", 0.0)),
-                        "V_perceived": float(meta.get("V_perceived", 0.0)),
                         "realized_pnl": float(meta.get("realized_pnl", 0.0)),
                         "n_trades_closed": int(meta.get("n_trades_closed", 0)),
                         "trade_accuracy_agent": float(meta.get("trade_accuracy", 0.0)),
                     })
-                short_eval_records, _ = evaluate_trained_ppo(
+                short_eval_records, _, _ = evaluate_trained_ppo(
                     da,
                     trainer,
                     diversity_score,
@@ -400,7 +470,7 @@ def run_training(
                     5,
                     zi_baseline_trade_accuracy,
                     zi_baseline_positive_pnl_frac,
-                    deterministic=False,
+                    deterministic=True,
                     same_population=True,
                 )
                 learning_curve_records.append({
@@ -434,7 +504,7 @@ def run_training(
     checkpoint_path = checkpoint_dir / f"ppo_D{diversity_score:.1f}_seed{seed}.pt"
     trainer.save(checkpoint_path, episode=n_episodes)
 
-    eval_records, sample_rows = evaluate_trained_ppo(
+    eval_records, sample_rows, env_step_rows = evaluate_trained_ppo(
         da,
         trainer,
         diversity_score,
@@ -443,13 +513,13 @@ def run_training(
         cfg.exp.n_eval_episodes,
         zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac,
-        deterministic=False,
-        algorithm_name="PPO_EVAL_SAME_POPULATION",
+        deterministic=True,
+        algorithm_name="PPO_EVAL_SAME_POPULATION_DETERMINISTIC",
         same_population=True,
     )
     new_population_eval_records: List[dict] = []
     if eval_new_population:
-        new_population_eval_records, _ = evaluate_trained_ppo(
+        new_population_eval_records, _, _ = evaluate_trained_ppo(
             da,
             trainer,
             diversity_score,
@@ -458,8 +528,8 @@ def run_training(
             cfg.exp.n_eval_episodes,
             zi_baseline_trade_accuracy,
             zi_baseline_positive_pnl_frac,
-            deterministic=False,
-            algorithm_name="PPO_EVAL_NEW_POPULATION",
+            deterministic=True,
+            algorithm_name="PPO_EVAL_NEW_POPULATION_DETERMINISTIC",
             same_population=False,
         )
 
@@ -470,6 +540,7 @@ def run_training(
         eval_records,
         new_population_eval_records,
         sample_rows,
+        env_step_rows,
         trainer,
         checkpoint_path,
     )
@@ -484,10 +555,10 @@ def evaluate_trained_ppo(
     n_eval_episodes: int,
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
-    deterministic: bool = False,
+    deterministic: bool = True,
     algorithm_name: Optional[str] = None,
     same_population: bool = True,
-) -> tuple[List[dict], List[dict]]:
+) -> tuple[List[dict], List[dict], List[dict]]:
     """
     Ewaluacja PPO. Domyślnie używa tej samej populacji co trening
     (`reset_episode()` na tej samej instancji `da`). Opcjonalnie można
@@ -511,7 +582,7 @@ def evaluate_trained_ppo(
     algorithm_name = algorithm_name or (
         "PPO_EVAL_DETERMINISTIC" if deterministic else "PPO_EVAL_STOCHASTIC"
     )
-    records, sample_rows = evaluate_policy(
+    records, sample_rows, env_step_rows = evaluate_policy(
         algorithm_name,
         trainer,
         cfg,
@@ -530,7 +601,7 @@ def evaluate_trained_ppo(
         row["eval_mean_terminal_pnl"] = row.get("mean_terminal_pnl", 0.0)
     for row in sample_rows:
         row["algorithm"] = algorithm_name
-    return records, sample_rows
+    return records, sample_rows, env_step_rows
 
 
 def plot_learning_curves(
@@ -674,7 +745,7 @@ def log_final_summary(
             )
 
 
-def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], Path]:
+def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], Path]:
     """
     Jeden niezależny trening PPO dla kombinacji (D, seed).
 
@@ -701,7 +772,7 @@ def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List
         pass
 
     cfg = copy.deepcopy(cfg)
-    train_records, learning_curve_records, agent_diagnostics, eval_records, no_impact_eval_records, sample_rows, _, checkpoint_path = run_training(
+    train_records, learning_curve_records, agent_diagnostics, eval_records, eval_new_population_records, sample_rows, env_step_rows, _, checkpoint_path = run_training(
         diversity_score=diversity_score,
         n_episodes=n_episodes,
         seed=seed,
@@ -717,8 +788,9 @@ def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List
         learning_curve_records,
         agent_diagnostics,
         eval_records,
-        no_impact_eval_records,
+        eval_new_population_records,
         sample_rows,
+        env_step_rows,
         checkpoint_path,
     )
 
@@ -753,6 +825,7 @@ def main(argv: List[str] | None = None) -> None:
     run_id, run_dir = prepare_run_dir(args.run_tag, args.run_id, args.run_dir)
     episodes_csv = run_dir / "episodes.csv"
     agents_sample_csv = run_dir / "agents_sample.csv"
+    env_steps_csv = run_dir / "env_steps.csv"
     run_config_path = run_dir / "run_config.json"
 
     run_name = "ppo_quick" if args.quick else "ppo"
@@ -789,7 +862,7 @@ def main(argv: List[str] | None = None) -> None:
         })
 
     baseline_d = float(settings["diversity_scores"][0]) if settings["diversity_scores"] else 0.0
-    zi_records, _ = evaluate_zi(cfg, diversity_score=baseline_d, n_episodes=settings["zi_episodes"], seed=42)
+    zi_records, _, _ = evaluate_zi(cfg, diversity_score=baseline_d, n_episodes=settings["zi_episodes"], seed=42)
     append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(zi_records, run_id, "zi_baseline"))
     shared_zi_acc = float(np.mean([r["trade_accuracy"] for r in zi_records])) if zi_records else 0.0
     shared_zi_pos = float(np.mean([r["positive_pnl_frac"] for r in zi_records])) if zi_records else 0.0
@@ -799,6 +872,7 @@ def main(argv: List[str] | None = None) -> None:
     all_records: List[dict] = []
     all_eval_same_population_records: List[dict] = []
     all_eval_new_population_records: List[dict] = []
+    all_env_step_rows: List[dict] = []
     checkpoints: List[Path] = []
     t0 = time.time()
 
@@ -831,15 +905,17 @@ def main(argv: List[str] | None = None) -> None:
 
     try:
         for i, worker_result in enumerate(iterator, start=1):
-            train_records, _learning_curve_records, _agent_diagnostics, eval_records, no_impact_eval_records, sample_rows, ckpt = worker_result
+            train_records, _learning_curve_records, _agent_diagnostics, eval_records, eval_new_population_records, sample_rows, env_step_rows, ckpt = worker_result
             all_records.extend(train_records)
             all_eval_same_population_records.extend(eval_records)
-            all_eval_new_population_records.extend(no_impact_eval_records)
+            all_eval_new_population_records.extend(eval_new_population_records)
+            all_env_step_rows.extend(env_step_rows)
             checkpoints.append(ckpt)
             append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(train_records, run_id, "train"))
             append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(eval_records, run_id, "eval_same_population"))
-            append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(no_impact_eval_records, run_id, "eval_new_population"))
+            append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(eval_new_population_records, run_id, "eval_new_population"))
             append_rows(agents_sample_csv, AGENT_SAMPLE_FIELDS, _stamp_sample_rows(sample_rows, run_id))
+            append_rows(env_steps_csv, ENV_STEP_FIELDS, _stamp_sample_rows(env_step_rows, run_id))
 
             d_done = train_records[0]["diversity_score"] if train_records else "?"
             seed_done = train_records[0]["seed"] if train_records else "?"
@@ -871,6 +947,7 @@ def main(argv: List[str] | None = None) -> None:
     total_rows = len(all_records) + len(all_eval_same_population_records) + len(all_eval_new_population_records) + len(zi_records)
     log.info(f"Wyniki: {episodes_csv} ({total_rows} wierszy)")
     log.info(f"Próbka agentów: {agents_sample_csv}")
+    log.info(f"Agregaty środowiska: {env_steps_csv}")
     log.info(f"Checkpointy: {checkpoint_dir}")
     log.info(f"Czas: {time.time() - t0:.0f}s")
 

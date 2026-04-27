@@ -34,7 +34,6 @@ EPISODE_FIELDS = [
     "price_range",
     "mean_abs_position",
     "mean_value_gap",
-    "v_perceived_std",
     "pct_chartists",
     "corr_type_pnl",
     "action_buy_frac",
@@ -56,8 +55,8 @@ EPISODE_FIELDS = [
     "pop_std_sentiment",
     "pop_mean_gamma",
     "pop_std_gamma",
-    "pop_mean_alpha",
-    "pop_mean_beta",
+    "pop_mean_sigma",
+    "pop_std_sigma",
     "pop_mean_risk_aversion",
     "pop_mean_threshold",
     "pop_mean_max_position",
@@ -92,14 +91,62 @@ AGENT_SAMPLE_FIELDS = [
     "action",
     "action_name",
     "executed",
+    "signal_i",
+    "pos_norm",
+    "unrealized_pnl",
+    "time_remaining",
+    "gamma_obs",
+    "price_vs_start",
+    "trend_short",
+    "sigma_norm",
     "sentiment",
-    "value_gap",
+    "public_gap_before",
+    "eq_price_before",
+    "ref_price_before",
+    "public_gap_after",
+    "eq_price_after",
+    "ref_price_after",
+    "position_before",
     "position",
+    "entry_price_after",
+    "reward_this_step",
     "realized_pnl_this_step",
-    "prev_net_flow_norm",
-    "alpha_i",
-    "beta_i",
+    "mtm_this_step",
+    "realized_pnl_cum",
+    "n_trades_closed",
+    "sigma_i",
     "threshold",
+]
+
+ENV_STEP_FIELDS = [
+    "run_id",
+    "algorithm",
+    "phase",
+    "diversity_score",
+    "seed",
+    "episode",
+    "step",
+    "eq_price_before",
+    "ref_price_before",
+    "public_gap_before",
+    "eq_price_after",
+    "ref_price_after",
+    "public_gap_after",
+    "price_delta_step",
+    "mean_signal",
+    "std_signal",
+    "mean_sigma",
+    "mean_position_before",
+    "mean_position_after",
+    "n_buy",
+    "n_sell",
+    "n_hold",
+    "net_flow",
+    "mean_reward",
+    "mean_realized_pnl",
+    "mean_mtm",
+    "n_executed",
+    "n_trades_closed_cum",
 ]
 
 
@@ -122,6 +169,7 @@ def prepare_run_dir(
     path.mkdir(parents=True, exist_ok=True)
     _ensure_csv(path / "episodes.csv", EPISODE_FIELDS)
     _ensure_csv(path / "agents_sample.csv", AGENT_SAMPLE_FIELDS)
+    _ensure_csv(path / "env_steps.csv", ENV_STEP_FIELDS)
     return resolved_run_id, path
 
 
@@ -157,4 +205,3 @@ def latest_run_dir() -> Optional[Path]:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
-
