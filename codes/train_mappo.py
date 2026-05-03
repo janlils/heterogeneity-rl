@@ -1,9 +1,9 @@
 """
-Runner treningowy shared-policy PPO dla HTM.
+Runner treningowy MAPPO dla HTM.
 
-Uruchomienie:
-    python -m codes.train_ppo
-    python -m codes.train_ppo --quick
+MAPPO w tej wersji:
+  - decentralized actor na lokalnej obserwacji
+  - centralized critic na lokalnej obserwacji + agregatach rynku
 """
 
 from __future__ import annotations
@@ -41,10 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from codes.config import HTMConfig, EnvConfig, LogConfig, PPOConfig
 from codes.double_auction import DoubleAuction
 from codes.evaluation import coordination_stats, evaluate_same_population
-from codes.experiment_runner import (
-    init_run_artifacts,
-    run_ppo_experiment,
-)
+from codes.experiment_runner import init_run_artifacts, run_ppo_experiment
 from codes.experiment_settings import (
     DEFAULT_DIVERSITY_SCORES,
     DEFAULT_EPISODE_STEPS,
@@ -56,10 +53,10 @@ from codes.experiment_settings import (
     DEFAULT_N_SEEDS,
     DEFAULT_ROLLING_WINDOW,
     DEFAULT_ZI_EPISODES,
-    build_ppo_settings,
+    build_mappo_settings,
 )
 from codes.evaluate_policies import evaluate_policy
-from codes.ppo import SharedPPOTrainer
+from codes.ppo import MAPPOTrainer
 from codes.rl_common import (
     aggregate_agent_eval_episode_rows,
     build_episode_record,
@@ -76,10 +73,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(PROJECT_ROOT / "logs" / "ppo.log", mode="w"),
+        logging.FileHandler(PROJECT_ROOT / "logs" / "mappo.log", mode="w"),
     ],
 )
-log = logging.getLogger("htm.train_ppo")
+log = logging.getLogger("htm.train_mappo")
 
 
 DIVERSITY_SCORES = DEFAULT_DIVERSITY_SCORES
@@ -96,27 +93,16 @@ PPO_CFG = PPOConfig()
 
 
 def _stamp_episode_rows(rows: List[dict], run_id: str, phase: str) -> List[dict]:
-    stamped: List[dict] = []
-    for row in rows:
-        item = dict(row)
-        item["run_id"] = run_id
-        item["phase"] = phase
-        stamped.append(item)
-    return stamped
+    return [{**row, "run_id": run_id, "phase": phase} for row in rows]
 
 
 def _stamp_sample_rows(rows: List[dict], run_id: str) -> List[dict]:
-    stamped: List[dict] = []
-    for row in rows:
-        item = dict(row)
-        item["run_id"] = run_id
-        stamped.append(item)
-    return stamped
+    return [{**row, "run_id": run_id} for row in rows]
 
 
-def evaluate_trained_ppo_same_population(
+def evaluate_trained_mappo_same_population(
     da: DoubleAuction,
-    trainer: SharedPPOTrainer,
+    trainer: MAPPOTrainer,
     diversity_score: float,
     seed: int,
     cfg: HTMConfig,
@@ -127,12 +113,13 @@ def evaluate_trained_ppo_same_population(
     algorithm_name: Optional[str] = None,
 ) -> tuple[List[dict], List[dict], List[dict], List[dict]]:
     algorithm_name = algorithm_name or (
-        "PPO_EVAL_SAME_POPULATION_DETERMINISTIC"
+        "MAPPO_EVAL_SAME_POPULATION_DETERMINISTIC"
         if deterministic else
-        "PPO_EVAL_SAME_POPULATION"
+        "MAPPO_EVAL_SAME_POPULATION"
     )
 
     def action_selector(aid: str, obs: np.ndarray) -> int:
+        trainer.set_global_state(da.get_global_state())
         action, _, _, _ = trainer.act_np(obs, aid, deterministic=deterministic)
         return int(action)
 
@@ -232,12 +219,7 @@ def evaluate_trained_ppo_same_population(
 
 
 def build_run_settings(quick: bool, args) -> dict:
-    settings = build_ppo_settings(
-        quick=quick,
-        use_agent_id_features=args.agent_id_features,
-        default_workers=cpu_count(),
-    )
-
+    settings = build_mappo_settings(quick=quick, default_workers=cpu_count())
     if args.episodes is not None:
         settings["n_episodes"] = args.episodes
     if args.steps is not None:
@@ -252,7 +234,6 @@ def build_run_settings(quick: bool, args) -> dict:
         settings["eval_episodes"] = args.eval_episodes
     if args.workers is not None:
         settings["n_workers"] = args.workers
-
     max_workers = settings["n_seeds"] * len(settings["diversity_scores"])
     settings["n_workers"] = max(1, min(settings["n_workers"], max_workers))
     settings["log_every"] = max(1, min(settings["log_every"], settings["n_episodes"]))
@@ -282,22 +263,23 @@ def run_training(
     checkpoint_dir: Path,
     log_every: int,
     eval_new_population: bool,
-) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], SharedPPOTrainer, Path]:
+) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], MAPPOTrainer, Path]:
     set_global_seeds(seed)
     da = DoubleAuction(cfg, seed=seed)
     da.reset(diversity_score=diversity_score, seed=seed)
     agent_ids = list(da.population.agents.keys())
     agent_gammas = [da.population.agents[aid].gamma for aid in agent_ids]
-    ppo_cfg = dataclasses.replace(cfg.ppo)
+    ppo_cfg = dataclasses.replace(cfg.ppo, use_agent_id_features=False)
     cfg.ppo = ppo_cfg
 
-    obs_dim = cfg.env.n_obs + (len(agent_ids) if ppo_cfg.use_agent_id_features else 0)
-    trainer = SharedPPOTrainer(
-        obs_dim=obs_dim,
+    actor_obs_dim = cfg.env.n_obs
+    critic_obs_dim = cfg.env.n_obs + len(da.get_global_state())
+    trainer = MAPPOTrainer(
+        actor_obs_dim=actor_obs_dim,
+        critic_obs_dim=critic_obs_dim,
         n_actions=cfg.env.n_actions,
         cfg=ppo_cfg,
         seed=seed,
-        agent_ids=agent_ids,
     )
     rng = np.random.default_rng(seed + 10_000)
     records: List[dict] = []
@@ -322,7 +304,7 @@ def run_training(
                 episode=episode,
                 diversity_score=diversity_score,
                 seed=seed,
-                algorithm="PPO_shared_plus_agent_id" if cfg.ppo.use_agent_id_features else "PPO_shared_plain",
+                algorithm="MAPPO",
                 cfg=cfg,
                 metrics=metrics,
                 extra={
@@ -359,7 +341,7 @@ def run_training(
                         "n_trades_closed": int(meta.get("n_trades_closed", 0)),
                         "trade_accuracy_agent": float(meta.get("trade_accuracy", 0.0)),
                     })
-                short_eval_records, _, _, _, _ = evaluate_trained_ppo(
+                short_eval_records, _, _, _, _ = evaluate_trained_mappo(
                     da,
                     trainer,
                     diversity_score,
@@ -399,10 +381,10 @@ def run_training(
                 f"t={elapsed:.0f}s"
             )
 
-    checkpoint_path = checkpoint_dir / f"ppo_D{diversity_score:.1f}_seed{seed}.pt"
+    checkpoint_path = checkpoint_dir / f"mappo_D{diversity_score:.1f}_seed{seed}.pt"
     trainer.save(checkpoint_path, episode=n_episodes)
 
-    eval_records, sample_rows, agent_eval_rows, decision_feature_rows, env_step_rows = evaluate_trained_ppo(
+    eval_records, sample_rows, agent_eval_rows, decision_feature_rows, env_step_rows = evaluate_trained_mappo(
         da,
         trainer,
         diversity_score,
@@ -412,12 +394,12 @@ def run_training(
         zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac,
         deterministic=True,
-        algorithm_name="PPO_EVAL_SAME_POPULATION_DETERMINISTIC",
+        algorithm_name="MAPPO_EVAL_SAME_POPULATION_DETERMINISTIC",
         same_population=True,
     )
     new_population_eval_records: List[dict] = []
     if eval_new_population:
-        new_population_eval_records, _, _, _, _ = evaluate_trained_ppo(
+        new_population_eval_records, _, _, _, _ = evaluate_trained_mappo(
             da,
             trainer,
             diversity_score,
@@ -427,7 +409,7 @@ def run_training(
             zi_baseline_trade_accuracy,
             zi_baseline_positive_pnl_frac,
             deterministic=True,
-            algorithm_name="PPO_EVAL_NEW_POPULATION_DETERMINISTIC",
+            algorithm_name="MAPPO_EVAL_NEW_POPULATION_DETERMINISTIC",
             same_population=False,
         )
 
@@ -446,9 +428,9 @@ def run_training(
     )
 
 
-def evaluate_trained_ppo(
+def evaluate_trained_mappo(
     da: DoubleAuction,
-    trainer: SharedPPOTrainer,
+    trainer: MAPPOTrainer,
     diversity_score: float,
     seed: int,
     cfg: HTMConfig,
@@ -459,13 +441,8 @@ def evaluate_trained_ppo(
     algorithm_name: Optional[str] = None,
     same_population: bool = True,
 ) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
-    """
-    Ewaluacja PPO. Domyślnie używa tej samej populacji co trening
-    (`reset_episode()` na tej samej instancji `da`). Opcjonalnie można
-    przełączyć na nową populację z seedem przesuniętym względem treningu.
-    """
     if same_population:
-        return evaluate_trained_ppo_same_population(
+        return evaluate_trained_mappo_same_population(
             da=da,
             trainer=trainer,
             diversity_score=diversity_score,
@@ -480,7 +457,7 @@ def evaluate_trained_ppo(
 
     eval_seed = seed if seed >= 1000 else seed + 1000
     algorithm_name = algorithm_name or (
-        "PPO_EVAL_DETERMINISTIC" if deterministic else "PPO_EVAL_STOCHASTIC"
+        "MAPPO_EVAL_DETERMINISTIC" if deterministic else "MAPPO_EVAL_STOCHASTIC"
     )
     records, sample_rows, env_step_rows = evaluate_policy(
         algorithm_name,
@@ -523,19 +500,19 @@ def plot_learning_curves(
         by_ep = df_d.groupby("episode")
         acc = by_ep["trade_accuracy"].mean().rolling(rolling_window, min_periods=1).mean()
         pnl = by_ep["mean_total_pnl"].mean().rolling(rolling_window, min_periods=1).mean()
-        axes[0].plot(acc.index, acc.values, lw=2, label=f"PPO D={d:.1f}")
+        axes[0].plot(acc.index, acc.values, lw=2, label=f"MAPPO D={d:.1f}")
         axes[1].plot(pnl.index, pnl.values, lw=2, label=f"D={d:.1f}")
         if d in zi_baselines:
             axes[0].axhline(zi_baselines[d], color="gray", ls="--", lw=1, alpha=0.5)
 
-    axes[0].set_title("PPO trade_accuracy")
+    axes[0].set_title("MAPPO trade_accuracy")
     axes[0].set_xlabel("Epizod")
     axes[0].set_ylabel("trade_accuracy")
     axes[0].set_ylim(0.0, 1.0)
     axes[0].grid(True, alpha=0.3)
     axes[0].legend(fontsize=8)
 
-    axes[1].set_title("PPO mean_total_pnl")
+    axes[1].set_title("MAPPO mean_total_pnl")
     axes[1].set_xlabel("Epizod")
     axes[1].set_ylabel("mean_total_pnl")
     axes[1].grid(True, alpha=0.3)
@@ -557,7 +534,6 @@ def log_final_summary(
 ) -> None:
     if not records:
         return
-
     df = pd.DataFrame(records)
     eval_df = pd.DataFrame(eval_same_population_records) if eval_same_population_records else pd.DataFrame()
     eval_new_df = pd.DataFrame(eval_new_population_records) if eval_new_population_records else pd.DataFrame()
@@ -566,7 +542,7 @@ def log_final_summary(
 
     log.info("")
     log.info("=" * 96)
-    log.info(f"PODSUMOWANIE PPO — ostatnie {final_window} epizodów, uśrednione po seedach")
+    log.info(f"PODSUMOWANIE MAPPO — ostatnie {final_window} epizodów, uśrednione po seedach")
     log.info(
         f"{'D':>5} | {'acc':>7} | {'ZI acc':>7} | {'pnl_tot':>9} | "
         f"{'term':>8} | {'Trades':>7} | {'Closed':>7} | {'ent':>6} | {'KL':>8}"
@@ -577,7 +553,6 @@ def log_final_summary(
         d_final = final[final["diversity_score"] == d]
         if d_final.empty:
             continue
-
         acc = float(d_final["trade_accuracy"].mean())
         zi = float(zi_baselines.get(d, 0.0))
         sign = "↑" if acc > zi else "↓"
@@ -587,23 +562,24 @@ def log_final_summary(
         closed = float(d_final["n_trades_closed"].mean())
         entropy = float(d_final["entropy"].mean()) if "entropy" in d_final else 0.0
         kl = float(d_final["approx_kl"].mean()) if "approx_kl" in d_final else 0.0
-
         log.info(
             f"{d:5.1f} | {acc:6.3f}{sign} | {zi:7.3f} | "
             f"{pnl:9.4f} | {term:8.4f} | {trades:7.1f} | "
             f"{closed:7.1f} | {entropy:6.3f} | {kl:8.5f}"
         )
 
-    if not eval_df.empty:
+    def _log_eval_block(title: str, frame: pd.DataFrame) -> None:
+        if frame.empty:
+            return
         log.info("")
-        log.info("EWALUACJA PPO — ta sama populacja, stochastic sample z masked policy")
+        log.info(title)
         log.info(
             f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
             f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
         )
         log.info("-" * 76)
         for d in diversity_scores:
-            d_eval = eval_df[eval_df["diversity_score"] == d]
+            d_eval = frame[frame["diversity_score"] == d]
             if d_eval.empty:
                 continue
             eval_acc = float(d_eval["trade_accuracy"].mean())
@@ -619,38 +595,11 @@ def log_final_summary(
                 f"{eval_trades:7.1f} | {eval_closed:7.1f}"
             )
 
-    if not eval_new_df.empty:
-        log.info("")
-        log.info("EWALUACJA PPO — nowa populacja, seed+1000, stochastic sample z masked policy")
-        log.info(
-            f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
-            f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
-        )
-        log.info("-" * 76)
-        for d in diversity_scores:
-            d_eval = eval_new_df[eval_new_df["diversity_score"] == d]
-            if d_eval.empty:
-                continue
-            eval_acc = float(d_eval["trade_accuracy"].mean())
-            zi = float(zi_baselines.get(d, 0.0))
-            sign = "↑" if eval_acc > zi else "↓"
-            eval_pnl = float(d_eval["mean_total_pnl"].mean())
-            eval_term = float(d_eval["mean_terminal_pnl"].mean())
-            eval_trades = float(d_eval["n_trades"].mean())
-            eval_closed = float(d_eval["n_trades_closed"].mean())
-            log.info(
-                f"{d:5.1f} | {eval_acc:7.3f}{sign} | {zi:7.3f} | "
-                f"{eval_pnl:9.4f} | {eval_term:8.4f} | "
-                f"{eval_trades:7.1f} | {eval_closed:7.1f}"
-            )
+    _log_eval_block("EWALUACJA MAPPO — ta sama populacja, deterministic argmax", eval_df)
+    _log_eval_block("EWALUACJA MAPPO — nowa populacja, seed+1000, deterministic argmax", eval_new_df)
 
 
 def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], List[dict], Path]:
-    """
-    Jeden niezależny trening PPO dla kombinacji (D, seed).
-
-    Funkcja jest na poziomie modułu, żeby multiprocessing mógł ją picklować.
-    """
     (
         diversity_score,
         seed,
@@ -665,7 +614,6 @@ def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List
 
     try:
         import torch
-
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
     except Exception:
@@ -699,27 +647,18 @@ def _train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], List
 
 def main(argv: List[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Szybki smoke test PPO")
+    parser.add_argument("--quick", action="store_true", help="Szybki smoke test MAPPO")
     parser.add_argument("--episodes", type=int, help="Override liczby epizodów.")
     parser.add_argument("--steps", type=int, help="Override liczby kroków w epizodzie.")
     parser.add_argument("--seeds", type=int, help="Override liczby seedów.")
     parser.add_argument("--agents", type=int, help="Override liczby agentów.")
     parser.add_argument("--zi-episodes", type=int, help="Override liczby epizodów ZI baseline.")
     parser.add_argument("--eval-episodes", type=int, help="Override liczby epizodów eval.")
-    parser.add_argument(
-        "--agent-id-features",
-        action="store_true",
-        help="Doklej one-hot agent_id do obserwacji PPO",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        help="Liczba równoległych procesów dla niezależnych zadań (D, seed).",
-    )
+    parser.add_argument("--workers", type=int, help="Liczba równoległych procesów dla niezależnych zadań (D, seed).")
     parser.add_argument(
         "--eval-new-population",
         action="store_true",
-        help="Dodatkowo uruchom osobny eval PPO na nowej populacji z seedem przesuniętym o 1000.",
+        help="Dodatkowo uruchom osobny eval MAPPO na nowej populacji z seedem przesuniętym o 1000.",
     )
     parser.add_argument("--run-tag", type=str, default="run", help="Krótki tag do nazwy folderu run.")
     parser.add_argument("--run-id", type=str, help=argparse.SUPPRESS)
@@ -743,6 +682,8 @@ def main(argv: List[str] | None = None) -> None:
         stamp_sample_rows=_stamp_sample_rows,
         plot_learning_curves=plot_learning_curves,
         log_final_summary=log_final_summary,
+        algorithm_label="MAPPO",
+        artifact_stem="mappo_quick" if args.quick else "mappo",
     )
 
 

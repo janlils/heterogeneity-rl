@@ -149,6 +149,48 @@ ENV_STEP_FIELDS = [
     "n_trades_closed_cum",
 ]
 
+AGENT_EVAL_SUMMARY_FIELDS = [
+    "run_id",
+    "phase",
+    "algorithm",
+    "diversity_score",
+    "seed",
+    "agent_id",
+    "sigma_i",
+    "trader_type",
+    "mean_realized_pnl",
+    "mean_trade_accuracy_agent",
+    "mean_n_trades_closed",
+    "mean_n_trades_won",
+    "mean_position_end",
+    "buy_frac",
+    "sell_frac",
+    "hold_frac",
+    "signal_alignment_rate",
+    "directional_action_rate",
+    "n_eval_episodes",
+]
+
+DECISION_FEATURE_SUMMARY_FIELDS = [
+    "run_id",
+    "phase",
+    "algorithm",
+    "diversity_score",
+    "seed",
+    "n_obs_actions",
+    "corr_signal_i_action_dir",
+    "corr_pos_norm_action_dir",
+    "corr_unrealized_pnl_action_dir",
+    "corr_time_remaining_action_dir",
+    "corr_gamma_obs_action_dir",
+    "corr_price_vs_start_action_dir",
+    "corr_trend_short_action_dir",
+    "corr_sigma_norm_action_dir",
+    "buy_frac",
+    "sell_frac",
+    "hold_frac",
+]
+
 
 def make_run_id(run_tag: str, timestamp: Optional[datetime] = None) -> str:
     ts = timestamp or datetime.now()
@@ -170,6 +212,8 @@ def prepare_run_dir(
     _ensure_csv(path / "episodes.csv", EPISODE_FIELDS)
     _ensure_csv(path / "agents_sample.csv", AGENT_SAMPLE_FIELDS)
     _ensure_csv(path / "env_steps.csv", ENV_STEP_FIELDS)
+    _ensure_csv(path / "agent_eval_summary.csv", AGENT_EVAL_SUMMARY_FIELDS)
+    _ensure_csv(path / "decision_feature_summary.csv", DECISION_FEATURE_SUMMARY_FIELDS)
     return resolved_run_id, path
 
 

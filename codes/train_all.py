@@ -1,5 +1,5 @@
 """
-Uruchamia benchmarki Deep SARSA i PPO jednym poleceniem.
+Uruchamia benchmarki Deep SARSA, PPO, IPPO, MAPPO i SignalRule jednym poleceniem.
 
 Przykłady:
     python -m codes.train_all --quick
@@ -14,35 +14,41 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
-from codes.results_store import latest_run_dir, prepare_run_dir, write_run_config
+from codes.experiment_runner import init_run_artifacts
+from codes.results_store import write_run_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Uruchom oba algorytmy w trybie quick.")
+    parser.add_argument("--quick", action="store_true", help="Uruchom wybrane benchmarki w trybie quick.")
     parser.add_argument(
         "--only",
-        choices=["all", "sarsa", "ppo"],
+        choices=["all", "sarsa", "ppo", "ippo", "mappo", "signal_rule"],
         default="all",
         help="Który benchmark uruchomić.",
     )
-    parser.add_argument("--episodes", type=int, help="Override epizodów dla SARSA.")
-    parser.add_argument("--steps", type=int, help="Override kroków w epizodzie dla SARSA.")
-    parser.add_argument("--seeds", type=int, help="Override seedów dla SARSA.")
-    parser.add_argument("--agents", type=int, help="Override agentów dla SARSA.")
-    parser.add_argument("--zi-episodes", type=int, help="Override epizodów ZI baseline dla SARSA.")
-    parser.add_argument("--eval-episodes", type=int, help="Override epizodów eval dla SARSA.")
-    parser.add_argument("--workers", type=int, help="Override workerów dla SARSA i PPO.")
+    parser.add_argument("--episodes", type=int, help="Override liczby epizodów dla wszystkich algorytmów.")
+    parser.add_argument("--steps", type=int, help="Override liczby kroków w epizodzie dla wszystkich algorytmów.")
+    parser.add_argument("--seeds", type=int, help="Override liczby seedów dla wszystkich algorytmów.")
+    parser.add_argument("--agents", type=int, help="Override liczby agentów dla wszystkich algorytmów.")
+    parser.add_argument("--zi-episodes", type=int, help="Override liczby epizodów ZI baseline dla wszystkich algorytmów.")
+    parser.add_argument("--eval-episodes", type=int, help="Override liczby epizodów eval dla wszystkich algorytmów.")
+    parser.add_argument("--workers", type=int, help="Override workerów dla SARSA, PPO, IPPO, MAPPO i SignalRule.")
     parser.add_argument(
         "--agent-id-features",
         action="store_true",
         help="Uruchom PPO z one-hot agent_id doklejonym do obserwacji.",
     )
     parser.add_argument("--run-tag", type=str, default="run", help="Krótki tag do nazwy folderu run.")
+    parser.add_argument(
+        "--parallel-algorithms",
+        type=int,
+        help="Maksymalna liczba algorytmów uruchamianych równolegle w train_all.",
+    )
     return parser.parse_args()
 
 
@@ -72,6 +78,56 @@ def build_ppo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[
         cmd.append("--quick")
     if args.agent_id_features:
         cmd.append("--agent-id-features")
+    _add_optional(cmd, "--episodes", args.episodes)
+    _add_optional(cmd, "--steps", args.steps)
+    _add_optional(cmd, "--seeds", args.seeds)
+    _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--zi-episodes", args.zi_episodes)
+    _add_optional(cmd, "--eval-episodes", args.eval_episodes)
+    _add_optional(cmd, "--workers", args.workers)
+    cmd.extend(["--run-tag", args.run_tag, "--run-id", run_id, "--run-dir", str(run_dir)])
+    return cmd
+
+
+def build_ippo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
+    cmd = [sys.executable, "-m", "codes.train_ippo"]
+    if args.quick:
+        cmd.append("--quick")
+    _add_optional(cmd, "--episodes", args.episodes)
+    _add_optional(cmd, "--steps", args.steps)
+    _add_optional(cmd, "--seeds", args.seeds)
+    _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--zi-episodes", args.zi_episodes)
+    _add_optional(cmd, "--eval-episodes", args.eval_episodes)
+    _add_optional(cmd, "--workers", args.workers)
+    cmd.extend(["--run-tag", args.run_tag, "--run-id", run_id, "--run-dir", str(run_dir)])
+    return cmd
+
+
+def build_mappo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
+    cmd = [sys.executable, "-m", "codes.train_mappo"]
+    if args.quick:
+        cmd.append("--quick")
+    _add_optional(cmd, "--episodes", args.episodes)
+    _add_optional(cmd, "--steps", args.steps)
+    _add_optional(cmd, "--seeds", args.seeds)
+    _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--zi-episodes", args.zi_episodes)
+    _add_optional(cmd, "--eval-episodes", args.eval_episodes)
+    _add_optional(cmd, "--workers", args.workers)
+    cmd.extend(["--run-tag", args.run_tag, "--run-id", run_id, "--run-dir", str(run_dir)])
+    return cmd
+
+
+def build_signal_rule_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
+    cmd = [sys.executable, "-m", "codes.train_signal_rule"]
+    if args.quick:
+        cmd.append("--quick")
+    _add_optional(cmd, "--steps", args.steps)
+    _add_optional(cmd, "--seeds", args.seeds)
+    _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--zi-episodes", args.zi_episodes)
+    _add_optional(cmd, "--eval-episodes", args.eval_episodes)
     _add_optional(cmd, "--workers", args.workers)
     cmd.extend(["--run-tag", args.run_tag, "--run-id", run_id, "--run-dir", str(run_dir)])
     return cmd
@@ -89,6 +145,103 @@ def run_command(label: str, cmd: List[str]) -> None:
     print("=" * 78, flush=True)
 
 
+def _parallel_default(args: argparse.Namespace) -> int:
+    if args.parallel_algorithms is not None:
+        return max(1, args.parallel_algorithms)
+    if args.quick and args.only == "all":
+        return 4
+    return 1
+
+
+def run_commands_parallel(commands: Sequence[Tuple[str, List[str]]], max_parallel: int) -> None:
+    if not commands:
+        return
+    if max_parallel <= 1 or len(commands) == 1:
+        for label, cmd in commands:
+            run_command(label, cmd)
+        return
+
+    active: List[dict] = []
+    pending = list(commands)
+    heartbeat_interval_s = 10.0
+
+    def _start(label: str, cmd: List[str]) -> None:
+        log_path = PROJECT_ROOT / "logs" / f"{label.lower()}_train_all.out"
+        print()
+        print("=" * 78, flush=True)
+        print(f"START {label}: {' '.join(cmd)}", flush=True)
+        print(f"LOG {label}: {log_path}", flush=True)
+        print("=" * 78, flush=True)
+        handle = open(log_path, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        active.append({
+            "label": label,
+            "cmd": cmd,
+            "proc": proc,
+            "handle": handle,
+            "t0": time.time(),
+            "log_path": log_path,
+            "last_heartbeat": 0.0,
+            "last_log_line": None,
+        })
+
+    def _read_last_nonempty_line(log_path: Path) -> Optional[str]:
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return None
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None
+        return lines[-1]
+
+    try:
+        while pending or active:
+            while pending and len(active) < max_parallel:
+                label, cmd = pending.pop(0)
+                _start(label, cmd)
+
+            time.sleep(1.0)
+            still_active: List[dict] = []
+            for job in active:
+                rc = job["proc"].poll()
+                if rc is None:
+                    now = time.time()
+                    if now - job["last_heartbeat"] >= heartbeat_interval_s:
+                        last_line = _read_last_nonempty_line(job["log_path"])
+                        if last_line and last_line != job["last_log_line"]:
+                            print(f"[{job['label']}] {last_line}", flush=True)
+                            job["last_log_line"] = last_line
+                        job["last_heartbeat"] = now
+                    still_active.append(job)
+                    continue
+                job["handle"].close()
+                elapsed = time.time() - job["t0"]
+                print("=" * 78, flush=True)
+                print(f"KONIEC {job['label']}: {elapsed:.0f}s | log: {job['log_path']}", flush=True)
+                print("=" * 78, flush=True)
+                if rc != 0:
+                    raise subprocess.CalledProcessError(rc, job["cmd"])
+            active = still_active
+    finally:
+        for job in active:
+            try:
+                if job["proc"].poll() is None:
+                    job["proc"].terminate()
+            except Exception:
+                pass
+            try:
+                job["handle"].close()
+            except Exception:
+                pass
+
+
 def _mean_or_none(df, column: str) -> Optional[float]:
     if column not in df.columns or df.empty:
         return None
@@ -101,14 +254,13 @@ def _fmt(value: Optional[float], width: int, decimals: int = 3) -> str:
     return f"{value:>{width}.{decimals}f}"
 
 
-def print_eval_comparison(quick: bool) -> None:
-    run_dir = latest_run_dir()
-    episodes_csv = None if run_dir is None else run_dir / "episodes.csv"
-    if episodes_csv is None or not episodes_csv.exists():
+def print_eval_comparison(run_dir: Path) -> None:
+    episodes_csv = run_dir / "episodes.csv"
+    if not episodes_csv.exists():
         print()
         print("=" * 78, flush=True)
         print("PORÓWNANIE EVAL POMINIĘTE", flush=True)
-        print("Brak results/run_*/episodes.csv", flush=True)
+        print(f"Brak {episodes_csv.relative_to(PROJECT_ROOT)}", flush=True)
         print("=" * 78, flush=True)
         return
 
@@ -117,66 +269,97 @@ def print_eval_comparison(quick: bool) -> None:
     episodes = pd.read_csv(episodes_csv)
     eval_df = episodes[episodes["phase"].astype(str).str.startswith("eval")].copy()
     sarsa = eval_df[eval_df["algorithm"].astype(str).str.contains("SARSA", case=False, na=False)]
-    ppo = eval_df[eval_df["algorithm"].astype(str).str.contains("PPO", case=False, na=False)]
+    ippo = eval_df[eval_df["algorithm"].astype(str).str.contains("IPPO", case=False, na=False)]
+    mappo = eval_df[eval_df["algorithm"].astype(str).str.contains("MAPPO", case=False, na=False)]
+    signal_rule = eval_df[eval_df["algorithm"].astype(str).str.contains("SIGNAL_RULE", case=False, na=False)]
+    ppo = eval_df[eval_df["algorithm"].astype(str).str.match(r"^PPO", case=False, na=False)]
     ppo = ppo[~ppo["algorithm"].astype(str).str.contains("NO_IMPACT", case=False, na=False)]
-    if sarsa.empty or ppo.empty:
+    if sarsa.empty and ppo.empty and ippo.empty and mappo.empty and signal_rule.empty:
         print()
         print("=" * 78, flush=True)
         print("PORÓWNANIE EVAL POMINIĘTE", flush=True)
         print(f"Brak odpowiednich rekordów eval w {episodes_csv}", flush=True)
         print("=" * 78, flush=True)
         return
-    d_vals = sorted(set(sarsa["diversity_score"].unique()) | set(ppo["diversity_score"].unique()))
+    d_vals = sorted(
+        set(sarsa["diversity_score"].unique())
+        | set(ppo["diversity_score"].unique())
+        | set(ippo["diversity_score"].unique())
+        | set(mappo["diversity_score"].unique())
+        | set(signal_rule["diversity_score"].unique())
+    )
 
     print()
-    print("=" * 118, flush=True)
-    print("PORÓWNANIE EVAL — SARSA vs PPO", flush=True)
+    print("=" * 230, flush=True)
+    print("PORÓWNANIE EVAL — SARSA vs PPO vs IPPO vs MAPPO vs SignalRule", flush=True)
     print(
-        f"{'D':>5} | {'ZI':>6} | {'SARSA acc':>9} | {'PPO acc':>7} | {'Δ acc':>7} | "
-        f"{'SARSA pnl':>9} | {'PPO pnl':>8} | {'SARSA term':>10} | {'PPO term':>8} | "
-        f"{'SARSA Closed':>12} | {'PPO Closed':>10}",
+        f"{'D':>5} | {'ZI':>6} | {'SARSA acc':>9} | {'PPO acc':>7} | {'IPPO acc':>8} | {'MAPPO acc':>9} | {'Rule acc':>8} | "
+        f"{'PPO-S':>7} | {'IPPO-S':>8} | {'MAPPO-S':>9} | {'Rule-S':>8} | "
+        f"{'SARSA pnl':>9} | {'PPO pnl':>8} | {'IPPO pnl':>9} | {'MAPPO pnl':>10} | {'Rule pnl':>9} | "
+        f"{'SARSA Closed':>12} | {'PPO Closed':>10} | {'IPPO Closed':>11} | {'MAPPO Closed':>12} | {'Rule Closed':>11}",
         flush=True,
     )
-    print("-" * 118, flush=True)
+    print("-" * 230, flush=True)
 
     for d in d_vals:
         s_d = sarsa[sarsa["diversity_score"] == d]
         p_d = ppo[ppo["diversity_score"] == d]
+        i_d = ippo[ippo["diversity_score"] == d]
+        m_d = mappo[mappo["diversity_score"] == d]
+        r_d = signal_rule[signal_rule["diversity_score"] == d]
 
         s_acc = _mean_or_none(s_d, "trade_accuracy")
         p_acc = _mean_or_none(p_d, "trade_accuracy")
-        delta = None if s_acc is None or p_acc is None else p_acc - s_acc
+        i_acc = _mean_or_none(i_d, "trade_accuracy")
+        m_acc = _mean_or_none(m_d, "trade_accuracy")
+        r_acc = _mean_or_none(r_d, "trade_accuracy")
+        delta_p = None if s_acc is None or p_acc is None else p_acc - s_acc
+        delta_i = None if s_acc is None or i_acc is None else i_acc - s_acc
+        delta_m = None if s_acc is None or m_acc is None else m_acc - s_acc
+        delta_r = None if s_acc is None or r_acc is None else r_acc - s_acc
         zi = _mean_or_none(s_d, "zi_baseline_trade_accuracy")
         if zi is None:
             zi = _mean_or_none(p_d, "zi_baseline_trade_accuracy")
+        if zi is None:
+            zi = _mean_or_none(i_d, "zi_baseline_trade_accuracy")
+        if zi is None:
+            zi = _mean_or_none(m_d, "zi_baseline_trade_accuracy")
+        if zi is None:
+            zi = _mean_or_none(r_d, "zi_baseline_trade_accuracy")
 
         s_pnl = _mean_or_none(s_d, "mean_total_pnl")
         p_pnl = _mean_or_none(p_d, "mean_total_pnl")
-        s_term = _mean_or_none(s_d, "mean_terminal_pnl")
-        p_term = _mean_or_none(p_d, "mean_terminal_pnl")
+        i_pnl = _mean_or_none(i_d, "mean_total_pnl")
+        m_pnl = _mean_or_none(m_d, "mean_total_pnl")
+        r_pnl = _mean_or_none(r_d, "mean_total_pnl")
         s_closed = _mean_or_none(s_d, "n_trades_closed")
         p_closed = _mean_or_none(p_d, "n_trades_closed")
+        i_closed = _mean_or_none(i_d, "n_trades_closed")
+        m_closed = _mean_or_none(m_d, "n_trades_closed")
+        r_closed = _mean_or_none(r_d, "n_trades_closed")
 
         print(
-            f"{d:5.1f} | {_fmt(zi, 6)} | {_fmt(s_acc, 9)} | {_fmt(p_acc, 7)} | "
-            f"{_fmt(delta, 7)} | {_fmt(s_pnl, 9, 4)} | {_fmt(p_pnl, 8, 4)} | "
-            f"{_fmt(s_term, 10, 4)} | {_fmt(p_term, 8, 4)} | "
-            f"{_fmt(s_closed, 12, 1)} | {_fmt(p_closed, 10, 1)}",
+            f"{d:5.1f} | {_fmt(zi, 6)} | {_fmt(s_acc, 9)} | {_fmt(p_acc, 7)} | {_fmt(i_acc, 8)} | {_fmt(m_acc, 9)} | {_fmt(r_acc, 8)} | "
+            f"{_fmt(delta_p, 7)} | {_fmt(delta_i, 8)} | {_fmt(delta_m, 9)} | {_fmt(delta_r, 8)} | "
+            f"{_fmt(s_pnl, 9, 4)} | {_fmt(p_pnl, 8, 4)} | {_fmt(i_pnl, 9, 4)} | {_fmt(m_pnl, 10, 4)} | {_fmt(r_pnl, 9, 4)} | "
+            f"{_fmt(s_closed, 12, 1)} | {_fmt(p_closed, 10, 1)} | {_fmt(i_closed, 11, 1)} | {_fmt(m_closed, 12, 1)} | {_fmt(r_closed, 11, 1)}",
             flush=True,
         )
 
-    print("-" * 118, flush=True)
+    print("-" * 230, flush=True)
     print(f"Run folder: {run_dir.relative_to(PROJECT_ROOT)}", flush=True)
     print(f"Episodes CSV: {episodes_csv.relative_to(PROJECT_ROOT)}", flush=True)
-    print("=" * 118, flush=True)
+    print("=" * 194, flush=True)
 
 
 def main() -> None:
     args = parse_args()
     total_t0 = time.time()
-    run_id, run_dir = prepare_run_dir(args.run_tag)
-    write_run_config(run_dir / "run_config.json", {
-        "run_id": run_id,
+    artifacts = init_run_artifacts(args.run_tag, None, None)
+    run_id = artifacts.run_id
+    run_dir = artifacts.run_dir
+    write_run_config(artifacts.run_config_path, {
+        "run_id": artifacts.run_id,
         "run_tag": args.run_tag,
         "timestamp": run_id.split("_", 1)[1] if run_id.startswith("run_") else run_id,
         "algorithm": "train_all",
@@ -189,15 +372,25 @@ def main() -> None:
         "zi_episodes": args.zi_episodes,
         "eval_episodes": args.eval_episodes,
         "workers": args.workers,
+        "parallel_algorithms": _parallel_default(args),
         "agent_id_features": args.agent_id_features,
     })
 
+    commands: List[Tuple[str, List[str]]] = []
     if args.only in {"all", "sarsa"}:
-        run_command("Deep SARSA", build_sarsa_cmd(args, run_id, run_dir))
+        commands.append(("Deep SARSA", build_sarsa_cmd(args, run_id, run_dir)))
     if args.only in {"all", "ppo"}:
-        run_command("PPO", build_ppo_cmd(args, run_id, run_dir))
+        commands.append(("PPO", build_ppo_cmd(args, run_id, run_dir)))
+    if args.only in {"all", "ippo"}:
+        commands.append(("IPPO", build_ippo_cmd(args, run_id, run_dir)))
+    if args.only in {"all", "mappo"}:
+        commands.append(("MAPPO", build_mappo_cmd(args, run_id, run_dir)))
+    if args.only in {"all", "signal_rule"}:
+        commands.append(("SignalRule", build_signal_rule_cmd(args, run_id, run_dir)))
 
-    print_eval_comparison(args.quick)
+    run_commands_parallel(commands, _parallel_default(args))
+
+    print_eval_comparison(run_dir)
 
     print()
     print("=" * 78, flush=True)

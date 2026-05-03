@@ -245,6 +245,18 @@ class DoubleAuction:
         self.cfg        = cfg
         self.rng        = np.random.default_rng(seed)
         self.population: Optional[AgentPopulation] = None
+        self.agent_ids: List[str] = []
+        self._agent_idx: Dict[str, int] = {}
+        self._positions_arr = np.zeros(0, dtype=np.int32)
+        self._entry_prices_arr = np.zeros(0, dtype=np.float32)
+        self._realized_pnl_arr = np.zeros(0, dtype=np.float32)
+        self._n_trades_closed_arr = np.zeros(0, dtype=np.int32)
+        self._n_trades_won_arr = np.zeros(0, dtype=np.int32)
+        self._sigma_i_arr = np.zeros(0, dtype=np.float32)
+        self._gamma_i_arr = np.zeros(0, dtype=np.float32)
+        self._threshold_arr = np.zeros(0, dtype=np.float32)
+        self._max_position_arr = np.zeros(0, dtype=np.int32)
+        self._risk_aversion_arr = np.zeros(0, dtype=np.float32)
         self._eq_price  = cfg.market.eq_center
         self._ref_price = cfg.market.eq_center  # aktualizowany po transakcjach
         self._episode_start_price: float = cfg.market.eq_center
@@ -259,15 +271,62 @@ class DoubleAuction:
         self._prev_price:         float            = 0.5
         self._actions_log:        List[dict]       = []
         self._price_window:       List[float]      = []
-        self._episode_pnl:        Dict[str, float] = {}
-        self._realized_this_step: Dict[str, float] = {}  # realized PnL per agent w bieżącym kroku
+        self._episode_pnl_arr = np.zeros(0, dtype=np.float32)
+        self._realized_this_step_arr = np.zeros(0, dtype=np.float32)
         self._price_history:      List[float]      = []
         self._n_fills:            int              = 0
         self._n_position_closes:  int              = 0
-        self._terminal_pnl:       Dict[str, float] = {}
+        self._terminal_pnl_arr = np.zeros(0, dtype=np.float32)
         self._prev_net_flow:      int              = 0
         self._V_drift:            float            = 0.0
         self._signal_cache:       Dict[str, float] = {}
+
+    def _sync_agent_from_idx(self, idx: int) -> None:
+        if self.population is None or idx >= len(self.agent_ids):
+            return
+        aid = self.agent_ids[idx]
+        p = self.population.agents[aid]
+        p.position = int(self._positions_arr[idx])
+        p.entry_price = float(self._entry_prices_arr[idx])
+        p.realized_pnl = float(self._realized_pnl_arr[idx])
+        p.n_trades_closed = int(self._n_trades_closed_arr[idx])
+        p.n_trades_won = int(self._n_trades_won_arr[idx])
+
+    def _init_runtime_arrays(self) -> None:
+        if self.population is None:
+            self.agent_ids = []
+            self._agent_idx = {}
+            self._positions_arr = np.zeros(0, dtype=np.int32)
+            self._entry_prices_arr = np.zeros(0, dtype=np.float32)
+            self._realized_pnl_arr = np.zeros(0, dtype=np.float32)
+            self._n_trades_closed_arr = np.zeros(0, dtype=np.int32)
+            self._n_trades_won_arr = np.zeros(0, dtype=np.int32)
+            self._sigma_i_arr = np.zeros(0, dtype=np.float32)
+            self._gamma_i_arr = np.zeros(0, dtype=np.float32)
+            self._threshold_arr = np.zeros(0, dtype=np.float32)
+            self._max_position_arr = np.zeros(0, dtype=np.int32)
+            self._risk_aversion_arr = np.zeros(0, dtype=np.float32)
+            self._episode_pnl_arr = np.zeros(0, dtype=np.float32)
+            self._realized_this_step_arr = np.zeros(0, dtype=np.float32)
+            self._terminal_pnl_arr = np.zeros(0, dtype=np.float32)
+            return
+        self.agent_ids = list(self.population.agents.keys())
+        self._agent_idx = {aid: i for i, aid in enumerate(self.agent_ids)}
+        agents = [self.population.agents[aid] for aid in self.agent_ids]
+        self._positions_arr = np.array([p.position for p in agents], dtype=np.int32)
+        self._entry_prices_arr = np.array([p.entry_price for p in agents], dtype=np.float32)
+        self._realized_pnl_arr = np.array([p.realized_pnl for p in agents], dtype=np.float32)
+        self._n_trades_closed_arr = np.array([p.n_trades_closed for p in agents], dtype=np.int32)
+        self._n_trades_won_arr = np.array([p.n_trades_won for p in agents], dtype=np.int32)
+        self._sigma_i_arr = np.array([p.sigma_i for p in agents], dtype=np.float32)
+        self._gamma_i_arr = np.array([p.gamma for p in agents], dtype=np.float32)
+        self._threshold_arr = np.array([p.threshold for p in agents], dtype=np.float32)
+        self._max_position_arr = np.array([p.max_position for p in agents], dtype=np.int32)
+        self._risk_aversion_arr = np.array([p.risk_aversion for p in agents], dtype=np.float32)
+        n = len(agents)
+        self._episode_pnl_arr = np.zeros(n, dtype=np.float32)
+        self._realized_this_step_arr = np.zeros(n, dtype=np.float32)
+        self._terminal_pnl_arr = np.zeros(n, dtype=np.float32)
 
     # -----------------------------------------------------------------------
     # Reset
@@ -306,6 +365,7 @@ class DoubleAuction:
             eq_price        = self._eq_price,
             seed            = seed,
         )
+        self.agent_ids = list(self.population.agents.keys())
         self._V_t_prev = self._eq_price
 
         self._step        = 0
@@ -322,12 +382,10 @@ class DoubleAuction:
         # Reset pozycji agentów
         for p in self.population.agents.values():
             p.reset_position()
+        self._init_runtime_arrays()
 
         self._rewards    = {aid: 0.0 for aid in self.population.agents}
         self._prev_price = self._ref_price
-        self._episode_pnl = {aid: 0.0 for aid in self.population.agents}
-        self._realized_this_step = {}
-        self._terminal_pnl = {}
         self._prev_net_flow = 0
         self._refresh_signal_cache()
 
@@ -336,8 +394,8 @@ class DoubleAuction:
 f"N={self.cfg.env.n_agents}"
         )
 
-        return {aid: self.get_observation(aid)
-                for aid in self.population.agents}
+        obs_batch = self.get_all_observations()
+        return {aid: obs_batch[i] for i, aid in enumerate(self.agent_ids)}
 
     def reset_episode(self) -> Dict[str, np.ndarray]:
         """
@@ -364,6 +422,7 @@ f"N={self.cfg.env.n_agents}"
         # 2. Reset portfeli agentów na nowy epizod.
         for p in self.population.agents.values():
             p.reset_position()
+        self._init_runtime_arrays()
 
         # 3. Reset stanu epizodu (nie: P_t, wagi sieci, epsilon)
         self._step            = 0
@@ -378,13 +437,11 @@ f"N={self.cfg.env.n_agents}"
         self._n_position_closes = 0
         self._rewards             = {aid: 0.0 for aid in self.population.agents}
         self._prev_price          = self._ref_price
-        self._episode_pnl         = {aid: 0.0 for aid in self.population.agents}
-        self._realized_this_step  = {}
-        self._terminal_pnl        = {}
         self._prev_net_flow       = 0
         self._refresh_signal_cache()
 
-        return {aid: self.get_observation(aid) for aid in self.population.agents}
+        obs_batch = self.get_all_observations()
+        return {aid: obs_batch[i] for i, aid in enumerate(self.agent_ids)}
 
     # backward compat alias
     def reset_market_only(self) -> Dict[str, np.ndarray]:
@@ -442,11 +499,6 @@ f"N={self.cfg.env.n_agents}"
             return None  # HOLD
 
         self._record_fill_price(p_exec)
-        if realized != 0.0:
-            self._realized_this_step[agent_id] = (
-                self._realized_this_step.get(agent_id, 0.0) + realized
-            )
-
         return {"agent_id": agent_id, "side": self.cfg.env.action_name(action_idx), "price": p_exec}
 
     def execute_parallel_actions(self, actions: dict) -> None:
@@ -466,37 +518,29 @@ f"N={self.cfg.env.n_agents}"
 
         e = self.cfg.env
         P_before = self._ref_price
-        buy_agents = [
-            aid for aid, action in actions.items()
-            if aid in self.population.agents
-            and action == e.ACTION_BUY_MARKET
-            and self.population.agents[aid].position < self.population.agents[aid].max_position
-        ]
-        sell_agents = [
-            aid for aid, action in actions.items()
-            if aid in self.population.agents
-            and action == e.ACTION_SELL_MARKET
-            and self.population.agents[aid].position > -self.population.agents[aid].max_position
-        ]
+        buy_agents = []
+        sell_agents = []
+        for aid, action in actions.items():
+            idx = self._agent_idx.get(aid)
+            if idx is None:
+                continue
+            pos = int(self._positions_arr[idx])
+            max_pos = int(self._max_position_arr[idx])
+            if action == e.ACTION_BUY_MARKET and pos < max_pos:
+                buy_agents.append(aid)
+            elif action == e.ACTION_SELL_MARKET and pos > -max_pos:
+                sell_agents.append(aid)
         excess = len(buy_agents) - len(sell_agents)
         p_exec_buy = float(np.clip(P_before + e.half_spread, e.p_min, e.p_max))
         p_exec_sell = float(np.clip(P_before - e.half_spread, e.p_min, e.p_max))
 
         for aid in buy_agents:
-            realized = self._execute_fill(aid, "buy", p_exec_buy)
+            self._execute_fill(aid, "buy", p_exec_buy)
             self._record_fill_price(p_exec_buy)
-            if realized != 0.0:
-                self._realized_this_step[aid] = (
-                    self._realized_this_step.get(aid, 0.0) + realized
-                )
 
         for aid in sell_agents:
-            realized = self._execute_fill(aid, "sell", p_exec_sell)
+            self._execute_fill(aid, "sell", p_exec_sell)
             self._record_fill_price(p_exec_sell)
-            if realized != 0.0:
-                self._realized_this_step[aid] = (
-                    self._realized_this_step.get(aid, 0.0) + realized
-                )
 
         self._prev_net_flow = excess
         if excess != 0:
@@ -516,7 +560,7 @@ f"N={self.cfg.env.n_agents}"
                 "agent_id":   aid,
                 "action":     action,
                 "action_name":e.action_name(action),
-                "position":   self.population.agents[aid].position,
+                "position":   int(self._positions_arr[self._agent_idx[aid]]),
                 "sentiment":  self.population.agents[aid].sentiment,
                 "ref_price":  self._ref_price,
             })
@@ -554,19 +598,20 @@ f"N={self.cfg.env.n_agents}"
         # 2. Oblicz nagrody
         # MTM = mark-to-market: niezrealizowany zysk/strata z otwartej pozycji
         # po ruchu ceny, który wydarzył się po bieżącej decyzji.
-        rewards: Dict[str, float] = {}
-        for aid, p in self.population.agents.items():
-            realized = self._realized_this_step.get(aid, 0.0)
-            mtm = e.mtm_weight * p.position * price_delta
-            rewards[aid] = realized + mtm
-            self._episode_pnl[aid] = self._episode_pnl.get(aid, 0.0) + realized
+        realized_arr = self._realized_this_step_arr.astype(np.float32, copy=False)
+        mtm_arr = e.mtm_weight * self._positions_arr.astype(np.float32, copy=False) * float(price_delta)
+        reward_arr = realized_arr + mtm_arr
+        self._episode_pnl_arr += realized_arr
+        rewards: Dict[str, float] = {
+            aid: float(reward_arr[i]) for i, aid in enumerate(self.agent_ids)
+        }
 
         # 3. Drift V_t na kolejny krok.
         self._drift_V_t()
 
         self._step_prices.append(self._ref_price)
         self._prev_price = self._ref_price
-        self._realized_this_step = {}
+        self._realized_this_step_arr.fill(0.0)
         self._refresh_signal_cache()
 
         self._step += 1
@@ -576,7 +621,7 @@ f"N={self.cfg.env.n_agents}"
                 terminal = self._liquidate_terminal_positions()
                 for aid, realized in terminal.items():
                     rewards[aid]          = rewards.get(aid, 0.0) + realized
-                    self._episode_pnl[aid] = self._episode_pnl.get(aid, 0.0) + realized
+                    self._episode_pnl_arr[self._agent_idx[aid]] += float(realized)
             self._done = True
 
         dones = {aid: done for aid in self.population.agents}
@@ -618,48 +663,51 @@ f"N={self.cfg.env.n_agents}"
         Sentiment nie bierze udziału w PnL. Zysk/strata wynika wyłącznie
         z average cost basis i ceny zamknięcia.
         """
-        agent = self.population.agents[agent_id]
-        old = agent.position
+        idx = self._agent_idx[agent_id]
+        old = int(self._positions_arr[idx])
         realized = 0.0
+        entry_price = float(self._entry_prices_arr[idx])
 
         if side == "buy":
             if old < 0:
-                realized = agent.entry_price - p_exec
-                self._register_close(agent, realized)
+                realized = entry_price - p_exec
+                self._register_close(idx, realized)
                 if old + 1 == 0:
-                    agent.entry_price = 0.0
+                    self._entry_prices_arr[idx] = 0.0
             elif old == 0:
-                agent.entry_price = p_exec
+                self._entry_prices_arr[idx] = p_exec
             else:
-                agent.entry_price = (agent.entry_price * old + p_exec) / (old + 1)
-            agent.position += 1
+                self._entry_prices_arr[idx] = (entry_price * old + p_exec) / (old + 1)
+            self._positions_arr[idx] = old + 1
 
         elif side == "sell":
             if old > 0:
-                realized = p_exec - agent.entry_price
-                self._register_close(agent, realized)
+                realized = p_exec - entry_price
+                self._register_close(idx, realized)
                 if old - 1 == 0:
-                    agent.entry_price = 0.0
+                    self._entry_prices_arr[idx] = 0.0
             elif old == 0:
-                agent.entry_price = p_exec
+                self._entry_prices_arr[idx] = p_exec
             else:
-                agent.entry_price = (agent.entry_price * abs(old) + p_exec) / (abs(old) + 1)
-            agent.position -= 1
+                self._entry_prices_arr[idx] = (entry_price * abs(old) + p_exec) / (abs(old) + 1)
+            self._positions_arr[idx] = old - 1
         else:
             raise ValueError(f"Unknown side: {side}")
 
-        agent.realized_pnl += realized
+        self._realized_pnl_arr[idx] += float(realized)
+        self._realized_this_step_arr[idx] += float(realized)
+        self._sync_agent_from_idx(idx)
         _log.debug(
-            f"  FILL {agent_id} {side} pos:{old}->{agent.position} "
+            f"  FILL {agent_id} {side} pos:{old}->{int(self._positions_arr[idx])} "
             f"p={p_exec:.4f} r={realized:.4f}"
         )
         return realized
 
-    def _register_close(self, agent: AgentParams, realized: float) -> None:
-        agent.n_trades_closed += 1
+    def _register_close(self, idx: int, realized: float) -> None:
+        self._n_trades_closed_arr[idx] += 1
         self._n_position_closes += 1
         if realized > 0:
-            agent.n_trades_won += 1
+            self._n_trades_won_arr[idx] += 1
 
     def _liquidate_terminal_positions(self) -> Dict[str, float]:
         """
@@ -678,28 +726,33 @@ f"N={self.cfg.env.n_agents}"
         e = self.cfg.env
         realized_by_agent: Dict[str, float] = {}
 
-        for aid, p in self.population.agents.items():
+        for aid in self.agent_ids:
+            idx = self._agent_idx[aid]
             total = 0.0
+            position = int(self._positions_arr[idx])
+            entry_price = float(self._entry_prices_arr[idx])
 
-            while p.position > 0:
+            while position > 0:
                 p_exec = float(np.clip(self._ref_price, e.p_min, e.p_max))
-                realized = p_exec - p.entry_price
+                realized = p_exec - entry_price
                 total += realized
-                p.realized_pnl += realized
-                p.position -= 1
+                self._realized_pnl_arr[idx] += float(realized)
+                position -= 1
 
-            while p.position < 0:
+            while position < 0:
                 p_exec = float(np.clip(self._ref_price, e.p_min, e.p_max))
-                realized = p.entry_price - p_exec
+                realized = entry_price - p_exec
                 total += realized
-                p.realized_pnl += realized
-                p.position += 1
+                self._realized_pnl_arr[idx] += float(realized)
+                position += 1
 
-            p.entry_price = 0.0
+            self._positions_arr[idx] = 0
+            self._entry_prices_arr[idx] = 0.0
+            self._terminal_pnl_arr[idx] = float(total)
+            self._sync_agent_from_idx(idx)
             if total != 0.0:
                 realized_by_agent[aid] = total
 
-        self._terminal_pnl = realized_by_agent
         return realized_by_agent
 
     def _drift_V_t(self) -> None:
@@ -732,8 +785,8 @@ f"N={self.cfg.env.n_agents}"
             return
         sc = self.cfg.sentiment
         signal_cache: Dict[str, float] = {}
-        for aid, p in self.population.agents.items():
-            noise = float(self.rng.normal(0.0, p.sigma_i))
+        for i, aid in enumerate(self.agent_ids):
+            noise = float(self.rng.normal(0.0, float(self._sigma_i_arr[i])))
             signal_cache[aid] = float(np.clip(
                 (self._eq_price - self._ref_price + noise) / sc.signal_scale,
                 -1.0,
@@ -762,16 +815,18 @@ f"N={self.cfg.env.n_agents}"
         to niezaszumiony sygnał identyczny dla wszystkich agentów, który
         osłabiał heterogeniczność opartą na sigma_i.
         """
-        p    = self.population.agents[agent_id]
+        idx = self._agent_idx[agent_id]
         T    = self.cfg.env.episode_steps
-        MPOS = max(p.max_position, 1)
+        MPOS = max(int(self._max_position_arr[idx]), 1)
+        position = int(self._positions_arr[idx])
+        entry_price = float(self._entry_prices_arr[idx])
 
-        pos_norm = float(np.clip(p.position / MPOS, -1.0, 1.0))
+        pos_norm = float(np.clip(position / MPOS, -1.0, 1.0))
         time_rem = float(np.clip(1.0 - self._step / max(T, 1), 0.0, 1.0))
 
-        if p.position != 0 and p.entry_price > 0:
+        if position != 0 and entry_price > 0:
             unrealized = float(np.clip(
-                (self._ref_price - p.entry_price) * p.position / 0.05,
+                (self._ref_price - entry_price) * position / 0.05,
                 -2.0, 2.0
             ))
         else:
@@ -799,17 +854,150 @@ f"N={self.cfg.env.n_agents}"
             -1.0,
             1.0,
         ))
-        sigma_norm = float(np.clip(p.sigma_i / sc.sigma_chart, 0.0, 1.0))
+        sigma_norm = float(np.clip(float(self._sigma_i_arr[idx]) / sc.sigma_chart, 0.0, 1.0))
 
         return np.array([
             signal_i,                                           # [0]
             pos_norm,                                           # [1]
             unrealized,                                         # [2]
             time_rem,                                           # [3]
-            p.gamma,                                            # [4]
+            float(self._gamma_i_arr[idx]),                      # [4]
             price_vs_start,                                     # [5]
             trend_short,                                        # [6]
             sigma_norm,                                         # [7]
+        ], dtype=np.float32)
+
+    def get_agent_ids(self) -> List[str]:
+        return list(self.agent_ids)
+
+    def get_observations(self, agent_ids: Optional[List[str]] = None) -> np.ndarray:
+        """
+        Batch API obserwacji.
+
+        Zwraca tablicę [n_agents, obs_dim] w kolejności przekazanych agent_ids
+        albo w domyślnej, stabilnej kolejności środowiska.
+        """
+        if self.population is None:
+            return np.zeros((0, self.cfg.env.n_obs), dtype=np.float32)
+        ids = agent_ids if agent_ids is not None else self.agent_ids
+        if not ids:
+            return np.zeros((0, self.cfg.env.n_obs), dtype=np.float32)
+
+        idxs = np.array([self._agent_idx[aid] for aid in ids], dtype=np.int32)
+        T = max(self.cfg.env.episode_steps, 1)
+        sc = self.cfg.sentiment
+        max_pos = np.maximum(self._max_position_arr[idxs].astype(np.float32), 1.0)
+        positions = self._positions_arr[idxs].astype(np.float32, copy=False)
+        entry_prices = self._entry_prices_arr[idxs].astype(np.float32, copy=False)
+
+        pos_norm = np.clip(positions / max_pos, -1.0, 1.0)
+        time_rem = np.full(len(idxs), np.clip(1.0 - self._step / T, 0.0, 1.0), dtype=np.float32)
+        active = (positions != 0.0) & (entry_prices > 0.0)
+        unrealized = np.zeros(len(idxs), dtype=np.float32)
+        unrealized[active] = np.clip(
+            (self._ref_price - entry_prices[active]) * positions[active] / 0.05,
+            -2.0,
+            2.0,
+        )
+        price_vs_start = np.full(
+            len(idxs),
+            np.clip((self._ref_price - self._episode_start_price) / 0.1, -3.0, 3.0),
+            dtype=np.float32,
+        )
+        old_price = self._step_prices[-8] if len(self._step_prices) >= 8 else self._episode_start_price
+        trend_short = np.full(
+            len(idxs),
+            np.tanh((self._ref_price - old_price) / max(sc.sigma_P, 1e-6)),
+            dtype=np.float32,
+        )
+        if len(self._signal_cache) != len(self.agent_ids):
+            self._refresh_signal_cache()
+        signal_i = np.array([self._signal_cache[aid] for aid in ids], dtype=np.float32)
+        sigma_norm = np.clip(
+            self._sigma_i_arr[idxs].astype(np.float32, copy=False) / max(sc.sigma_chart, 1e-6),
+            0.0,
+            1.0,
+        )
+        gamma = self._gamma_i_arr[idxs].astype(np.float32, copy=False)
+
+        return np.column_stack([
+            signal_i,
+            pos_norm,
+            unrealized,
+            time_rem,
+            gamma,
+            price_vs_start,
+            trend_short,
+            sigma_norm,
+        ]).astype(np.float32, copy=False)
+
+    def get_all_observations(self) -> np.ndarray:
+        return self.get_observations(self.agent_ids)
+
+    def get_global_state(self) -> np.ndarray:
+        """
+        Zwięzły globalny stan rynku dla centralized critic (MAPPO).
+
+        To nie jest pełny joint state wszystkich agentów. To zestaw agregatów
+        rynku i populacji, który ma pomóc criticowi ocenić wartość stanu:
+          [0] eq_price
+          [1] ref_price
+          [2] public_gap = (V - P) / signal_scale
+          [3] price_vs_start
+          [4] trend_short
+          [5] mean_position_norm
+          [6] mean_abs_position_norm
+          [7] prev_net_flow_norm
+          [8] mean_sigma_norm
+          [9] std_sigma_norm
+        """
+        sc = self.cfg.sentiment
+        if self.population is None:
+            return np.zeros(10, dtype=np.float32)
+
+        if len(self._step_prices) >= 8:
+            old_price = self._step_prices[-8]
+        else:
+            old_price = self._episode_start_price
+
+        max_position = max(self.cfg.env.max_position, 1)
+        positions = self._positions_arr.astype(np.float32, copy=False)
+        sigmas = self._sigma_i_arr.astype(np.float32, copy=False)
+
+        public_gap = float(np.clip(
+            (self._eq_price - self._ref_price) / max(sc.signal_scale, 1e-6),
+            -1.0,
+            1.0,
+        ))
+        price_vs_start = float(np.clip(
+            (self._ref_price - self._episode_start_price) / 0.1,
+            -3.0,
+            3.0,
+        ))
+        trend_short = float(np.tanh(
+            (self._ref_price - old_price) / max(sc.sigma_P, 1e-6)
+        ))
+        prev_net_flow_norm = float(np.clip(
+            self._prev_net_flow / max(self.cfg.env.n_agents, 1),
+            -1.0,
+            1.0,
+        ))
+        mean_position_norm = float(np.clip(np.mean(positions) / max_position, -1.0, 1.0))
+        mean_abs_position_norm = float(np.clip(np.mean(np.abs(positions)) / max_position, 0.0, 1.0))
+        mean_sigma_norm = float(np.clip(np.mean(sigmas) / max(sc.sigma_chart, 1e-6), 0.0, 1.0))
+        std_sigma_norm = float(np.clip(np.std(sigmas) / max(sc.sigma_chart, 1e-6), 0.0, 1.0))
+
+        return np.array([
+            float(self._eq_price),
+            float(self._ref_price),
+            public_gap,
+            price_vs_start,
+            trend_short,
+            mean_position_norm,
+            mean_abs_position_norm,
+            prev_net_flow_norm,
+            mean_sigma_norm,
+            std_sigma_norm,
         ], dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -823,7 +1011,7 @@ f"N={self.cfg.env.n_agents}"
     @property
     def active_agents(self) -> List[str]:
         """W CT wszyscy agenci są aktywni przez cały epizod."""
-        return list(self.population.agents.keys()) if self.population else []
+        return list(self.agent_ids) if self.population else []
 
     @property
     def ref_price(self) -> float:
@@ -840,17 +1028,16 @@ f"N={self.cfg.env.n_agents}"
     def episode_metrics(self) -> dict:
         """Metryki epizodu — Continuous Trading."""
         prices  = self._price_history
-        agents = list(self.population.agents.values())
-
         # Realized P&L agentów (z zamkniętych pozycji)
-        pnls     = self._episode_pnl   # realized PnL per agent
-        pnl_vals = [v for v in pnls.values()]
+        pnls_arr = self._episode_pnl_arr.astype(np.float32, copy=False)
+        pnls = {aid: float(pnls_arr[i]) for i, aid in enumerate(self.agent_ids)}
+        pnl_vals = pnls_arr.tolist()
         mean_pnl = float(np.mean(pnl_vals)) if pnl_vals else 0.0
-        positive_pnl = sum(1 for v in pnls.values() if v > 0)
+        positive_pnl = int(np.sum(pnls_arr > 0))
 
         # Trade accuracy: ile zamkniętych transakcji było zyskownych
-        total_closed = sum(p.n_trades_closed for p in self.population.agents.values())
-        total_won    = sum(p.n_trades_won    for p in self.population.agents.values())
+        total_closed = int(np.sum(self._n_trades_closed_arr))
+        total_won    = int(np.sum(self._n_trades_won_arr))
         trade_accuracy = float(total_won / max(total_closed, 1))
 
         # Zmienność cen
@@ -868,30 +1055,28 @@ f"N={self.cfg.env.n_agents}"
         n_acts = max(len(self._actions_log), 1)
 
         # Pozycja na koniec epizodu
-        final_pos   = {aid: p.position for aid, p in self.population.agents.items()}
-        mean_pos    = float(np.mean(list(final_pos.values())))
-        mean_abs_pos = float(np.mean([abs(v) for v in final_pos.values()]))
-        open_pos    = sum(1 for v in final_pos.values() if v != 0)
+        final_pos_arr = self._positions_arr.astype(np.int32, copy=False)
+        final_pos = {aid: int(final_pos_arr[i]) for i, aid in enumerate(self.agent_ids)}
+        mean_pos    = float(np.mean(final_pos_arr)) if len(final_pos_arr) else 0.0
+        mean_abs_pos = float(np.mean(np.abs(final_pos_arr))) if len(final_pos_arr) else 0.0
+        open_pos    = int(np.sum(final_pos_arr != 0))
         positive_pnl_frac = float(positive_pnl / max(self.cfg.env.n_agents, 1))
-        terminal_pnl_vals  = list(self._terminal_pnl.values())
+        terminal_pnl_vals  = self._terminal_pnl_arr.tolist()
         mean_terminal_pnl  = float(np.mean(terminal_pnl_vals)) if terminal_pnl_vals else 0.0
-        terminal_positive  = sum(1 for v in terminal_pnl_vals if v > 0)
+        terminal_positive  = int(np.sum(self._terminal_pnl_arr > 0))
         sc = self.cfg.sentiment
         value_gap_value = float(np.clip(
             (self._eq_price - self._ref_price) / sc.signal_scale,
             -1.0,
             1.0,
         ))
-        value_gaps = [value_gap_value for _ in agents]
+        value_gaps = [value_gap_value for _ in self.agent_ids]
         midpoint = (sc.sigma_fund + sc.sigma_chart) / 2.0
         pct_chartists = float(
-            sum(1 for p in agents if p.sigma_i > midpoint) / max(len(agents), 1)
+            np.sum(self._sigma_i_arr > midpoint) / max(len(self.agent_ids), 1)
         )
-        type_proxy = np.array(
-            [p.sigma_i for p in agents],
-            dtype=np.float64,
-        )
-        pnl_array = np.array([pnls.get(p.agent_id, 0.0) for p in agents], dtype=np.float64)
+        type_proxy = self._sigma_i_arr.astype(np.float64, copy=False)
+        pnl_array = pnls_arr.astype(np.float64, copy=False)
         if (
             len(type_proxy) >= 2
             and float(np.std(type_proxy)) > 1e-12
@@ -945,13 +1130,16 @@ f"N={self.cfg.env.n_agents}"
                 "threshold":       p.threshold,
                 "gamma":           p.gamma,
                 "risk_aversion":   p.risk_aversion,
-                "position":        p.position,
-                "entry_price":     p.entry_price,
-                "ep_pnl":          self._episode_pnl.get(aid, 0.0),
-                "realized_pnl":    p.realized_pnl,
-                "n_trades_closed": p.n_trades_closed,
-                "n_trades_won":    p.n_trades_won,
-                "trade_accuracy":  float(p.n_trades_won / max(p.n_trades_closed, 1)),
+                "position":        int(self._positions_arr[self._agent_idx[aid]]),
+                "entry_price":     float(self._entry_prices_arr[self._agent_idx[aid]]),
+                "ep_pnl":          float(self._episode_pnl_arr[self._agent_idx[aid]]),
+                "realized_pnl":    float(self._realized_pnl_arr[self._agent_idx[aid]]),
+                "n_trades_closed": int(self._n_trades_closed_arr[self._agent_idx[aid]]),
+                "n_trades_won":    int(self._n_trades_won_arr[self._agent_idx[aid]]),
+                "trade_accuracy":  float(
+                    self._n_trades_won_arr[self._agent_idx[aid]]
+                    / max(int(self._n_trades_closed_arr[self._agent_idx[aid]]), 1)
+                ),
             }
             for aid, p in self.population.agents.items()
         }

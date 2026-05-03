@@ -45,19 +45,35 @@ import matplotlib.pyplot as plt
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from multiprocessing import Pool, cpu_count
-from codes.config import HTMConfig, EnvConfig, MarketDynamics, LogConfig, DeepSARSAConfig
+from multiprocessing import cpu_count
+from codes.config import HTMConfig, EnvConfig, LogConfig, DeepSARSAConfig
 from codes.double_auction import DoubleAuction
 from codes.deep_sarsa import DeepSARSAMultiAgent
-from codes.evaluate_policies import evaluate_sarsa, evaluate_zi
-from codes.rl_common import build_agent_sample_row, build_env_step_row, build_episode_record
-from codes.results_store import (
-    EPISODE_FIELDS,
-    AGENT_SAMPLE_FIELDS,
-    ENV_STEP_FIELDS,
-    append_rows,
-    prepare_run_dir,
-    write_run_config,
+from codes.evaluation import evaluate_same_population
+from codes.experiment_runner import (
+    init_run_artifacts,
+    run_sarsa_experiment,
+)
+from codes.experiment_settings import (
+    DEFAULT_DIVERSITY_SCORES,
+    DEFAULT_EPISODE_STEPS,
+    DEFAULT_EVAL_EPISODES,
+    DEFAULT_LOG_EVERY,
+    DEFAULT_MARKET,
+    DEFAULT_N_AGENTS,
+    DEFAULT_N_EPISODES,
+    DEFAULT_N_SEEDS,
+    DEFAULT_ROLLING_WINDOW,
+    DEFAULT_ZI_EPISODES,
+    build_sarsa_settings,
+)
+from codes.evaluate_policies import evaluate_sarsa
+from codes.rl_common import (
+    aggregate_agent_eval_episode_rows,
+    build_episode_record,
+    finalize_decision_feature_summary,
+    init_decision_feature_stats,
+    update_decision_feature_stats,
 )
 
 # ---------------------------------------------------------------------------
@@ -80,20 +96,20 @@ log = logging.getLogger("htm.train")
 # Parametry eksperymentu — zmień tu
 # ---------------------------------------------------------------------------
 
-DIVERSITY_SCORES = [0.0, 0.3, 0.5, 0.7, 1.0]   # wartości D do przetestowania
-N_AGENTS         = 50                             # liczba agentów
-N_EPISODES       = 500                            # epizodów CT (każdy = EPISODE_STEPS kroków)
+DIVERSITY_SCORES = DEFAULT_DIVERSITY_SCORES       # wartości D do przetestowania
+N_AGENTS         = DEFAULT_N_AGENTS               # liczba agentów
+N_EPISODES       = DEFAULT_N_EPISODES             # epizodów CT (każdy = EPISODE_STEPS kroków)
 # N_ROUNDS usunięty — CT nie ma rund, epizod = T kroków
-N_SEEDS          = 10                             # powtórzeń (dla std)
-N_WORKERS        = min(cpu_count(), N_SEEDS * len([0.0, 0.3, 0.5, 0.7, 1.0]))
+N_SEEDS          = DEFAULT_N_SEEDS                # powtórzeń (dla std)
+N_WORKERS        = min(cpu_count(), N_SEEDS * len(DIVERSITY_SCORES))
                                                   # równoległe procesy (auto: liczba corów)
-LOG_EVERY        = 25                             # loguj co ile epizodów
-ROLLING_WINDOW   = 30                             # okno wygładzania krzywych
-ZI_EPISODES      = 30                             # epizodów do policzenia ZI baseline (populacja nie resetuje się co ep)
-EPISODE_STEPS    = 500                            # długość epizodu CT
+LOG_EVERY        = DEFAULT_LOG_EVERY              # loguj co ile epizodów
+ROLLING_WINDOW   = DEFAULT_ROLLING_WINDOW         # okno wygładzania krzywych
+ZI_EPISODES      = DEFAULT_ZI_EPISODES            # epizodów do policzenia ZI baseline (populacja nie resetuje się co ep)
+EPISODE_STEPS    = DEFAULT_EPISODE_STEPS          # długość epizodu CT
 
 # Warunek rynkowy: stable / random_eq / drifting
-MARKET = MarketDynamics.stable()
+MARKET = DEFAULT_MARKET
 
 # SARSA_ALGO_GAMMA usunięty — każdy agent używa własnej gamma z populacji
 
@@ -216,22 +232,6 @@ def _stamp_sample_rows(rows: List[dict], run_id: str) -> List[dict]:
     return stamped
 
 
-def _sampled_agent_types(da: DoubleAuction) -> dict[str, tuple[str, float]]:
-    trader_meta = []
-    for aid, agent in da.population.agents.items():
-        trader_type = agent.sigma_i / max(da.cfg.sentiment.sigma_chart, 1e-9)
-        trader_meta.append((aid, trader_type))
-    trader_meta.sort(key=lambda item: item[1])
-    fundamentalist_id, fundamentalist_type = trader_meta[0]
-    chartist_id, chartist_type = trader_meta[-1]
-    mixed_id, mixed_type = min(trader_meta, key=lambda item: abs(item[1] - 0.5))
-    return {
-        fundamentalist_id: ("fundamentalista", fundamentalist_type),
-        mixed_id: ("mieszany", mixed_type),
-        chartist_id: ("chartista", chartist_type),
-    }
-
-
 def evaluate_trained_sarsa_same_population(
     da: DoubleAuction,
     sarsa: DeepSARSAMultiAgent,
@@ -241,136 +241,55 @@ def evaluate_trained_sarsa_same_population(
     n_eval_episodes: int,
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
-) -> tuple[List[dict], List[dict], List[dict], List[dict]]:
-    agent_ids = list(da.population.agents.keys())
-    agent_gammas = [da.population.agents[aid].gamma for aid in agent_ids]
-    records: List[dict] = []
-    sample_rows: List[dict] = []
+) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
     agent_eval_rows: List[dict] = []
-    env_step_rows: List[dict] = []
+    feature_stats = init_decision_feature_stats()
+    alignment_counts = {aid: {"aligned": 0, "directional": 0, "total": 0} for aid in da.agent_ids}
 
-    for episode in range(n_eval_episodes):
-        da.reset_episode()
-        prev_positions = {aid: da.population.agents[aid].position for aid in agent_ids}
-        sample_this_episode = seed == 0 and abs(diversity_score - 1.0) < 1e-9 and episode == 0
+    def action_selector(aid: str, obs: np.ndarray) -> int:
+        return int(sarsa.agents[aid].act(obs, explore=False))
 
-        while not da.done:
-            obs_by_agent: Dict[str, np.ndarray] = {}
-            actions_taken: Dict[str, int] = {}
-            positions_before = dict(prev_positions)
-            eq_price_before = float(da.eq_price)
-            ref_price_before = float(da.ref_price)
-            public_gap = float(np.clip(
-                (eq_price_before - ref_price_before) / max(cfg.sentiment.signal_scale, 1e-9),
-                -1.0,
-                1.0,
-            ))
-            realized_before = {
-                aid: da.population.agents[aid].realized_pnl
-                for aid in agent_ids
-            }
-            for aid in agent_ids:
-                obs = da.get_observation(aid)
-                obs_by_agent[aid] = obs
-                actions_taken[aid] = sarsa.agents[aid].act(obs, explore=False)
+    def extra_builder(metrics: dict, _step_actions: List[np.ndarray]) -> dict:
+        return {
+            "zi_baseline_trade_accuracy": zi_baseline_trade_accuracy,
+            "zi_baseline_positive_pnl_frac": zi_baseline_positive_pnl_frac,
+            "zi_baseline": zi_baseline_trade_accuracy,
+            "beats_zi": metrics.get("trade_accuracy", 0.0) > zi_baseline_trade_accuracy,
+        }
 
-            da.execute_parallel_actions(actions_taken)
-            rewards, _ = da.compute_step_rewards()
+    def step_callback(
+        _episode: int,
+        _da_eval: DoubleAuction,
+        obs_by_agent: Dict[str, np.ndarray],
+        actions: Dict[str, int],
+        _rewards: Dict[str, float],
+        _positions_before: Dict[str, int],
+    ) -> None:
+        for aid, obs in obs_by_agent.items():
+            action = int(actions[aid])
+            update_decision_feature_stats(feature_stats, obs, action)
+            alignment_counts[aid]["total"] += 1
+            if action in (1, 2):
+                alignment_counts[aid]["directional"] += 1
+                signal = float(obs[0])
+                if (signal > 0 and action == 1) or (signal < 0 and action == 2):
+                    alignment_counts[aid]["aligned"] += 1
 
-            if sample_this_episode:
-                public_gap_after = float(np.clip(
-                    (da.eq_price - da.ref_price) / max(cfg.sentiment.signal_scale, 1e-9),
-                    -1.0,
-                    1.0,
-                ))
-                for aid in agent_ids:
-                    agent = da.population.agents[aid]
-                    obs = obs_by_agent[aid]
-                    executed = agent.position != positions_before[aid]
-                    trader_type = agent.sigma_i / max(cfg.sentiment.sigma_chart, 1e-9)
-                    if trader_type <= 0.33:
-                        agent_type = "fundamentalista"
-                    elif trader_type >= 0.67:
-                        agent_type = "chartista"
-                    else:
-                        agent_type = "mieszany"
-                    realized_pnl_this_step = float(agent.realized_pnl - realized_before[aid])
-                    sample_rows.append(build_agent_sample_row(
-                        algorithm="DeepSARSA_EVAL_SAME_POPULATION",
-                        phase="eval_same_population",
-                        diversity_score=diversity_score,
-                        seed=seed,
-                        episode=episode,
-                        step=da._step,
-                        agent_id=aid,
-                        trader_type=trader_type,
-                        agent_type=agent_type,
-                        action=actions_taken[aid],
-                        action_name=cfg.env.action_name(actions_taken[aid]),
-                        executed=executed,
-                        obs=obs,
-                        public_gap_before=public_gap,
-                        eq_price_before=eq_price_before,
-                        ref_price_before=ref_price_before,
-                        public_gap_after=public_gap_after,
-                        eq_price_after=da.eq_price,
-                        ref_price_after=da.ref_price,
-                        position_before=positions_before[aid],
-                        position=agent.position,
-                        entry_price_after=agent.entry_price,
-                        reward_this_step=float(rewards.get(aid, 0.0)),
-                        realized_pnl_this_step=realized_pnl_this_step,
-                        realized_pnl_cum=agent.realized_pnl,
-                        n_trades_closed=agent.n_trades_closed,
-                        sentiment=agent.sentiment,
-                        sigma_i=agent.sigma_i,
-                        threshold=agent.threshold,
-                    ))
-                    prev_positions[aid] = agent.position
-                mean_signal = float(np.mean([float(obs_by_agent[aid][0]) for aid in agent_ids]))
-                std_signal = float(np.std([float(obs_by_agent[aid][0]) for aid in agent_ids]))
-                mean_sigma = float(np.mean([float(da.population.agents[aid].sigma_i) for aid in agent_ids]))
-                mean_position_before = float(np.mean([positions_before[aid] for aid in agent_ids]))
-                mean_position_after = float(np.mean([da.population.agents[aid].position for aid in agent_ids]))
-                n_buy = sum(1 for aid in agent_ids if actions_taken[aid] == cfg.env.ACTION_BUY_MARKET)
-                n_sell = sum(1 for aid in agent_ids if actions_taken[aid] == cfg.env.ACTION_SELL_MARKET)
-                n_hold = sum(1 for aid in agent_ids if actions_taken[aid] == cfg.env.ACTION_HOLD)
-                realized_vals = [float(da.population.agents[aid].realized_pnl - realized_before[aid]) for aid in agent_ids]
-                reward_vals = [float(rewards.get(aid, 0.0)) for aid in agent_ids]
-                env_step_rows.append(build_env_step_row(
-                    algorithm="DeepSARSA_EVAL_SAME_POPULATION",
-                    phase="eval_same_population",
-                    diversity_score=diversity_score,
-                    seed=seed,
-                    episode=episode,
-                    step=da._step,
-                    eq_price_before=eq_price_before,
-                    ref_price_before=ref_price_before,
-                    public_gap_before=public_gap,
-                    eq_price_after=da.eq_price,
-                    ref_price_after=da.ref_price,
-                    public_gap_after=public_gap_after,
-                    price_delta_step=da.ref_price - ref_price_before,
-                    mean_signal=mean_signal,
-                    std_signal=std_signal,
-                    mean_sigma=mean_sigma,
-                    mean_position_before=mean_position_before,
-                    mean_position_after=mean_position_after,
-                    n_buy=n_buy,
-                    n_sell=n_sell,
-                    n_hold=n_hold,
-                    net_flow=n_buy - n_sell,
-                    mean_reward=float(np.mean(reward_vals)),
-                    mean_realized_pnl=float(np.mean(realized_vals)),
-                    mean_mtm=float(np.mean([r - x for r, x in zip(reward_vals, realized_vals)])),
-                    n_executed=sum(1 for aid in agent_ids if da.population.agents[aid].position != positions_before[aid]),
-                    n_trades_closed_cum=sum(da.population.agents[aid].n_trades_closed for aid in agent_ids),
-                ))
-
-        metrics = da.episode_metrics()
-        for aid, meta in da.agent_metrics().items():
+    def episode_end_callback(episode: int, da_eval: DoubleAuction) -> None:
+        action_counts = {aid: [0, 0, 0] for aid in da_eval.agent_ids}
+        for entry in da_eval._actions_log:
+            aid = entry.get("agent_id")
+            action = int(entry.get("action", 0))
+            if aid in action_counts and 0 <= action <= 2:
+                action_counts[aid][action] += 1
+        for aid, meta in da_eval.agent_metrics().items():
             sigma_i = float(meta.get("sigma_i", 0.0))
+            counts = action_counts.get(aid, [0, 0, 0])
+            total_actions = max(sum(counts), 1)
+            directional = max(alignment_counts[aid]["directional"], 1)
             agent_eval_rows.append({
+                "algorithm": "DeepSARSA_EVAL_SAME_POPULATION",
+                "phase": "eval_same_population",
                 "diversity_score": diversity_score,
                 "seed": seed,
                 "episode": episode,
@@ -380,24 +299,37 @@ def evaluate_trained_sarsa_same_population(
                 "realized_pnl": float(meta.get("realized_pnl", 0.0)),
                 "trade_accuracy_agent": float(meta.get("trade_accuracy", 0.0)),
                 "n_trades_closed": int(meta.get("n_trades_closed", 0)),
+                "n_trades_won": int(meta.get("n_trades_won", 0)),
+                "position_end": int(meta.get("position", 0)),
+                "buy_frac": counts[1] / total_actions,
+                "sell_frac": counts[2] / total_actions,
+                "hold_frac": counts[0] / total_actions,
+                "signal_alignment_rate": alignment_counts[aid]["aligned"] / directional,
+                "directional_action_rate": alignment_counts[aid]["directional"] / max(alignment_counts[aid]["total"], 1),
             })
-        records.append(build_episode_record(
-            episode=episode,
-            diversity_score=diversity_score,
-            seed=seed,
-            algorithm="DeepSARSA_EVAL_SAME_POPULATION",
-            cfg=cfg,
-            metrics=metrics,
-            extra={
-                "zi_baseline_trade_accuracy": zi_baseline_trade_accuracy,
-                "zi_baseline_positive_pnl_frac": zi_baseline_positive_pnl_frac,
-                "zi_baseline": zi_baseline_trade_accuracy,
-                "beats_zi": metrics.get("trade_accuracy", 0.0) > zi_baseline_trade_accuracy,
-            },
-            agent_gammas=agent_gammas,
-        ))
 
-    return records, sample_rows, agent_eval_rows, env_step_rows
+    records, sample_rows, env_step_rows = evaluate_same_population(
+        da=da,
+        cfg=cfg,
+        diversity_score=diversity_score,
+        seed=seed,
+        n_eval_episodes=n_eval_episodes,
+        algorithm_name="DeepSARSA_EVAL_SAME_POPULATION",
+        phase="eval_same_population",
+        action_selector=action_selector,
+        extra_builder=extra_builder,
+        collect_coordination=False,
+        episode_end_callback=episode_end_callback,
+        step_callback=step_callback,
+    )
+    feature_rows = [finalize_decision_feature_summary(
+        feature_stats,
+        algorithm="DeepSARSA_EVAL_SAME_POPULATION",
+        phase="eval_same_population",
+        diversity_score=diversity_score,
+        seed=seed,
+    )]
+    return records, sample_rows, aggregate_agent_eval_episode_rows(agent_eval_rows), feature_rows, env_step_rows
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +411,10 @@ def run_training(
             # Parallel execution: wszyscy obserwują ten sam P_t.
             obs_at_action: Dict[str, np.ndarray] = {}
             actions_taken: Dict[str, int]        = {}
+            obs_batch = da.get_observations(agent_ids)
 
-            for aid in agent_ids:
-                obs = da.get_observation(aid)
+            for i, aid in enumerate(agent_ids):
+                obs = obs_batch[i]
                 obs_at_action[aid] = obs
                 actions_taken[aid] = sarsa.agents[aid].act(obs, explore=True)
 
@@ -490,6 +423,10 @@ def run_training(
             # Nagrody na końcu kroku (po wszystkich agentach)
             rewards, dones = da.compute_step_rewards()
             episode_done = any(dones.values())
+            next_obs_batch = None if episode_done else da.get_observations(agent_ids)
+            next_obs_map = None if next_obs_batch is None else {
+                aid: next_obs_batch[i] for i, aid in enumerate(agent_ids)
+            }
 
             for aid in agent_ids:
                 r = rewards.get(aid, 0.0)
@@ -508,7 +445,7 @@ def run_training(
                         for k in range(n_step)
                     )
                     if not episode_done:
-                        next_obs = da.get_observation(aid)
+                        next_obs = next_obs_map[aid]
                         G += agent.gamma ** n_step * agent.expected_next_q(next_obs)
 
                     agent.update_with_target(obs_0, action_0, G)
@@ -557,7 +494,7 @@ def run_training(
             agent_diagnostics.extend(
                 _agent_diagnostic_rows(da, episode + 1, diversity_score, seed)
             )
-            short_eval_records, _, _, _ = evaluate_trained_sarsa(
+            short_eval_records, _, _, _, _ = evaluate_trained_sarsa(
                 da=da,
                 sarsa=sarsa,
                 diversity_score=diversity_score,
@@ -608,7 +545,7 @@ def evaluate_trained_sarsa(
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
     same_population: bool = True,
-) -> tuple[List[dict], List[dict], List[dict], List[dict]]:
+) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
     """
     Ewaluacja wytrenowanej polityki z końcowym epsilonem i bez update'ów sieci.
     Używa tego samego równoległego protokołu kroku co trening, ale na
@@ -636,7 +573,7 @@ def evaluate_trained_sarsa(
         zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
     )
-    return records, sample_rows, [], env_step_rows
+    return records, sample_rows, [], [], env_step_rows
 
 
 # ---------------------------------------------------------------------------
@@ -863,9 +800,9 @@ def plot_agent_eval_distribution(
         .agg({
             "sigma_i": "first",
             "trader_type": "first",
-            "trade_accuracy_agent": "mean",
-            "realized_pnl": "mean",
-            "n_trades_closed": "mean",
+            "mean_trade_accuracy_agent": "mean",
+            "mean_realized_pnl": "mean",
+            "mean_n_trades_closed": "mean",
         })
     )
 
@@ -884,12 +821,12 @@ def plot_agent_eval_distribution(
         if sub.empty:
             continue
         ax.scatter(
-            sub["sigma_i"], sub["trade_accuracy_agent"],
+            sub["sigma_i"], sub["mean_trade_accuracy_agent"],
             s=24, alpha=0.7, color=colors[d], label=f"D={d:.1f}",
         )
-    ax.set_title("sigma_i vs trade_accuracy_agent")
+    ax.set_title("sigma_i vs mean_trade_accuracy_agent")
     ax.set_xlabel("sigma_i")
-    ax.set_ylabel("trade_accuracy_agent")
+    ax.set_ylabel("mean_trade_accuracy_agent")
     ax.set_ylim(0.0, 1.0)
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
@@ -900,17 +837,17 @@ def plot_agent_eval_distribution(
         if sub.empty:
             continue
         ax.scatter(
-            sub["sigma_i"], sub["realized_pnl"],
+            sub["sigma_i"], sub["mean_realized_pnl"],
             s=24, alpha=0.7, color=colors[d], label=f"D={d:.1f}",
         )
-    ax.set_title("sigma_i vs realized_pnl")
+    ax.set_title("sigma_i vs mean_realized_pnl")
     ax.set_xlabel("sigma_i")
-    ax.set_ylabel("mean realized_pnl")
+    ax.set_ylabel("mean_realized_pnl")
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
     acc_data = [
-        grouped.loc[grouped["diversity_score"] == d, "trade_accuracy_agent"].values
+        grouped.loc[grouped["diversity_score"] == d, "mean_trade_accuracy_agent"].values
         for d in diversity_scores
         if not grouped.loc[grouped["diversity_score"] == d].empty
     ]
@@ -921,14 +858,14 @@ def plot_agent_eval_distribution(
             d = float(label.split("=")[1])
             patch.set_facecolor(colors[d])
             patch.set_alpha(0.55)
-    ax.set_title("Rozkład trade_accuracy_agent")
-    ax.set_ylabel("trade_accuracy_agent")
+    ax.set_title("Rozkład mean_trade_accuracy_agent")
+    ax.set_ylabel("mean_trade_accuracy_agent")
     ax.set_ylim(0.0, 1.0)
     ax.grid(True, axis="y", alpha=0.3)
 
     ax = axes[1, 1]
     pnl_data = [
-        grouped.loc[grouped["diversity_score"] == d, "realized_pnl"].values
+        grouped.loc[grouped["diversity_score"] == d, "mean_realized_pnl"].values
         for d in diversity_scores
         if not grouped.loc[grouped["diversity_score"] == d].empty
     ]
@@ -939,8 +876,8 @@ def plot_agent_eval_distribution(
             d = float(label.split("=")[1])
             patch.set_facecolor(colors[d])
             patch.set_alpha(0.55)
-    ax.set_title("Rozkład realized_pnl per agent")
-    ax.set_ylabel("mean realized_pnl")
+    ax.set_title("Rozkład mean_realized_pnl per agent")
+    ax.set_ylabel("mean_realized_pnl")
     ax.grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()
@@ -980,7 +917,7 @@ def _train_worker(args: tuple) -> list:
         sarsa_cfg       = sarsa_cfg,
         log_every       = log_every,
     )
-    eval_same_population_records, sample_rows, agent_eval_rows, env_step_rows = evaluate_trained_sarsa(
+    eval_same_population_records, sample_rows, agent_eval_rows, decision_feature_rows, env_step_rows = evaluate_trained_sarsa(
         da=da,
         sarsa=sarsa,
         diversity_score=diversity_score,
@@ -993,7 +930,7 @@ def _train_worker(args: tuple) -> list:
     )
     eval_new_population_records: List[dict] = []
     if eval_new_population:
-        eval_new_population_records, _, _, _ = evaluate_trained_sarsa(
+        eval_new_population_records, _, _, _, _ = evaluate_trained_sarsa(
             da=da,
             sarsa=sarsa,
             diversity_score=diversity_score,
@@ -1004,7 +941,7 @@ def _train_worker(args: tuple) -> list:
             zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
             same_population=False,
         )
-    return train_records, eval_same_population_records, eval_new_population_records, sample_rows, agent_eval_rows, env_step_rows
+    return train_records, eval_same_population_records, eval_new_population_records, sample_rows, agent_eval_rows, decision_feature_rows, env_step_rows
 
 
 def parse_args() -> argparse.Namespace:
@@ -1033,44 +970,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_run_settings(args: argparse.Namespace) -> dict:
-    if args.quick:
-        settings = {
-            "run_name": "quick",
-            "diversity_scores": [0.0, 0.5, 1.0],
-            "n_agents": 50,
-            "n_episodes": 40,
-            "episode_steps": 800,
-            "n_seeds": 1,
-            "zi_episodes": 10,
-            "eval_episodes": 50,
-            "log_every": 10,
-            "rolling_window": 5,
-            "n_workers": 4,
-            "sarsa_cfg": DeepSARSAConfig(
-                hidden_size   = 32,
-                lr            = 1e-3,
-                epsilon_start = 0.30,
-                epsilon_end   = 0.1,
-                epsilon_decay = 0.97,
-                grad_clip     = 1.0,
-                n_step        = 1,
-            ),
-        }
-    else:
-        settings = {
-            "run_name": "full",
-            "diversity_scores": DIVERSITY_SCORES,
-            "n_agents": N_AGENTS,
-            "n_episodes": N_EPISODES,
-            "episode_steps": EPISODE_STEPS,
-            "n_seeds": N_SEEDS,
-            "zi_episodes": ZI_EPISODES,
-            "eval_episodes": 30,
-            "log_every": LOG_EVERY,
-            "rolling_window": ROLLING_WINDOW,
-            "n_workers": N_WORKERS,
-            "sarsa_cfg": SARSA_CFG,
-        }
+    settings = build_sarsa_settings(args.quick, default_workers=N_WORKERS)
+    if not args.quick:
+        settings["sarsa_cfg"] = SARSA_CFG
 
     if args.episodes is not None:
         settings["n_episodes"] = args.episodes
@@ -1104,247 +1006,27 @@ def build_run_settings(args: argparse.Namespace) -> dict:
 def main():
     args = parse_args()
     settings = build_run_settings(args)
-    run_id, run_dir = prepare_run_dir(args.run_tag, args.run_id, args.run_dir)
-    episodes_csv = run_dir / "episodes.csv"
-    agents_sample_csv = run_dir / "agents_sample.csv"
-    env_steps_csv = run_dir / "env_steps.csv"
-    run_config_path = run_dir / "run_config.json"
-    diversity_scores = settings["diversity_scores"]
-    n_agents = settings["n_agents"]
-    n_episodes = settings["n_episodes"]
-    episode_steps = settings["episode_steps"]
-    n_seeds = settings["n_seeds"]
-    zi_episodes = settings["zi_episodes"]
-    n_eval_episodes = settings["eval_episodes"]
-    n_workers = settings["n_workers"]
-    sarsa_cfg = settings["sarsa_cfg"]
-    run_name = settings["run_name"]
-    output_stem = "deep_sarsa" if run_name == "full" else f"deep_sarsa_{run_name}"
-
-    log.info("=" * 65)
-    log.info("HTM Benchmark — Deep SARSA (model spekulacyjny)")
-    log.info(f"Tryb: {run_name}")
-    log.info(f"N={n_agents} | D={diversity_scores} | ep={n_episodes} | steps/ep={episode_steps} | seeds={n_seeds}")
-    log.info(f"Łączne kroki per agent per D: {n_episodes}×{episode_steps}={n_episodes*episode_steps}")
-    log.info(
-        f"SARSA epsilon: start={sarsa_cfg.epsilon_start:.3f} | "
-        f"end={sarsa_cfg.epsilon_end:.3f} | decay={sarsa_cfg.epsilon_decay:.3f}"
-    )
-    log.info(f"Market: eq±{MARKET.eq_spread} drift={MARKET.drift_enabled}")
-    log.info("=" * 65)
-
-    # Upewnij się że katalogi istnieją
-    for d in ["logs", "plots", "results", "experiments"]:
-        (PROJECT_ROOT / d).mkdir(exist_ok=True)
-
+    artifacts = init_run_artifacts(args.run_tag, args.run_id, args.run_dir)
     cfg = HTMConfig(
-        env    = EnvConfig(n_agents=n_agents, episode_steps=episode_steps),
+        env    = EnvConfig(n_agents=settings["n_agents"], episode_steps=settings["episode_steps"]),
         market = MARKET,
         log    = LogConfig(level="WARNING"),
-        sarsa  = sarsa_cfg,
+        sarsa  = settings["sarsa_cfg"],
     )
-    if not run_config_path.exists():
-        write_run_config(run_config_path, {
-            "run_id": run_id,
-            "run_tag": args.run_tag,
-            "timestamp": run_id.split("_", 1)[1] if run_id.startswith("run_") else run_id,
-            "algorithm": "DeepSARSA",
-            "diversity_scores": diversity_scores,
-            "n_seeds": n_seeds,
-            "n_episodes": n_episodes,
-            "n_agents": n_agents,
-            "market_condition": {
-                "eq_center": cfg.market.eq_center,
-                "eq_spread": cfg.market.eq_spread,
-                "drift_enabled": cfg.market.drift_enabled,
-            },
-            "eval_new_population": args.eval_new_population,
-        })
-
-    log.info(cfg.summary())
-    log.info(f"episode_steps={cfg.env.episode_steps} | n_actions={cfg.env.n_actions}")
-
-    # 1. ZI baseline — raz przed treningiem, wspólny dla wszystkich D
-    log.info("\n--- Liczę wspólny ZI baseline ---")
-    baseline_d = float(diversity_scores[0]) if diversity_scores else 0.0
-    zi_records, _, _ = evaluate_zi(cfg, diversity_score=baseline_d, n_episodes=zi_episodes, seed=42)
-    append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(zi_records, run_id, "zi_baseline"))
-    shared_zi_acc = float(np.mean([r["trade_accuracy"] for r in zi_records])) if zi_records else 0.0
-    shared_zi_positive = float(np.mean([r["positive_pnl_frac"] for r in zi_records])) if zi_records else 0.0
-    zi_pnl = float(np.mean([r["mean_pnl"] for r in zi_records])) if zi_records else 0.0
-    zi_term = float(np.mean([r["mean_terminal_pnl"] for r in zi_records])) if zi_records else 0.0
-    zi_baselines = {d: shared_zi_acc for d in diversity_scores}
-    zi_positive_baselines = {d: shared_zi_positive for d in diversity_scores}
-    log.info(
-        f"  ZI | D_ref={baseline_d:.1f} | eff={shared_zi_positive:.3f} | "
-        f"acc={shared_zi_acc:.3f} | pnl={zi_pnl:.4f} | term={zi_term:.4f}"
+    run_sarsa_experiment(
+        log=log,
+        project_root=PROJECT_ROOT,
+        args=args,
+        settings=settings,
+        cfg=cfg,
+        artifacts=artifacts,
+        worker_fn=_train_worker,
+        stamp_episode_rows=_stamp_episode_rows,
+        stamp_sample_rows=_stamp_sample_rows,
+        plot_learning_curves=plot_learning_curves,
+        plot_final_comparison=plot_final_comparison,
+        plot_agent_eval_distribution=plot_agent_eval_distribution,
     )
-
-    # 2. Trening — równoległy (multiprocessing.Pool)
-    log.info(f"\n--- Start treningu ({n_workers} równoległych procesów) ---")
-    t_total = time.time()
-
-    # Stwórz listę zadań: (D, seed) dla wszystkich kombinacji
-    tasks = [
-        (
-            d, seed, cfg, zi_baselines[d], zi_positive_baselines[d],
-            n_episodes, n_eval_episodes, sarsa_cfg, settings["log_every"], args.eval_new_population,
-        )
-        for d in diversity_scores
-        for seed in range(n_seeds)
-    ]
-    n_tasks = len(tasks)
-    log.info(f"Łącznie zadań: {n_tasks} ({len(diversity_scores)} D × {n_seeds} seeds)")
-
-    # Pool: każde zadanie to osobny proces, brak konfliktów między sieciami
-    # imap_unordered: zapisuje wyniki na bieżąco — nie traci danych gdy worker pada
-    all_records = []
-    all_eval_same_population_records = []
-    all_eval_new_population_records = []
-    all_agent_eval_rows = []
-    all_env_step_rows = []
-    if n_workers == 1:
-        iterator = map(_train_worker, tasks)
-        pool = None
-    else:
-        pool = Pool(processes=n_workers)
-        iterator = pool.imap_unordered(_train_worker, tasks)
-
-    try:
-        for i, worker_result in enumerate(iterator):
-            task_records, eval_same_population_records, eval_new_population_records, sample_rows, agent_eval_rows, env_step_rows = worker_result
-            all_records.extend(task_records)
-            all_eval_same_population_records.extend(eval_same_population_records)
-            all_eval_new_population_records.extend(eval_new_population_records)
-            all_agent_eval_rows.extend(agent_eval_rows)
-            all_env_step_rows.extend(env_step_rows)
-            append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(task_records, run_id, "train"))
-            append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(eval_same_population_records, run_id, "eval_same_population"))
-            append_rows(episodes_csv, EPISODE_FIELDS, _stamp_episode_rows(eval_new_population_records, run_id, "eval_new_population"))
-            append_rows(agents_sample_csv, AGENT_SAMPLE_FIELDS, _stamp_sample_rows(sample_rows, run_id))
-            append_rows(env_steps_csv, ENV_STEP_FIELDS, _stamp_sample_rows(env_step_rows, run_id))
-            d_done = task_records[0]["diversity_score"] if task_records else "?"
-            s_done = task_records[0]["seed"]            if task_records else "?"
-            log.info(f"  Zakończono: D={d_done} seed={s_done} "
-                     f"({i+1}/{n_tasks}) | train: {len(all_records)} | eval_same: {len(all_eval_same_population_records)}")
-    finally:
-        if pool is not None:
-            pool.close()
-            pool.join()
-
-    log.info(f"Trening zakończony — {len(all_records)} rekordów")
-
-    # 3. Zapisz CSV
-    df       = pd.DataFrame(all_records)
-    eval_df = pd.DataFrame(all_eval_same_population_records)
-    eval_new_df = pd.DataFrame(all_eval_new_population_records)
-    total_rows = len(all_records) + len(all_eval_same_population_records) + len(all_eval_new_population_records) + len(zi_records)
-    log.info(f"\nWyniki: {episodes_csv} ({total_rows} wierszy łącznie z fazami)")
-
-    # 4. Wykresy
-    plot_learning_curves(
-        all_records, zi_baselines,
-        PROJECT_ROOT / "plots" / f"{output_stem}_learning_curves.png",
-        diversity_scores=diversity_scores,
-        rolling_window=settings["rolling_window"],
-        n_agents=n_agents,
-    )
-    plot_final_comparison(
-        all_records, zi_baselines,
-        PROJECT_ROOT / "plots" / f"{output_stem}_final_comparison.png",
-        diversity_scores=diversity_scores,
-        n_episodes=n_episodes,
-    )
-    plot_agent_eval_distribution(
-        all_agent_eval_rows,
-        PROJECT_ROOT / "plots" / f"{output_stem}_agent_eval_distribution.png",
-        diversity_scores=diversity_scores,
-    )
-
-    # 5. Podsumowanie w konsoli
-    final_window = min(50, max(1, n_episodes // 3))
-    log.info("\n" + "=" * 82)
-    log.info(f"PODSUMOWANIE — ostatnie {final_window} epizodów, uśrednione po seedach")
-    log.info(
-        f"{'D':>5} | {'acc':>7} | {'ZI acc':>7} | {'pnl_tot':>9} | "
-        f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
-    )
-    log.info("-" * 82)
-
-    final = df[df["episode"] >= n_episodes - final_window]
-    for d in diversity_scores:
-        sub   = final[final["diversity_score"] == d]
-        if sub.empty:
-            continue
-        s_pnl    = sub["mean_total_pnl"].mean()
-        term_pnl = sub["mean_terminal_pnl"].mean()
-        tacc     = sub["trade_accuracy"].mean()
-        zi       = zi_baselines.get(d, 0.0)
-        trades   = sub["n_trades"].mean()
-        closed   = sub["n_trades_closed"].mean()
-        sign     = "↑" if tacc > zi else "↓"
-        log.info(
-            f"{d:>5.1f} | {tacc:>7.3f}{sign} | {zi:>7.3f} | "
-            f"{s_pnl:>9.4f} | {term_pnl:>8.4f} | {trades:>7.1f} | {closed:>7.1f}"
-        )
-
-    if not eval_df.empty:
-        log.info("")
-        log.info("EWALUACJA SARSA — ta sama populacja treningowa, reset_episode(), explore=False")
-        log.info(
-            f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
-            f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
-        )
-        log.info("-" * 76)
-        for d in diversity_scores:
-            sub = eval_df[eval_df["diversity_score"] == d]
-            if sub.empty:
-                continue
-            eval_acc = sub["trade_accuracy"].mean()
-            eval_pnl = sub["mean_total_pnl"].mean()
-            eval_term = sub["mean_terminal_pnl"].mean()
-            eval_trades = sub["n_trades"].mean()
-            eval_closed = sub["n_trades_closed"].mean()
-            zi = zi_baselines.get(d, 0.0)
-            sign = "↑" if eval_acc > zi else "↓"
-            log.info(
-                f"{d:>5.1f} | {eval_acc:>7.3f}{sign} | {zi:>7.3f} | "
-                f"{eval_pnl:>9.4f} | {eval_term:>8.4f} | "
-                f"{eval_trades:>7.1f} | {eval_closed:>7.1f}"
-            )
-
-    if not eval_new_df.empty:
-        log.info("")
-        log.info("EWALUACJA SARSA — nowa populacja, seed+1000, explore=False")
-        log.info(
-            f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
-            f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
-        )
-        log.info("-" * 76)
-        for d in diversity_scores:
-            sub = eval_new_df[eval_new_df["diversity_score"] == d]
-            if sub.empty:
-                continue
-            eval_acc = sub["trade_accuracy"].mean()
-            eval_pnl = sub["mean_total_pnl"].mean()
-            eval_term = sub["mean_terminal_pnl"].mean()
-            eval_trades = sub["n_trades"].mean()
-            eval_closed = sub["n_trades_closed"].mean()
-            zi = zi_baselines.get(d, 0.0)
-            sign = "↑" if eval_acc > zi else "↓"
-            log.info(
-                f"{d:>5.1f} | {eval_acc:>7.3f}{sign} | {zi:>7.3f} | "
-                f"{eval_pnl:>9.4f} | {eval_term:>8.4f} | "
-                f"{eval_trades:>7.1f} | {eval_closed:>7.1f}"
-            )
-
-    log.info(f"\nCałkowity czas: {time.time()-t_total:.0f}s")
-    log.info(f"Wykresy: plots/{output_stem}_learning_curves.png")
-    log.info(f"         plots/{output_stem}_final_comparison.png")
-    log.info(f"         plots/{output_stem}_agent_eval_distribution.png")
-    log.info(f"Dane:    {episodes_csv.relative_to(PROJECT_ROOT)}")
-    log.info(f"Próbka:  {agents_sample_csv.relative_to(PROJECT_ROOT)}")
-    log.info(f"Środow.: {env_steps_csv.relative_to(PROJECT_ROOT)}")
 
 
 if __name__ == "__main__":
