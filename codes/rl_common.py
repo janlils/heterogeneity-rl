@@ -17,10 +17,8 @@ DECISION_FEATURE_NAMES = [
     "pos_norm",
     "unrealized_pnl",
     "time_remaining",
-    "gamma_obs",
     "price_vs_start",
     "trend_short",
-    "sigma_norm",
 ]
 
 
@@ -167,10 +165,8 @@ def build_agent_sample_row(
         "pos_norm": float(obs[1]),
         "unrealized_pnl": float(obs[2]),
         "time_remaining": float(obs[3]),
-        "gamma_obs": float(obs[4]),
-        "price_vs_start": float(obs[5]),
-        "trend_short": float(obs[6]),
-        "sigma_norm": float(obs[7]),
+        "price_vs_start": float(obs[4]),
+        "trend_short": float(obs[5]),
         "public_gap_before": float(public_gap_before),
         "eq_price_before": float(eq_price_before),
         "ref_price_before": float(ref_price_before),

@@ -757,16 +757,14 @@ f"N={self.cfg.env.n_agents}"
 
     def get_observation(self, agent_id: str) -> np.ndarray:
         """
-        8D wektor obserwacji — prywatny sygnał fundamentalny + stan portfela.
+        6D wektor obserwacji — prywatny sygnał fundamentalny + stan portfela.
 
           [0] signal_i        prywatny sygnał (V_t - P_t + noise) / scale
           [1] position_norm   position / max_position ∈ [-1, +1]
           [2] unrealized_pnl  znormalizowany niezrealizowany P&L ∈ [-2, +2]
           [3] time_remaining  (T - step) / T ∈ [0, 1]
-          [4] gamma           discount factor ∈ [0.80, 0.99]
-          [5] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
-          [6] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
-          [7] sigma_norm      sigma_i / sigma_chart ∈ [0, 1]
+          [4] price_vs_start  (P_t - P_episode_start) / 0.1, clip [-3, +3]
+          [5] trend_short     tanh(ΔP_8steps / σ_P) ∈ (-1, +1)
 
         public_gap jest liczony lokalnie, ale celowo pominięty z obserwacji:
         to niezaszumiony sygnał identyczny dla wszystkich agentów, który
@@ -806,17 +804,14 @@ f"N={self.cfg.env.n_agents}"
         if signal_i is None:
             self._refresh_signal_cache()
             signal_i = self._signal_cache[agent_id]
-        sigma_norm = float(np.clip(float(self._sigma_i_arr[idx]) / sc.sigma_chart, 0.0, 1.0))
 
         return np.array([
             signal_i,                                           # [0]
             pos_norm,                                           # [1]
             unrealized,                                         # [2]
             time_rem,                                           # [3]
-            float(self._gamma_i_arr[idx]),                      # [4]
-            price_vs_start,                                     # [5]
-            trend_short,                                        # [6]
-            sigma_norm,                                         # [7]
+            price_vs_start,                                     # [4]
+            trend_short,                                        # [5]
         ], dtype=np.float32)
 
     def get_agent_ids(self) -> List[str]:
@@ -865,22 +860,13 @@ f"N={self.cfg.env.n_agents}"
         if len(self._signal_cache) != len(self.agent_ids):
             self._refresh_signal_cache()
         signal_i = np.array([self._signal_cache[aid] for aid in ids], dtype=np.float32)
-        sigma_norm = np.clip(
-            self._sigma_i_arr[idxs].astype(np.float32, copy=False) / max(sc.sigma_chart, 1e-6),
-            0.0,
-            1.0,
-        )
-        gamma = self._gamma_i_arr[idxs].astype(np.float32, copy=False)
-
         return np.column_stack([
             signal_i,
             pos_norm,
             unrealized,
             time_rem,
-            gamma,
             price_vs_start,
             trend_short,
-            sigma_norm,
         ]).astype(np.float32, copy=False)
 
     def get_all_observations(self) -> np.ndarray:

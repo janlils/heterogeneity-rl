@@ -339,10 +339,8 @@ def write_article_summary(csv_path: Optional[str] = None) -> None:
             rows[-1]["corr_pos_norm_action_dir_mean"] = float(fsub["corr_pos_norm_action_dir"].mean()) if not fsub.empty else 0.0
             rows[-1]["corr_unrealized_pnl_action_dir_mean"] = float(fsub["corr_unrealized_pnl_action_dir"].mean()) if not fsub.empty else 0.0
             rows[-1]["corr_time_remaining_action_dir_mean"] = float(fsub["corr_time_remaining_action_dir"].mean()) if not fsub.empty else 0.0
-            rows[-1]["corr_gamma_obs_action_dir_mean"] = float(fsub["corr_gamma_obs_action_dir"].mean()) if not fsub.empty else 0.0
             rows[-1]["corr_price_vs_start_action_dir_mean"] = float(fsub["corr_price_vs_start_action_dir"].mean()) if not fsub.empty else 0.0
             rows[-1]["corr_trend_short_action_dir_mean"] = float(fsub["corr_trend_short_action_dir"].mean()) if not fsub.empty else 0.0
-            rows[-1]["corr_sigma_norm_action_dir_mean"] = float(fsub["corr_sigma_norm_action_dir"].mean()) if not fsub.empty else 0.0
 
     out = pd.DataFrame(rows).sort_values(["algorithm", "diversity_score"]).reset_index(drop=True)
     out_path = ep_path.parent / "article_summary.csv"
@@ -1866,20 +1864,16 @@ def plot_decision_feature_predictiveness(csv_path: Optional[str] = None,
         "corr_pos_norm_action_dir",
         "corr_unrealized_pnl_action_dir",
         "corr_time_remaining_action_dir",
-        "corr_gamma_obs_action_dir",
         "corr_price_vs_start_action_dir",
         "corr_trend_short_action_dir",
-        "corr_sigma_norm_action_dir",
     ]
     labels = [
         "signal",
         "position",
         "unrealized",
         "time",
-        "gamma",
         "price_vs_start",
         "trend",
-        "sigma_norm",
     ]
     present = [c for c in cols if c in df.columns]
     if not present:

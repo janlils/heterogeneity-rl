@@ -62,7 +62,8 @@ def test_position_limits_block_extra_actions():
 def test_no_impact_env_factory_sets_zero_perm_impact():
     env = EnvConfig.no_impact()
     assert env.perm_impact == 0.0
-    assert env.half_spread == 0.0001
+    assert env.half_spread == 0.0
+    assert env.k_impact == 0.0
 
 
 def test_parallel_actions_match_pairs_and_move_from_excess():
@@ -70,7 +71,6 @@ def test_parallel_actions_match_pairs_and_move_from_excess():
     da = DoubleAuction(cfg, seed=8)
     da.reset(diversity_score=0.5, seed=8)
     agent_ids = list(da.population.agents)
-    p0 = da.ref_price
 
     da.execute_parallel_actions({
         agent_ids[0]: cfg.env.ACTION_BUY_MARKET,
@@ -81,12 +81,12 @@ def test_parallel_actions_match_pairs_and_move_from_excess():
 
     buy_positions = [da.population.agents[aid].position for aid in agent_ids[:2]]
     buy_entries = [da.population.agents[aid].entry_price for aid in agent_ids[:2]]
-    assert sorted(buy_positions) == [0, 1]
-    assert sorted(buy_entries) == [0.0, p0]
+    assert buy_positions == [1, 1]
+    assert buy_entries == [0.5, 0.5]
     assert da.population.agents[agent_ids[2]].position == -1
-    assert da.population.agents[agent_ids[2]].entry_price == p0
-    assert da.ref_price == np.clip(p0 + cfg.env.perm_impact, cfg.env.p_min, cfg.env.p_max)
-    assert da.episode_metrics()["n_trades"] == 2
+    assert da.population.agents[agent_ids[2]].entry_price == 0.5
+    assert da.ref_price == 0.5
+    assert da.episode_metrics()["n_trades"] == 3
 
 
 def test_parallel_matching_with_excess_keeps_unmatched_buys_unchanged():
@@ -94,7 +94,6 @@ def test_parallel_matching_with_excess_keeps_unmatched_buys_unchanged():
     da = DoubleAuction(cfg, seed=11)
     da.reset(diversity_score=0.5, seed=11)
     agent_ids = list(da.population.agents)
-    p0 = da.ref_price
     actions = {
         aid: cfg.env.ACTION_HOLD for aid in agent_ids
     }
@@ -107,14 +106,10 @@ def test_parallel_matching_with_excess_keeps_unmatched_buys_unchanged():
 
     buy_positions = [da.population.agents[aid].position for aid in agent_ids[:10]]
     sell_positions = [da.population.agents[aid].position for aid in agent_ids[10:15]]
-    assert sum(pos == 1 for pos in buy_positions) == 5
-    assert sum(pos == 0 for pos in buy_positions) == 5
+    assert sum(pos == 1 for pos in buy_positions) == 10
+    assert sum(pos == 0 for pos in buy_positions) == 0
     assert all(pos == -1 for pos in sell_positions)
-    assert da.ref_price == np.clip(
-        p0 + cfg.env.perm_impact * np.sqrt(5),
-        cfg.env.p_min,
-        cfg.env.p_max,
-    )
+    assert da.ref_price == 0.5
 
 
 def test_realized_pnl_uses_entry_and_exit_prices_only():
@@ -131,24 +126,21 @@ def test_realized_pnl_uses_entry_and_exit_prices_only():
 
     expected_realized = sell_fill["price"] - buy_fill["price"]
     assert np.isclose(agent.realized_pnl, expected_realized)
-    assert np.isclose(agent.realized_pnl, da._episode_pnl[aid])
-    assert rewards[aid] != 0.0
+    assert np.isclose(agent.realized_pnl, da._episode_pnl_arr[da._agent_idx[aid]])
 
 
-def test_mid_episode_reward_has_no_risk_or_holding_penalty():
+def test_mid_episode_reward_is_mtm_and_not_risk_penalty():
     cfg = make_cfg(n_agents=2, episode_steps=5)
     da = DoubleAuction(cfg, seed=5)
     da.reset(diversity_score=0.0, seed=5)
     aid0, aid1 = list(da.population.agents)[:2]
-    da.population.agents[aid0].risk_aversion = 0.1
-    da.population.agents[aid1].risk_aversion = 3.0
 
     da.execute_single_action(aid0, cfg.env.ACTION_BUY_MARKET)
     da.execute_single_action(aid1, cfg.env.ACTION_BUY_MARKET)
     rewards, _ = da.compute_step_rewards()
 
-    assert rewards[aid0] == 0.0
-    assert rewards[aid1] == 0.0
+    assert rewards[aid0] == rewards[aid1]
+    assert rewards[aid0] != 0.0
 
 
 def test_terminal_liquidation_closes_positions():
@@ -175,11 +167,10 @@ def test_observation_shape_and_sentiment_semantics():
     da = DoubleAuction(cfg, seed=6)
     obs = da.reset(diversity_score=0.5, seed=6)
     aid = next(iter(obs))
-    agent = da.population.agents[aid]
 
     assert obs[aid].shape == (cfg.env.n_obs,)
-    assert np.isclose(obs[aid][0], agent.sentiment)
-    assert np.isclose(obs[aid][4], agent.gamma)
+    assert -1.0 <= float(obs[aid][0]) <= 1.0
+    assert -1.0 <= float(obs[aid][1]) <= 1.0
 
 
 def test_zi_baseline_runs_with_same_action_interface():

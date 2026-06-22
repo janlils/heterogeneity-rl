@@ -64,8 +64,8 @@ class EnvConfig:
 
     @property
     def n_obs(self) -> int:
-        return 8   # [signal_i, pos_norm, unrealized, time_rem,
-                   #  gamma, price_vs_start, trend_short, sigma_norm]
+        return 6   # [signal_i, pos_norm, unrealized, time_rem,
+                   #  price_vs_start, trend_short]
 
     @classmethod
     def no_impact(cls) -> "EnvConfig":
@@ -110,13 +110,13 @@ class MarketDynamics:
     stress_low:             float = 0.004
     crisis_prob:            float = 0.012
     crisis_stress_min:      float = 0.020
-    crisis_stress_max:      float = 0.040
+    crisis_stress_max:      float = 0.035
 
     psi:                    float = 0.55
-    kappa:                  float = 0.12
+    kappa:                  float = 0.16
     nu:                     float = 5.0
     kick_min:               float = 0.03
-    kick_max:               float = 0.07
+    kick_max:               float = 0.055
 
     @classmethod
     def stable(cls)    -> "MarketDynamics":

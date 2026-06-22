@@ -116,7 +116,7 @@ def test_common_evaluator_schema_for_zi_sarsa_ppo():
         "effective_N",
         "gamma_std",
     }
-    schemas = [set(r[0]) for r in (zi_records, sarsa_records, ppo_records, ppo_no_impact_records)]
+    schemas = [set(records[0].keys()) for records, _, _ in (zi_records, sarsa_records, ppo_records, ppo_no_impact_records)]
     assert all(required.issubset(schema) for schema in schemas)
-    assert all(r[0]["primary_metric"] == "trade_accuracy" for r in (zi_records, sarsa_records, ppo_records, ppo_no_impact_records))
-    assert ppo_no_impact_records[0]["algorithm"] == "PPO_EVAL_NO_IMPACT"
+    assert all(records[0]["primary_metric"] == "trade_accuracy" for records, _, _ in (zi_records, sarsa_records, ppo_records, ppo_no_impact_records))
+    assert ppo_no_impact_records[0][0]["algorithm"] == "PPO_EVAL_NO_IMPACT"
