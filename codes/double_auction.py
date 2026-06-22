@@ -12,7 +12,7 @@ Kluczowa zmiana względem modelu G&S:
     - PnL wynika wyłącznie z cen wejścia i wyjścia.
 
 Klasy:
-  AgentParams      — profil agenta (sigma_i, gamma, threshold)
+  AgentParams      — profil agenta (sigma_i, gamma)
   AgentPopulation  — generuje N agentów z różnym poziomem szumu sygnału
   DoubleAuction    — główne środowisko CT z równoległą egzekucją market maker
   ZeroIntelligence — baseline (losowa agresywność, losowa decyzja buy/sell/pass)
@@ -45,18 +45,11 @@ _log = logging.getLogger("htm.auction")
 @dataclass
 class AgentParams:
     """
-    Profil agenta w modelu sentiment.
-
-    Główna zmiana vs poprzedniej wersji:
-      - prywatny sygnał jest liczony per krok z (V_t - P_t + noise)
-      - heterogeniczność pochodzi z sigma_i
+    Profil agenta w modelu prywatnego sygnału.
     """
     agent_id:           str
-    sentiment:          float = 0.0
     sigma_i:            float = 0.08   # poziom szumu prywatnego sygnału
-    threshold:          float = 0.0
     gamma:              float = 0.90   # discount factor (indywidualny, wchodzi do TD)
-    risk_aversion:      float = 1.00   # λ: kara za otwartą pozycję w reward
     max_position:       int   = 5      # maks |position|
 
     # Stan portfela (reset per epizod)
@@ -76,9 +69,7 @@ class AgentParams:
 
     def __repr__(self) -> str:
         return (
-            f"Agent({self.agent_id}, sent={self.sentiment:.3f}, "
-            f"thr={self.threshold:.3f}, γ={self.gamma:.2f}, "
-            f"sigma={self.sigma_i:.3f})"
+            f"Agent({self.agent_id}, γ={self.gamma:.2f}, sigma={self.sigma_i:.3f})"
         )
 
 
@@ -140,19 +131,13 @@ class AgentPopulation:
             else:
                 sigma_i = (sc.sigma_fund + sc.sigma_chart) / 2.0
 
-            sentiment_0 = 0.0
             gamma       = self._sample_gamma(d, cfg, trader_type)
-            threshold   = 0.0
             max_pos     = self.env_cfg.max_position
-            risk_av     = self._sample_risk_aversion(d, cfg)
 
             self.agents[aid] = AgentParams(
                 agent_id        = aid,
-                sentiment       = sentiment_0,
                 sigma_i         = float(sigma_i),
-                threshold       = threshold,
                 gamma           = gamma,
-                risk_aversion   = risk_av,
                 max_position    = max_pos,
             )
 
@@ -174,46 +159,20 @@ class AgentPopulation:
         gamma_hi = 0.99 - trader_type * 0.11
         return float(np.clip(self.rng.uniform(gamma_lo, gamma_hi), 0.80, 0.99))
 
-    def _sample_risk_aversion(self, d, cfg) -> float:
-        """
-        Awersja do ryzyka pozycji — λ w: reward -= λ*(inv/max_inv)².
-
-        Interpretacja:
-          λ=0.0: agent ignoruje ryzyko — buduje max pozycję
-          λ=1.0: umiarkowana kara za dużą pozycję
-          λ=3.0: agent konserwatywny — unika dużych pozycji
-
-        Rozkład: LogNormal(log(1.0), 0.5*d) clip[0, 3]
-          D=0: wszyscy λ=1.0
-          D=1: zakres [0.1, 3.0] — od agresywnych do konserwatywnych
-        """
-        if not cfg.risk_aversion_spread or d < 1e-6:
-            return 1.0
-        sigma = 0.5 * d
-        raw = self.rng.lognormal(mean=-sigma**2/2, sigma=sigma)  # median=1.0
-        return float(np.clip(raw, 0.05, 3.0))
-
     def max_theoretical_surplus(self) -> float:
         """Legacy metric: model sentimentu nie ma statycznego surplusu."""
         return 0.0
 
     def diversity_stats(self) -> dict:
         """Statystyki opisowe populacji — do logowania i wykresów."""
-        sentiments = [p.sentiment for p in self.agents.values()]
         gammas     = [p.gamma     for p in self.agents.values()]
-        thrs       = [p.threshold for p in self.agents.values()]
         sigmas     = [p.sigma_i   for p in self.agents.values()]
 
         return {
             "D":                self.diversity_score,
             "eq_price":         self.eq_price,
-            "sentiment_mean":   float(np.mean(sentiments)),
-            "sentiment_std":    float(np.std(sentiments)),
-            "sentiment_range":  float(np.ptp(sentiments)),
             "gamma_mean":       float(np.mean(gammas)),
             "gamma_std":        float(np.std(gammas)),
-            "threshold_mean":   float(np.mean(thrs)),
-            "threshold_std":    float(np.std(thrs)),
             "sigma_mean":       float(np.mean(sigmas)),
             "sigma_std":        float(np.std(sigmas)),
         }
@@ -254,9 +213,7 @@ class DoubleAuction:
         self._n_trades_won_arr = np.zeros(0, dtype=np.int32)
         self._sigma_i_arr = np.zeros(0, dtype=np.float32)
         self._gamma_i_arr = np.zeros(0, dtype=np.float32)
-        self._threshold_arr = np.zeros(0, dtype=np.float32)
         self._max_position_arr = np.zeros(0, dtype=np.int32)
-        self._risk_aversion_arr = np.zeros(0, dtype=np.float32)
         self._eq_price  = cfg.market.eq_center
         self._ref_price = cfg.market.eq_center  # aktualizowany po transakcjach
         self._episode_start_price: float = cfg.market.eq_center
@@ -303,9 +260,7 @@ class DoubleAuction:
             self._n_trades_won_arr = np.zeros(0, dtype=np.int32)
             self._sigma_i_arr = np.zeros(0, dtype=np.float32)
             self._gamma_i_arr = np.zeros(0, dtype=np.float32)
-            self._threshold_arr = np.zeros(0, dtype=np.float32)
             self._max_position_arr = np.zeros(0, dtype=np.int32)
-            self._risk_aversion_arr = np.zeros(0, dtype=np.float32)
             self._episode_pnl_arr = np.zeros(0, dtype=np.float32)
             self._realized_this_step_arr = np.zeros(0, dtype=np.float32)
             self._terminal_pnl_arr = np.zeros(0, dtype=np.float32)
@@ -320,9 +275,7 @@ class DoubleAuction:
         self._n_trades_won_arr = np.array([p.n_trades_won for p in agents], dtype=np.int32)
         self._sigma_i_arr = np.array([p.sigma_i for p in agents], dtype=np.float32)
         self._gamma_i_arr = np.array([p.gamma for p in agents], dtype=np.float32)
-        self._threshold_arr = np.array([p.threshold for p in agents], dtype=np.float32)
         self._max_position_arr = np.array([p.max_position for p in agents], dtype=np.int32)
-        self._risk_aversion_arr = np.array([p.risk_aversion for p in agents], dtype=np.float32)
         n = len(agents)
         self._episode_pnl_arr = np.zeros(n, dtype=np.float32)
         self._realized_this_step_arr = np.zeros(n, dtype=np.float32)
@@ -399,7 +352,7 @@ f"N={self.cfg.env.n_agents}"
 
     def reset_episode(self) -> Dict[str, np.ndarray]:
         """
-        Reset na nowy epizod: macro dryft V_t + nowy sygnał sentimentu + reset portfeli.
+        Reset na nowy epizod: macro dryft V_t + reset portfeli.
 
         P_t NIE resetuje się (ciągłość rynku między epizodami).
         """
@@ -414,10 +367,6 @@ f"N={self.cfg.env.n_agents}"
         ))
         self._eq_price = V_new
         self._V_drift = 0.0
-
-        # Kierunek dryfu V_t jako sygnał dla agentów
-        V_change    = self._eq_price - self._V_t_prev
-        V_direction = float(np.tanh(V_change / max(sc.sigma_macro, 1e-6)))
 
         # 2. Reset portfeli agentów na nowy epizod.
         for p in self.population.agents.values():
@@ -478,7 +427,6 @@ f"N={self.cfg.env.n_agents}"
             "action":     action_idx,
             "action_name":self.cfg.env.action_name(action_idx),
             "position":   params.position,
-            "sentiment":  params.sentiment,
             "ref_price":  self._ref_price,
         })
 
@@ -561,7 +509,6 @@ f"N={self.cfg.env.n_agents}"
                 "action":     action,
                 "action_name":e.action_name(action),
                 "position":   int(self._positions_arr[self._agent_idx[aid]]),
-                "sentiment":  self.population.agents[aid].sentiment,
                 "ref_price":  self._ref_price,
             })
 
@@ -849,11 +796,6 @@ f"N={self.cfg.env.n_agents}"
         if signal_i is None:
             self._refresh_signal_cache()
             signal_i = self._signal_cache[agent_id]
-        public_gap = float(np.clip(
-            (self._eq_price - self._ref_price) / sc.signal_scale,
-            -1.0,
-            1.0,
-        ))
         sigma_norm = float(np.clip(float(self._sigma_i_arr[idx]) / sc.sigma_chart, 0.0, 1.0))
 
         return np.array([
@@ -1125,11 +1067,8 @@ f"N={self.cfg.env.n_agents}"
     def agent_metrics(self) -> Dict[str, dict]:
         return {
             aid: {
-                "sentiment":       p.sentiment,
                 "sigma_i":         p.sigma_i,
-                "threshold":       p.threshold,
                 "gamma":           p.gamma,
-                "risk_aversion":   p.risk_aversion,
                 "position":        int(self._positions_arr[self._agent_idx[aid]]),
                 "entry_price":     float(self._entry_prices_arr[self._agent_idx[aid]]),
                 "ep_pnl":          float(self._episode_pnl_arr[self._agent_idx[aid]]),

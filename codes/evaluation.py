@@ -154,9 +154,7 @@ def evaluate_same_population(
                         realized_pnl_this_step=realized_pnl_this_step,
                         realized_pnl_cum=agent.realized_pnl,
                         n_trades_closed=agent.n_trades_closed,
-                        sentiment=agent.sentiment,
                         sigma_i=agent.sigma_i,
-                        threshold=agent.threshold,
                     ))
                     prev_positions[aid] = agent.position
 

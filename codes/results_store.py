@@ -51,14 +51,10 @@ EPISODE_FIELDS = [
     "mean_epsilon",
     "mean_td_error",
     "mean_grad_norm",
-    "pop_mean_sentiment",
-    "pop_std_sentiment",
     "pop_mean_gamma",
     "pop_std_gamma",
     "pop_mean_sigma",
     "pop_std_sigma",
-    "pop_mean_risk_aversion",
-    "pop_mean_threshold",
     "pop_mean_max_position",
     "policy_loss",
     "value_loss",
@@ -99,7 +95,6 @@ AGENT_SAMPLE_FIELDS = [
     "price_vs_start",
     "trend_short",
     "sigma_norm",
-    "sentiment",
     "public_gap_before",
     "eq_price_before",
     "ref_price_before",
@@ -115,7 +110,6 @@ AGENT_SAMPLE_FIELDS = [
     "realized_pnl_cum",
     "n_trades_closed",
     "sigma_i",
-    "threshold",
 ]
 
 ENV_STEP_FIELDS = [

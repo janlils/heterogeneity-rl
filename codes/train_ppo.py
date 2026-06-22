@@ -353,7 +353,6 @@ def run_training(
                         "agent_id": aid,
                         "trader_type": sigma_i / max(cfg.sentiment.sigma_chart, 1e-9),
                         "sigma_i": sigma_i,
-                        "threshold": float(meta.get("threshold", 0.0)),
                         "gamma": float(meta.get("gamma", 0.0)),
                         "realized_pnl": float(meta.get("realized_pnl", 0.0)),
                         "n_trades_closed": int(meta.get("n_trades_closed", 0)),

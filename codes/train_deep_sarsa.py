@@ -204,7 +204,6 @@ def _agent_diagnostic_rows(
             "agent_id": aid,
             "trader_type": trader_type,
             "sigma_i": sigma_i,
-            "threshold": float(meta.get("threshold", 0.0)),
             "gamma": float(meta.get("gamma", 0.0)),
             "realized_pnl": float(meta.get("realized_pnl", 0.0)),
             "n_trades_closed": int(meta.get("n_trades_closed", 0)),
@@ -363,11 +362,9 @@ def run_training(
         dtype=np.float64,
     )
 
-    sentiments = [da.population.agents[a].sentiment for a in agent_ids]
     gammas_pop = [da.population.agents[a].gamma for a in agent_ids]
     log.info(
         f"  Populacja | N={len(agent_ids)} | "
-        f"sentiment=[{min(sentiments):.2f}, {max(sentiments):.2f}] | "
         f"gamma=[{min(gammas_pop):.2f}, {max(gammas_pop):.2f}] mean={np.mean(gammas_pop):.3f}"
     )
 
@@ -380,14 +377,10 @@ def run_training(
     # Parametry populacji — stałe przez cały run, zapisywane do każdego rekordu
     _ap = da.population.agents
     pop_meta = {
-        "pop_mean_sentiment":     float(np.mean([_ap[a].sentiment     for a in agent_ids])),
-        "pop_std_sentiment":      float(np.std( [_ap[a].sentiment     for a in agent_ids])),
         "pop_mean_gamma":         float(np.mean([_ap[a].gamma         for a in agent_ids])),
         "pop_std_gamma":          float(np.std( [_ap[a].gamma         for a in agent_ids])),
         "pop_mean_sigma":         float(np.mean([_ap[a].sigma_i       for a in agent_ids])),
         "pop_std_sigma":          float(np.std( [_ap[a].sigma_i       for a in agent_ids])),
-        "pop_mean_risk_aversion": float(np.mean([_ap[a].risk_aversion for a in agent_ids])),
-        "pop_mean_threshold":     float(np.mean([_ap[a].threshold     for a in agent_ids])),
         "pop_mean_max_position":  float(np.mean([_ap[a].max_position  for a in agent_ids])),
     }
 

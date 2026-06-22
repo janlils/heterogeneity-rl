@@ -146,9 +146,7 @@ def build_agent_sample_row(
     realized_pnl_this_step: float,
     realized_pnl_cum: float,
     n_trades_closed: int,
-    sentiment: float,
     sigma_i: float,
-    threshold: float,
 ) -> dict:
     reward_this_step = float(reward_this_step)
     realized_pnl_this_step = float(realized_pnl_this_step)
@@ -173,7 +171,6 @@ def build_agent_sample_row(
         "price_vs_start": float(obs[5]),
         "trend_short": float(obs[6]),
         "sigma_norm": float(obs[7]),
-        "sentiment": float(sentiment),
         "public_gap_before": float(public_gap_before),
         "eq_price_before": float(eq_price_before),
         "ref_price_before": float(ref_price_before),
@@ -189,7 +186,6 @@ def build_agent_sample_row(
         "realized_pnl_cum": float(realized_pnl_cum),
         "n_trades_closed": int(n_trades_closed),
         "sigma_i": float(sigma_i),
-        "threshold": float(threshold),
     }
 
 

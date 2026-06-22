@@ -133,20 +133,15 @@ class SentimentConfig:
 @dataclass
 class DiversityConfig:
     """
-    Co D kontroluje. Każdy wymiar można włączyć/wyłączyć osobno
-    (eksperymenty ablacyjne: który wymiar heterogeniczności jest kluczowy).
+    Co D kontroluje w docelowym rdzeniu v1.
     """
-    sentiment_spread:    bool = True   # rozrzut początkowego sentimentu agentów
-    threshold_spread:    bool = True   # różne progi decyzji o handlu
     gamma_spread:        bool = True   # horyzonty czasowe
-    risk_aversion_spread:bool = True   # awersja do ryzyka pozycji
     sigma_spread:        bool = True   # poziom szumu prywatnego sygnału
 
     @classmethod
     def sentiment_only(cls) -> "DiversityConfig":
-        """Tylko sentiment — najczystszy test modelu spekulacyjnego."""
-        return cls(threshold_spread=False, gamma_spread=False,
-                   sigma_spread=False)
+        """Kompatybilnosc wsteczna: tylko rozrzut sigma_i bez spreadu gamma."""
+        return cls(gamma_spread=False, sigma_spread=True)
 
     @classmethod
     def full(cls) -> "DiversityConfig":
@@ -224,7 +219,7 @@ class ExpConfig:
         default_factory=lambda: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     )
     algorithms:         List[str]   = field(
-        default_factory=lambda: ["ZI", "DeepSARSA", "PPO", "IPPO", "MAPPO"]
+        default_factory=lambda: ["ZI", "DeepSARSA", "PPO", "IPPO"]
     )
     n_agents_list:      List[int]   = field(
         default_factory=lambda: [20, 50, 100]
@@ -251,7 +246,7 @@ class ExpConfig:
     def conference_paper(cls) -> "ExpConfig":
         return cls(
             diversity_scores=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            algorithms=["ZI", "DeepSARSA", "PPO", "IPPO", "MAPPO"],
+            algorithms=["ZI", "DeepSARSA", "PPO", "IPPO"],
             n_agents_list=[20, 50],
             market_conditions=["stable", "random_eq"],
             n_seeds=30, n_train_episodes=1000, n_eval_episodes=100,
