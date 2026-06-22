@@ -45,7 +45,7 @@ class EnvConfig:
     market_impact:          float = 0.0
     temp_impact:            float = 0.000
     perm_impact:            float = 0.0
-    k_impact:               float = 0.0
+    k_impact:               float = 0.03
     mtm_weight:             float = 0.3
     p_min:                  float = 0.05
     p_max:                  float = 0.95

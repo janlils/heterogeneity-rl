@@ -163,9 +163,14 @@ def evaluate_same_population(
                 mean_sigma = float(np.mean([float(da.population.agents[aid].sigma_i) for aid in agent_ids]))
                 mean_position_before = float(np.mean([positions_before[aid] for aid in agent_ids]))
                 mean_position_after = float(np.mean([da.population.agents[aid].position for aid in agent_ids]))
-                n_buy = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_BUY_MARKET)
-                n_sell = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_SELL_MARKET)
+                position_changes = {
+                    aid: da.population.agents[aid].position - positions_before[aid]
+                    for aid in agent_ids
+                }
+                n_buy = sum(1 for aid, delta in position_changes.items() if delta > 0)
+                n_sell = sum(1 for aid, delta in position_changes.items() if delta < 0)
                 n_hold = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_HOLD)
+                net_flow_actual = int(sum(position_changes.values()))
                 realized_vals = [float(da.population.agents[aid].realized_pnl - realized_before[aid]) for aid in agent_ids]
                 reward_vals = [float(rewards.get(aid, 0.0)) for aid in agent_ids]
                 env_step_rows.append(build_env_step_row(
@@ -190,11 +195,11 @@ def evaluate_same_population(
                     n_buy=n_buy,
                     n_sell=n_sell,
                     n_hold=n_hold,
-                    net_flow=n_buy - n_sell,
+                    net_flow=net_flow_actual,
                     mean_reward=float(np.mean(reward_vals)),
                     mean_realized_pnl=float(np.mean(realized_vals)),
                     mean_mtm=float(np.mean([r - x for r, x in zip(reward_vals, realized_vals)])),
-                    n_executed=sum(1 for aid in agent_ids if da.population.agents[aid].position != positions_before[aid]),
+                    n_executed=sum(1 for delta in position_changes.values() if delta != 0),
                     n_trades_closed_cum=sum(da.population.agents[aid].n_trades_closed for aid in agent_ids),
                 ))
 

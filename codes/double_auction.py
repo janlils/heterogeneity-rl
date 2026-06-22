@@ -418,15 +418,15 @@ f"N={self.cfg.env.n_agents}"
             if params.position >= params.max_position:
                 return None
             p_exec = self._execution_price("buy")
-            realized = self._execute_fill(agent_id, "buy", p_exec)
-            self._move_ref_price("buy")
+            self._execute_fill(agent_id, "buy", p_exec)
+            self._prev_net_flow += 1
 
         elif action_idx == SELL_M:
             if params.position <= -params.max_position:
                 return None
             p_exec = self._execution_price("sell")
-            realized = self._execute_fill(agent_id, "sell", p_exec)
-            self._move_ref_price("sell")
+            self._execute_fill(agent_id, "sell", p_exec)
+            self._prev_net_flow -= 1
         else:
             return None  # HOLD
 
@@ -462,26 +462,22 @@ f"N={self.cfg.env.n_agents}"
                 buy_agents.append(aid)
             elif action == e.ACTION_SELL_MARKET and pos > -max_pos:
                 sell_agents.append(aid)
-        excess = len(buy_agents) - len(sell_agents)
         p_exec_buy = float(np.clip(P_before + e.half_spread, e.p_min, e.p_max))
         p_exec_sell = float(np.clip(P_before - e.half_spread, e.p_min, e.p_max))
+        executed_buys = 0
+        executed_sells = 0
 
         for aid in buy_agents:
             self._execute_fill(aid, "buy", p_exec_buy)
             self._record_fill_price(p_exec_buy)
+            executed_buys += 1
 
         for aid in sell_agents:
             self._execute_fill(aid, "sell", p_exec_sell)
             self._record_fill_price(p_exec_sell)
+            executed_sells += 1
 
-        self._prev_net_flow = excess
-        if excess != 0:
-            self._ref_price = float(np.clip(
-                P_before + e.perm_impact * np.sign(excess) * np.sqrt(abs(excess)),
-                e.p_min,
-                e.p_max,
-            ))
-        self._price_history.append(self._ref_price)
+        self._prev_net_flow = executed_buys - executed_sells
 
         # Zaloguj akcje.
         for aid, action in actions.items():
@@ -533,6 +529,7 @@ f"N={self.cfg.env.n_agents}"
         self._price_history.append(self._ref_price)
         self._prev_price = self._ref_price
         self._realized_this_step_arr.fill(0.0)
+        self._prev_net_flow = 0
         self._refresh_signal_cache()
 
         self._step += 1
