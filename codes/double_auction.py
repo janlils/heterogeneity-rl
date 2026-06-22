@@ -214,10 +214,10 @@ class DoubleAuction:
         self._sigma_i_arr = np.zeros(0, dtype=np.float32)
         self._gamma_i_arr = np.zeros(0, dtype=np.float32)
         self._max_position_arr = np.zeros(0, dtype=np.int32)
-        self._eq_price  = cfg.market.eq_center
-        self._ref_price = cfg.market.eq_center  # aktualizowany po transakcjach
-        self._episode_start_price: float = cfg.market.eq_center
-        self._eq_price_start:      float = cfg.market.eq_center
+        self._eq_price  = cfg.market.init_value
+        self._ref_price = cfg.market.init_value
+        self._episode_start_price: float = cfg.market.init_value
+        self._eq_price_start:      float = cfg.market.init_value
         self._step_prices: List[float]   = []
 
         # Stan epizodu
@@ -235,7 +235,9 @@ class DoubleAuction:
         self._n_position_closes:  int              = 0
         self._terminal_pnl_arr = np.zeros(0, dtype=np.float32)
         self._prev_net_flow:      int              = 0
-        self._V_drift:            float            = 0.0
+        self._trend_mu:           float            = cfg.market.init_mu
+        self._stress_level:       float            = cfg.market.init_stress
+        self._price_momentum:     float            = cfg.market.init_momentum
         self._signal_cache:       Dict[str, float] = {}
 
     def _sync_agent_from_idx(self, idx: int) -> None:
@@ -291,23 +293,17 @@ class DoubleAuction:
         seed: Optional[int]    = None,
     ) -> Dict[str, np.ndarray]:
         """
-        Reset środowiska. Nowa populacja + nowa (ew. losowa) cena równowagi.
+        Reset środowiska. Nowa populacja + reset procesu rynku v1.
         """
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # Losuj cenę równowagi dla tego epizodu
         md = self.cfg.market
-        if md.eq_spread > 1e-6:
-            self._eq_price = float(np.clip(
-                self.rng.uniform(md.eq_center - md.eq_spread,
-                                 md.eq_center + md.eq_spread),
-                0.15, 0.85
-            ))
-        else:
-            self._eq_price = md.eq_center
-
-        self._ref_price = self._eq_price  # start: ref = eq
+        self._eq_price = float(md.init_value)
+        self._ref_price = float(md.init_value)
+        self._trend_mu = float(md.init_mu)
+        self._stress_level = float(md.init_stress)
+        self._price_momentum = float(md.init_momentum)
 
         self.population = AgentPopulation(
             n_agents        = self.cfg.env.n_agents,
@@ -352,28 +348,16 @@ f"N={self.cfg.env.n_agents}"
 
     def reset_episode(self) -> Dict[str, np.ndarray]:
         """
-        Reset na nowy epizod: macro dryft V_t + reset portfeli.
-
-        P_t NIE resetuje się (ciągłość rynku między epizodami).
+        Reset na nowy epizod: portfele od zera, rynek kontynuuje swój stan.
         """
         assert self.population is not None, "Wywołaj reset() przed reset_episode()"
-        sc = self.cfg.sentiment
 
-        # 1. V_t macro dryft (większy skok między epizodami)
-        self._V_t_prev = self._eq_price
-        V_new = float(np.clip(
-            self._eq_price + self.rng.normal(0, sc.sigma_macro),
-            self.cfg.env.p_min, self.cfg.env.p_max,
-        ))
-        self._eq_price = V_new
-        self._V_drift = 0.0
-
-        # 2. Reset portfeli agentów na nowy epizod.
+        # 1. Reset portfeli agentów na nowy epizod.
         for p in self.population.agents.values():
             p.reset_position()
         self._init_runtime_arrays()
 
-        # 3. Reset stanu epizodu (nie: P_t, wagi sieci, epsilon)
+        # 2. Reset stanu epizodu (nie: procesu rynku, wag sieci, epsilon)
         self._step            = 0
         self._done            = False
         self._actions_log     = []
@@ -528,18 +512,10 @@ f"N={self.cfg.env.n_agents}"
         """
         e  = self.cfg.env
 
-        # 1. Ruch ceny po decyzjach agentów.
-        # Agenci wybierają akcje przy bieżącym P_t, po czym rynek przechodzi do P_{t+1}.
-        # Reward za ten krok powinien więc używać ruchu ceny, który nastąpił PO akcji.
+        # 1. Rynek przechodzi do kolejnego stanu po decyzjach agentów.
+        # Agenci wybierają akcje przy bieżącym (V_t, P_t), a reward używa ruchu P_{t+1} - P_t.
         ref_price_before = self._ref_price
-        noise_P = self.rng.normal(0.0, self.cfg.env.sigma_P_noise)
-        self._ref_price = float(np.clip(
-            self._ref_price
-            + self.cfg.env.mv_speed * (self._eq_price - self._ref_price)
-            + noise_P,
-            self.cfg.env.p_min,
-            self.cfg.env.p_max,
-        ))
+        self._advance_market()
         price_delta = self._ref_price - ref_price_before
 
         # 2. Oblicz nagrody
@@ -553,10 +529,8 @@ f"N={self.cfg.env.n_agents}"
             aid: float(reward_arr[i]) for i, aid in enumerate(self.agent_ids)
         }
 
-        # 3. Drift V_t na kolejny krok.
-        self._drift_V_t()
-
         self._step_prices.append(self._ref_price)
+        self._price_history.append(self._ref_price)
         self._prev_price = self._ref_price
         self._realized_this_step_arr.fill(0.0)
         self._refresh_signal_cache()
@@ -702,29 +676,68 @@ f"N={self.cfg.env.n_agents}"
 
         return realized_by_agent
 
-    def _drift_V_t(self) -> None:
-        """
-        Intra-episode dryft V_t — wywoływany z compute_step_rewards().
+    def _advance_market(self) -> None:
+        """Jednokrokowa aktualizacja procesu v1: V_t, stres, momentum i cena P_t."""
+        md = self.cfg.market
+        env = self.cfg.env
+        value_before = float(self._eq_price)
+        price_before = float(self._ref_price)
+        self._V_t_prev = value_before
 
-        V_t dryfuje niezależnie od P_t. P_t zmienia się tylko przez transakcje.
-        Opcjonalne szoki z MarketDynamics (gdy drift_enabled=True).
-        """
-        sc  = self.cfg.sentiment
-        md  = self.cfg.market
-        self._V_t_prev = self._eq_price
-
-        self._V_drift = (
-            self.cfg.sentiment.drift_persistence * self._V_drift
-            + self.rng.normal(0, sc.sigma_intra)
+        mu_noise = self.rng.normal(md.mu_drift_mean, md.mu_drift_std)
+        self._trend_mu = (
+            md.mu_persistence * self._trend_mu
+            + md.mu_innovation_weight * float(mu_noise)
         )
-        drift = self._V_drift
-        if md.drift_enabled and self.rng.random() < md.shock_probability:
-            drift += float(self.rng.choice([-1, 1])) * md.shock_size
 
-        self._eq_price = float(np.clip(
-            self._eq_price + drift,
-            self.cfg.env.p_min, self.cfg.env.p_max,
+        value_jump = 0.0
+        if self.rng.random() < md.value_jump_prob:
+            value_jump = float(self.rng.uniform(md.value_jump_min, md.value_jump_max))
+            value_jump *= float(self.rng.choice([-1.0, 1.0]))
+
+        value_noise = float(self.rng.normal(0.0, md.value_noise_std))
+        value_next = float(np.clip(
+            value_before + self._trend_mu + value_jump + value_noise,
+            md.value_min,
+            md.value_max,
         ))
+
+        self._stress_level = (
+            md.stress_reversion * self._stress_level
+            + md.stress_anchor_weight * md.stress_low
+        )
+        crisis_step = self.rng.random() < md.crisis_prob
+        if crisis_step:
+            self._stress_level = max(
+                self._stress_level,
+                float(self.rng.uniform(md.crisis_stress_min, md.crisis_stress_max)),
+            )
+
+        nu = max(float(md.nu), 3.0)
+        student = float(self.rng.standard_t(nu))
+        eps_scale = np.sqrt(nu / (nu - 2.0))
+        eps_t = float(self._stress_level * student / eps_scale)
+
+        kick = 0.0
+        if crisis_step:
+            kick = float(self.rng.uniform(md.kick_min, md.kick_max))
+            kick *= float(self.rng.choice([-1.0, 1.0]))
+
+        impact = float(env.k_impact * np.tanh(self._prev_net_flow / max(env.n_agents, 1)))
+        self._price_momentum = (
+            md.psi * self._price_momentum
+            - md.kappa * (price_before - value_before)
+            + eps_t
+            + kick
+        )
+        price_next = float(np.clip(
+            price_before + self._price_momentum + impact,
+            env.p_min,
+            env.p_max,
+        ))
+
+        self._eq_price = value_next
+        self._ref_price = price_next
 
     def _refresh_signal_cache(self) -> None:
         if self.population is None:
@@ -1186,7 +1199,7 @@ if __name__ == "__main__":
     from codes.config import HTMConfig, MarketDynamics, LogConfig, ExpConfig
 
     cfg = HTMConfig(
-        market=MarketDynamics.random_eq(),
+        market=MarketDynamics.stable(),
         log=LogConfig(level="INFO"),
         exp=ExpConfig.quick_test(),
     )

@@ -77,9 +77,13 @@ def ensure_run_config(
         "n_episodes": settings["n_episodes"],
         "n_agents": cfg.env.n_agents,
         "market_condition": {
-            "eq_center": cfg.market.eq_center,
-            "eq_spread": cfg.market.eq_spread,
-            "drift_enabled": cfg.market.drift_enabled,
+            "init_value": cfg.market.init_value,
+            "psi": cfg.market.psi,
+            "kappa": cfg.market.kappa,
+            "nu": cfg.market.nu,
+            "stress_low": cfg.market.stress_low,
+            "crisis_prob": cfg.market.crisis_prob,
+            "k_impact": cfg.env.k_impact,
         },
         "eval_new_population": eval_new_population,
     })
@@ -173,7 +177,10 @@ def run_sarsa_experiment(
         f"SARSA epsilon: start={sarsa_cfg.epsilon_start:.3f} | "
         f"end={sarsa_cfg.epsilon_end:.3f} | decay={sarsa_cfg.epsilon_decay:.3f}"
     )
-    log.info(f"Market: eq±{cfg.market.eq_spread} drift={cfg.market.drift_enabled}")
+    log.info(
+        f"Market: v1 | psi={cfg.market.psi:.2f} | kappa={cfg.market.kappa:.2f} | "
+        f"stress_low={cfg.market.stress_low:.3f} | k_impact={cfg.env.k_impact:.3f}"
+    )
     log.info("=" * 65)
 
     for d in ["logs", "plots", "results", "experiments"]:

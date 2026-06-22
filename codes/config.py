@@ -45,9 +45,8 @@ class EnvConfig:
     market_impact:          float = 0.0
     temp_impact:            float = 0.000
     perm_impact:            float = 0.0
+    k_impact:               float = 0.0
     mtm_weight:             float = 0.3
-    mv_speed:               float = 0.1
-    sigma_P_noise:          float = 0.003
     p_min:                  float = 0.05
     p_max:                  float = 0.95
     auto_liquidate_end:     bool  = True
@@ -70,7 +69,7 @@ class EnvConfig:
 
     @classmethod
     def no_impact(cls) -> "EnvConfig":
-        return cls(perm_impact=0.0, half_spread=0.0)
+        return cls(half_spread=0.0, temp_impact=0.0, perm_impact=0.0, k_impact=0.0)
 
     def action_name(self, idx: int) -> str:
         return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
@@ -83,29 +82,53 @@ class EnvConfig:
 @dataclass
 class MarketDynamics:
     """
-    Trzy warunki środowiskowe dla artykułu:
-      stable    — stałe eq=0.5 (baseline, jak G&S)
-      random_eq — eq losowane per epizod z [eq_center ± eq_spread]
-      drifting  — eq zmienia się w trakcie epizodu
+    Docelowy proces rynku v1:
+      - V_t trenduje i doświadcza rzadkich skoków
+      - stres s_t przełącza rynek między ciszą i kryzysem
+      - P_t jest tłumionym oscylatorem wokół V_t
+      - wpływ agentów jest ograniczony przez k_impact * tanh(flow/N)
     """
-    eq_center:         float = 0.5
-    eq_spread:         float = 0.0     # 0.0 = stable
-    drift_enabled:     bool  = False
-    drift_magnitude:   float = 0.015
-    shock_probability: float = 0.04
-    shock_size:        float = 0.04
+    init_value:             float = 0.50
+    init_mu:                float = 0.0
+    init_stress:            float = 0.004
+    init_momentum:          float = 0.0
+
+    mu_persistence:         float = 0.99
+    mu_innovation_weight:   float = 0.01
+    mu_drift_mean:          float = 0.0002
+    mu_drift_std:           float = 0.0004
+
+    value_jump_prob:        float = 0.01
+    value_jump_min:         float = 0.03
+    value_jump_max:         float = 0.07
+    value_noise_std:        float = 0.0007
+    value_min:              float = 0.25
+    value_max:              float = 0.75
+
+    stress_reversion:       float = 0.94
+    stress_anchor_weight:   float = 0.06
+    stress_low:             float = 0.004
+    crisis_prob:            float = 0.012
+    crisis_stress_min:      float = 0.020
+    crisis_stress_max:      float = 0.040
+
+    psi:                    float = 0.55
+    kappa:                  float = 0.12
+    nu:                     float = 5.0
+    kick_min:               float = 0.03
+    kick_max:               float = 0.07
 
     @classmethod
     def stable(cls)    -> "MarketDynamics":
-        return cls(eq_spread=0.0,  drift_enabled=False)
+        return cls()
 
     @classmethod
     def random_eq(cls) -> "MarketDynamics":
-        return cls(eq_spread=0.18, drift_enabled=False)
+        return cls()
 
     @classmethod
     def drifting(cls)  -> "MarketDynamics":
-        return cls(eq_spread=0.18, drift_enabled=True)
+        return cls()
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +248,7 @@ class ExpConfig:
         default_factory=lambda: [20, 50, 100]
     )
     market_conditions:  List[str]   = field(
-        default_factory=lambda: ["stable", "random_eq", "drifting"]
+        default_factory=lambda: ["v1_market"]
     )
     n_seeds:            int  = 30
     n_train_episodes:   int  = 1000
@@ -238,7 +261,7 @@ class ExpConfig:
             diversity_scores=[0.0, 0.5, 1.0],
             algorithms=["ZI", "DeepSARSA"],
             n_agents_list=[50],
-            market_conditions=["stable"],
+            market_conditions=["v1_market"],
             n_seeds=3, n_train_episodes=200, n_eval_episodes=30,
         )
 
@@ -248,7 +271,7 @@ class ExpConfig:
             diversity_scores=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             algorithms=["ZI", "DeepSARSA", "PPO", "IPPO"],
             n_agents_list=[20, 50],
-            market_conditions=["stable", "random_eq"],
+            market_conditions=["v1_market"],
             n_seeds=30, n_train_episodes=1000, n_eval_episodes=100,
         )
 
@@ -273,6 +296,6 @@ class HTMConfig:
             f"HTM-Speculative | N={self.env.n_agents} | "
             f"actions={self.env.n_actions} | "
             f"episode_steps={self.env.episode_steps} | "
-            f"eq={self.market.eq_center}±{self.market.eq_spread}"
-            f"{'+drift' if self.market.drift_enabled else ''}"
+            f"market=v1(psi={self.market.psi:.2f}, kappa={self.market.kappa:.2f}, "
+            f"stress_low={self.market.stress_low:.3f})"
         )
