@@ -61,7 +61,7 @@ def evaluate_same_population(
     collect_coordination: bool = False,
     episode_end_callback: Optional[EpisodeEndCallback] = None,
     step_callback: Optional[StepCallback] = None,
-    debug_diversity_score: Optional[float] = 1.0,
+    debug_diversity_score: Optional[float] = None,
 ) -> tuple[List[dict], List[dict], List[dict]]:
     agent_ids = list(da.population.agents.keys())
     agent_gammas = [da.population.agents[aid].gamma for aid in agent_ids]
@@ -73,10 +73,12 @@ def evaluate_same_population(
         da.reset_episode()
         prev_positions = {aid: da.population.agents[aid].position for aid in agent_ids}
         sample_this_episode = (
-            debug_diversity_score is not None
-            and seed == 0
+            seed == 0
             and episode == (n_eval_episodes - 1)
-            and abs(float(diversity_score) - float(debug_diversity_score)) < 1e-9
+            and (
+                debug_diversity_score is None
+                or abs(float(diversity_score) - float(debug_diversity_score)) < 1e-9
+            )
         )
         step_actions: List[np.ndarray] = []
 
@@ -185,8 +187,11 @@ def evaluate_same_population(
                     public_gap_before=public_gap,
                     eq_price_after=da.eq_price,
                     ref_price_after=da.ref_price,
+                    exec_price=da._last_exec_price,
                     public_gap_after=public_gap_after,
                     price_delta_step=da.ref_price - ref_price_before,
+                    sigma_step=da._last_step_sigma,
+                    crisis_step=da._last_step_crisis,
                     mean_signal=mean_signal,
                     std_signal=std_signal,
                     mean_sigma=mean_sigma,

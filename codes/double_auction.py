@@ -50,7 +50,7 @@ class AgentParams:
     agent_id:           str
     sigma_i:            float = 0.08   # poziom szumu prywatnego sygnału
     gamma:              float = 0.90   # discount factor (indywidualny, wchodzi do TD)
-    max_position:       int   = 5      # maks |position|
+    max_position:       int   = 1      # maks |position|
 
     # Stan portfela (reset per epizod)
     position:           int   = 0
@@ -236,8 +236,16 @@ class DoubleAuction:
         self._terminal_pnl_arr = np.zeros(0, dtype=np.float32)
         self._prev_net_flow:      int              = 0
         self._trend_mu:           float            = cfg.market.init_mu
-        self._stress_level:       float            = cfg.market.init_stress
-        self._price_momentum:     float            = cfg.market.init_momentum
+        self._variance_state:     float            = cfg.market.init_variance
+        self._sigma_level:        float            = float(np.sqrt(max(cfg.market.init_variance, 1e-12)))
+        self._shock_prev:         float            = 0.0
+        self._crisis_active:      bool             = False
+        self._pending_exec_price: Optional[float]  = None
+        self._pending_net_flow:   int              = 0
+        self._staged_actions:     Dict[str, int]   = {}
+        self._last_exec_price:    float            = self._ref_price
+        self._last_step_sigma:    float            = self._sigma_level
+        self._last_step_crisis:   bool             = False
         self._signal_cache:       Dict[str, float] = {}
 
     def _sync_agent_from_idx(self, idx: int) -> None:
@@ -302,8 +310,16 @@ class DoubleAuction:
         self._eq_price = float(md.init_value)
         self._ref_price = float(md.init_value)
         self._trend_mu = float(md.init_mu)
-        self._stress_level = float(md.init_stress)
-        self._price_momentum = float(md.init_momentum)
+        self._variance_state = float(md.init_variance)
+        self._sigma_level = float(np.sqrt(max(md.init_variance, 1e-12)))
+        self._shock_prev = 0.0
+        self._crisis_active = False
+        self._pending_exec_price = None
+        self._pending_net_flow = 0
+        self._staged_actions = {}
+        self._last_exec_price = self._ref_price
+        self._last_step_sigma = self._sigma_level
+        self._last_step_crisis = False
 
         self.population = AgentPopulation(
             n_agents        = self.cfg.env.n_agents,
@@ -336,6 +352,7 @@ class DoubleAuction:
         self._rewards    = {aid: 0.0 for aid in self.population.agents}
         self._prev_price = self._ref_price
         self._prev_net_flow = 0
+        self._prepare_next_decision_state()
         self._refresh_signal_cache()
 
         _log.debug(
@@ -371,6 +388,10 @@ f"N={self.cfg.env.n_agents}"
         self._rewards             = {aid: 0.0 for aid in self.population.agents}
         self._prev_price          = self._ref_price
         self._prev_net_flow       = 0
+        self._pending_exec_price  = None
+        self._pending_net_flow    = 0
+        self._staged_actions      = {}
+        self._prepare_next_decision_state()
         self._refresh_signal_cache()
 
         obs_batch = self.get_all_observations()
@@ -386,52 +407,32 @@ f"N={self.cfg.env.n_agents}"
 
     def execute_single_action(self, agent_id: str, action_idx: int):
         """
-        Natychmiastowe wykonanie akcji jednego agenta.
+        Zachowany dla kompatybilności wstecznej.
 
-        Używane w sekwencyjnym training loop:
-          for aid in random_permutation(agents):
-              obs = da.get_observation(aid)   # aktualny stan rynku
-              action = agent.act(obs)
-              da.execute_single_action(aid, action)
-          rewards, dones = da.compute_step_rewards()
-
-        Każdy następny agent widzi rynek ZAKTUALIZOWANY przez poprzedników.
-        To jest realistyczne: w prawdziwym rynku oferty przetwarzane są sekwencyjnie.
+        W nowym procesie wpływ na cenę zależy od agregatu akcji w kroku,
+        więc pojedyncze wywołania są tylko buforowane do późniejszej
+        zbiorczej egzekucji w compute_step_rewards().
         """
         if self._done or agent_id not in self.population.agents:
             return None
+        if self._pending_exec_price is not None:
+            raise RuntimeError("compute_step_rewards() must be called before staging more actions")
 
         params = self.population.agents[agent_id]
         BUY_M  = self.cfg.env.ACTION_BUY_MARKET
         SELL_M = self.cfg.env.ACTION_SELL_MARKET
 
-        self._actions_log.append({
-            "step":       self._step,
-            "agent_id":   agent_id,
-            "action":     action_idx,
-            "action_name":self.cfg.env.action_name(action_idx),
-            "position":   params.position,
-            "ref_price":  self._ref_price,
-        })
-
         if action_idx == BUY_M:
             if params.position >= params.max_position:
                 return None
-            p_exec = self._execution_price("buy")
-            self._execute_fill(agent_id, "buy", p_exec)
-            self._prev_net_flow += 1
-
         elif action_idx == SELL_M:
             if params.position <= -params.max_position:
                 return None
-            p_exec = self._execution_price("sell")
-            self._execute_fill(agent_id, "sell", p_exec)
-            self._prev_net_flow -= 1
         else:
-            return None  # HOLD
+            action_idx = self.cfg.env.ACTION_HOLD
 
-        self._record_fill_price(p_exec)
-        return {"agent_id": agent_id, "side": self.cfg.env.action_name(action_idx), "price": p_exec}
+        self._staged_actions[agent_id] = int(action_idx)
+        return {"agent_id": agent_id, "action": self.cfg.env.action_name(action_idx), "staged": True}
 
     def execute_parallel_actions(self, actions: dict) -> None:
         """
@@ -448,7 +449,16 @@ f"N={self.cfg.env.n_agents}"
         if self._done:
             return None
 
+        if self._pending_exec_price is not None:
+            raise RuntimeError("compute_step_rewards() must be called before the next execute_parallel_actions()")
+
         e = self.cfg.env
+        if self._staged_actions:
+            merged_actions = dict(self._staged_actions)
+            merged_actions.update(actions)
+            actions = merged_actions
+            self._staged_actions = {}
+
         P_before = self._ref_price
         buy_agents = []
         sell_agents = []
@@ -462,22 +472,26 @@ f"N={self.cfg.env.n_agents}"
                 buy_agents.append(aid)
             elif action == e.ACTION_SELL_MARKET and pos > -max_pos:
                 sell_agents.append(aid)
-        p_exec_buy = float(np.clip(P_before + e.half_spread, e.p_min, e.p_max))
-        p_exec_sell = float(np.clip(P_before - e.half_spread, e.p_min, e.p_max))
+        net_flow = len(buy_agents) - len(sell_agents)
+        impact_scale = self.cfg.market.beta * (1.0 + self.cfg.market.impact_stress_gain * self._sigma_level)
+        impact = float(impact_scale * np.tanh(net_flow / max(e.n_agents, 1)))
+        p_exec = float(np.clip(P_before + impact, e.p_min, e.p_max))
         executed_buys = 0
         executed_sells = 0
 
         for aid in buy_agents:
-            self._execute_fill(aid, "buy", p_exec_buy)
-            self._record_fill_price(p_exec_buy)
+            self._execute_fill(aid, "buy", p_exec)
+            self._record_fill_price(p_exec)
             executed_buys += 1
 
         for aid in sell_agents:
-            self._execute_fill(aid, "sell", p_exec_sell)
-            self._record_fill_price(p_exec_sell)
+            self._execute_fill(aid, "sell", p_exec)
+            self._record_fill_price(p_exec)
             executed_sells += 1
 
-        self._prev_net_flow = executed_buys - executed_sells
+        self._pending_exec_price = p_exec
+        self._pending_net_flow = executed_buys - executed_sells
+        self._prev_net_flow = self._pending_net_flow
 
         # Zaloguj akcje.
         for aid, action in actions.items():
@@ -489,7 +503,7 @@ f"N={self.cfg.env.n_agents}"
                 "action":     action,
                 "action_name":e.action_name(action),
                 "position":   int(self._positions_arr[self._agent_idx[aid]]),
-                "ref_price":  self._ref_price,
+                "ref_price":  p_exec,
             })
 
         return None
@@ -501,18 +515,25 @@ f"N={self.cfg.env.n_agents}"
         Oblicza nagrody i przygotowuje stan na następny krok.
 
         Kolejność per krok:
-          1. Ruch ceny po decyzjach agentów względem aktualnego V_t
-          2. Obliczenie nagród
-          3. Drift V_t na potrzeby kolejnego kroku
-          4. Terminacja jeśli step >= T
+          1. Jeśli trzeba, zbierz zbuforowane akcje do jednej egzekucji.
+          2. Fill wszystkich akcji po P_exec = P + impact(flow, sigma).
+          3. Egzogeniczne przejście ceny do P_next.
+          4. Reward = realized(@P_exec) + MTM * position * (P_next - P_exec).
+          5. Przygotowanie V i sigma na kolejny krok decyzyjny.
         """
-        e  = self.cfg.env
+        e = self.cfg.env
+        if self._pending_exec_price is None:
+            if self._staged_actions:
+                self.execute_parallel_actions(dict(self._staged_actions))
+            else:
+                self._pending_exec_price = float(self._ref_price)
+                self._pending_net_flow = 0
+                self._prev_net_flow = 0
 
-        # 1. Rynek przechodzi do kolejnego stanu po decyzjach agentów.
-        # Agenci wybierają akcje przy bieżącym (V_t, P_t), a reward używa ruchu P_{t+1} - P_t.
-        ref_price_before = self._ref_price
-        self._advance_market()
-        price_delta = self._ref_price - ref_price_before
+        ref_price_before = float(self._ref_price)
+        exec_price = float(self._pending_exec_price)
+        price_next = self._advance_market(exec_price)
+        price_delta = price_next - exec_price
 
         # 2. Oblicz nagrody
         # MTM = mark-to-market: niezrealizowany zysk/strata z otwartej pozycji
@@ -525,12 +546,17 @@ f"N={self.cfg.env.n_agents}"
             aid: float(reward_arr[i]) for i, aid in enumerate(self.agent_ids)
         }
 
+        self._ref_price = price_next
         self._step_prices.append(self._ref_price)
         self._price_history.append(self._ref_price)
         self._prev_price = self._ref_price
+        self._last_exec_price = exec_price
+        self._last_step_sigma = float(self._sigma_level)
+        self._last_step_crisis = bool(self._crisis_active)
         self._realized_this_step_arr.fill(0.0)
-        self._prev_net_flow = 0
-        self._refresh_signal_cache()
+        self._pending_exec_price = None
+        self._pending_net_flow = 0
+        self._staged_actions = {}
 
         self._step += 1
         done = self._step >= e.episode_steps
@@ -541,6 +567,9 @@ f"N={self.cfg.env.n_agents}"
                     rewards[aid]          = rewards.get(aid, 0.0) + realized
                     self._episode_pnl_arr[self._agent_idx[aid]] += float(realized)
             self._done = True
+        else:
+            self._prepare_next_decision_state()
+            self._refresh_signal_cache()
 
         dones = {aid: done for aid in self.population.agents}
         return rewards, dones
@@ -673,68 +702,69 @@ f"N={self.cfg.env.n_agents}"
 
         return realized_by_agent
 
-    def _advance_market(self) -> None:
-        """Jednokrokowa aktualizacja procesu v1: V_t, stres, momentum i cena P_t."""
+    def _prepare_next_decision_state(self) -> None:
+        """Egzogeniczny update V_t i sigma_t przed kolejną decyzją agentów."""
         md = self.cfg.market
-        env = self.cfg.env
         value_before = float(self._eq_price)
-        price_before = float(self._ref_price)
         self._V_t_prev = value_before
 
-        mu_noise = self.rng.normal(md.mu_drift_mean, md.mu_drift_std)
+        mu_noise = float(self.rng.normal(md.mu_drift_mean, md.mu_drift_std))
         self._trend_mu = (
             md.mu_persistence * self._trend_mu
-            + md.mu_innovation_weight * float(mu_noise)
+            + md.mu_innov_weight * mu_noise
         )
 
         value_jump = 0.0
-        if self.rng.random() < md.value_jump_prob:
-            value_jump = float(self.rng.uniform(md.value_jump_min, md.value_jump_max))
+        u = self.rng.random()
+        if u < md.crash_prob:
+            value_jump = float(self.rng.uniform(md.crash_min, md.crash_max))
+            value_jump *= float(self.rng.choice([-1.0, 1.0]))
+        elif u < (md.crash_prob + md.news_prob):
+            value_jump = float(self.rng.uniform(md.news_min, md.news_max))
             value_jump *= float(self.rng.choice([-1.0, 1.0]))
 
         value_noise = float(self.rng.normal(0.0, md.value_noise_std))
-        value_next = float(np.clip(
+        self._eq_price = float(np.clip(
             value_before + self._trend_mu + value_jump + value_noise,
             md.value_min,
             md.value_max,
         ))
 
-        self._stress_level = (
-            md.stress_reversion * self._stress_level
-            + md.stress_anchor_weight * md.stress_low
+        self._variance_state = float(
+            md.garch_w
+            + md.garch_a * (self._shock_prev ** 2)
+            + md.garch_b * self._variance_state
         )
-        crisis_step = self.rng.random() < md.crisis_prob
-        if crisis_step:
-            self._stress_level = max(
-                self._stress_level,
+        self._variance_state = max(self._variance_state, 1e-12)
+        self._sigma_level = float(np.sqrt(self._variance_state))
+        self._crisis_active = bool(self.rng.random() < md.crisis_prob)
+        if self._crisis_active:
+            self._sigma_level = max(
+                self._sigma_level,
                 float(self.rng.uniform(md.crisis_stress_min, md.crisis_stress_max)),
             )
+
+    def _advance_market(self, exec_price: float) -> float:
+        """Część po egzekucji: P_exec -> P_next bez momentum."""
+        md = self.cfg.market
+        env = self.cfg.env
 
         nu = max(float(md.nu), 3.0)
         student = float(self.rng.standard_t(nu))
         eps_scale = np.sqrt(nu / (nu - 2.0))
-        eps_t = float(self._stress_level * student / eps_scale)
-
+        shock = float(self._sigma_level * student / eps_scale)
         kick = 0.0
-        if crisis_step:
+        if self._crisis_active:
             kick = float(self.rng.uniform(md.kick_min, md.kick_max))
             kick *= float(self.rng.choice([-1.0, 1.0]))
 
-        impact = float(env.k_impact * np.tanh(self._prev_net_flow / max(env.n_agents, 1)))
-        self._price_momentum = (
-            md.psi * self._price_momentum
-            - md.kappa * (price_before - value_before)
-            + eps_t
-            + kick
-        )
         price_next = float(np.clip(
-            price_before + self._price_momentum + impact,
+            exec_price + md.alpha * (self._eq_price - exec_price) + shock + kick,
             env.p_min,
             env.p_max,
         ))
-
-        self._eq_price = value_next
-        self._ref_price = price_next
+        self._shock_prev = shock
+        return price_next
 
     def _refresh_signal_cache(self) -> None:
         if self.population is None:

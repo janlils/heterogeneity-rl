@@ -78,12 +78,14 @@ def ensure_run_config(
         "n_agents": cfg.env.n_agents,
         "market_condition": {
             "init_value": cfg.market.init_value,
-            "psi": cfg.market.psi,
-            "kappa": cfg.market.kappa,
+            "alpha": cfg.market.alpha,
+            "beta": cfg.market.beta,
+            "impact_stress_gain": cfg.market.impact_stress_gain,
             "nu": cfg.market.nu,
-            "stress_low": cfg.market.stress_low,
+            "garch_w": cfg.market.garch_w,
+            "garch_a": cfg.market.garch_a,
+            "garch_b": cfg.market.garch_b,
             "crisis_prob": cfg.market.crisis_prob,
-            "k_impact": cfg.env.k_impact,
         },
         "eval_new_population": eval_new_population,
     })
@@ -178,8 +180,8 @@ def run_sarsa_experiment(
         f"end={sarsa_cfg.epsilon_end:.3f} | decay={sarsa_cfg.epsilon_decay:.3f}"
     )
     log.info(
-        f"Market: v1 | psi={cfg.market.psi:.2f} | kappa={cfg.market.kappa:.2f} | "
-        f"stress_low={cfg.market.stress_low:.3f} | k_impact={cfg.env.k_impact:.3f}"
+        f"Market: v2 | alpha={cfg.market.alpha:.3f} | beta={cfg.market.beta:.3f} | "
+        f"impact_gain={cfg.market.impact_stress_gain:.2f} | crisis_prob={cfg.market.crisis_prob:.3f}"
     )
     log.info("=" * 65)
 

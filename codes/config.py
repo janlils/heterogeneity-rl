@@ -45,7 +45,6 @@ class EnvConfig:
     market_impact:          float = 0.0
     temp_impact:            float = 0.000
     perm_impact:            float = 0.0
-    k_impact:               float = 0.03
     mtm_weight:             float = 0.3
     p_min:                  float = 0.05
     p_max:                  float = 0.95
@@ -69,7 +68,7 @@ class EnvConfig:
 
     @classmethod
     def no_impact(cls) -> "EnvConfig":
-        return cls(half_spread=0.0, temp_impact=0.0, perm_impact=0.0, k_impact=0.0)
+        return cls(half_spread=0.0, temp_impact=0.0, perm_impact=0.0)
 
     def action_name(self, idx: int) -> str:
         return {0: "HOLD", 1: "BUY", 2: "SELL"}.get(idx, f"?{idx}")
@@ -82,41 +81,43 @@ class EnvConfig:
 @dataclass
 class MarketDynamics:
     """
-    Docelowy proces rynku v1:
-      - V_t trenduje i doświadcza rzadkich skoków
-      - stres s_t przełącza rynek między ciszą i kryzysem
-      - P_t jest tłumionym oscylatorem wokół V_t
-      - wpływ agentów jest ograniczony przez k_impact * tanh(flow/N)
+    Proces rynku v2:
+      - V_t jest egzogeniczne: gładkie trendy + newsy + rzadkie załamania,
+      - sigma_t jest egzogenicznym reżimem zmienności typu GARCH + kryzysy,
+      - P_t reaguje na flow agentów PRZED egzekucją i potem dryfuje luźno do V_t.
     """
     init_value:             float = 0.50
     init_mu:                float = 0.0
-    init_stress:            float = 0.004
-    init_momentum:          float = 0.0
+    init_variance:          float = 0.0001
 
     mu_persistence:         float = 0.99
-    mu_innovation_weight:   float = 0.01
+    mu_innov_weight:        float = 0.01
     mu_drift_mean:          float = 0.0002
     mu_drift_std:           float = 0.0004
 
-    value_jump_prob:        float = 0.01
-    value_jump_min:         float = 0.03
-    value_jump_max:         float = 0.07
-    value_noise_std:        float = 0.0007
-    value_min:              float = 0.25
-    value_max:              float = 0.75
+    value_noise_std:        float = 0.0005
+    crash_prob:             float = 0.004
+    crash_min:              float = 0.05
+    crash_max:              float = 0.11
+    news_prob:              float = 0.010
+    news_min:               float = 0.02
+    news_max:               float = 0.04
+    value_min:              float = 0.20
+    value_max:              float = 0.80
 
-    stress_reversion:       float = 0.94
-    stress_anchor_weight:   float = 0.06
-    stress_low:             float = 0.004
-    crisis_prob:            float = 0.012
+    garch_w:                float = 8e-6
+    garch_a:                float = 0.10
+    garch_b:                float = 0.86
+    crisis_prob:            float = 0.010
     crisis_stress_min:      float = 0.020
     crisis_stress_max:      float = 0.035
 
-    psi:                    float = 0.55
-    kappa:                  float = 0.16
+    alpha:                  float = 0.04
+    beta:                   float = 0.025
+    impact_stress_gain:     float = 8.0
     nu:                     float = 5.0
-    kick_min:               float = 0.03
-    kick_max:               float = 0.055
+    kick_min:               float = 0.02
+    kick_max:               float = 0.05
 
     @classmethod
     def stable(cls)    -> "MarketDynamics":
@@ -236,23 +237,23 @@ class LogConfig:
 @dataclass
 class ExpConfig:
     """
-    Grid eksperymentów: D × N × warunek_rynku × algorytm × seed.
+    Docelowa mała siatka benchmarku: D × algorytm × seed.
     """
     diversity_scores:   List[float] = field(
-        default_factory=lambda: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        default_factory=lambda: [0.0, 0.5, 1.0]
     )
     algorithms:         List[str]   = field(
         default_factory=lambda: ["ZI", "DeepSARSA", "PPO", "IPPO"]
     )
     n_agents_list:      List[int]   = field(
-        default_factory=lambda: [20, 50, 100]
+        default_factory=lambda: [50]
     )
     market_conditions:  List[str]   = field(
         default_factory=lambda: ["v1_market"]
     )
-    n_seeds:            int  = 30
-    n_train_episodes:   int  = 1000
-    n_eval_episodes:    int  = 100
+    n_seeds:            int  = 3
+    n_train_episodes:   int  = 500
+    n_eval_episodes:    int  = 30
     base_seed:          int  = 45
 
     @classmethod
@@ -268,11 +269,11 @@ class ExpConfig:
     @classmethod
     def conference_paper(cls) -> "ExpConfig":
         return cls(
-            diversity_scores=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            diversity_scores=[0.0, 0.5, 1.0],
             algorithms=["ZI", "DeepSARSA", "PPO", "IPPO"],
-            n_agents_list=[20, 50],
+            n_agents_list=[50],
             market_conditions=["v1_market"],
-            n_seeds=30, n_train_episodes=1000, n_eval_episodes=100,
+            n_seeds=3, n_train_episodes=500, n_eval_episodes=30,
         )
 
 
@@ -296,6 +297,6 @@ class HTMConfig:
             f"HTM-Speculative | N={self.env.n_agents} | "
             f"actions={self.env.n_actions} | "
             f"episode_steps={self.env.episode_steps} | "
-            f"market=v1(psi={self.market.psi:.2f}, kappa={self.market.kappa:.2f}, "
-            f"stress_low={self.market.stress_low:.3f})"
+            f"market=v2(alpha={self.market.alpha:.3f}, beta={self.market.beta:.3f}, "
+            f"crisis_prob={self.market.crisis_prob:.3f})"
         )
