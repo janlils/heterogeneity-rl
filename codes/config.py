@@ -189,6 +189,7 @@ class DeepSARSAConfig:
     epsilon_decay:  float = 0.993
     grad_clip:      float = 1.0     # gradient clipping
     n_step:         int   = 1       # liczba kroków do przodu dla n-step returns
+    reward_scale:   float = 30.0    # skala rewardu tylko dla ścieżki uczenia Q
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +252,7 @@ class ExpConfig:
     market_conditions:  List[str]   = field(
         default_factory=lambda: ["v1_market"]
     )
-    n_seeds:            int  = 3
+    n_seeds:            int  = 5
     n_train_episodes:   int  = 500
     n_eval_episodes:    int  = 30
     base_seed:          int  = 45
@@ -263,7 +264,7 @@ class ExpConfig:
             algorithms=["ZI", "DeepSARSA"],
             n_agents_list=[50],
             market_conditions=["v1_market"],
-            n_seeds=3, n_train_episodes=200, n_eval_episodes=30,
+            n_seeds=2, n_train_episodes=200, n_eval_episodes=30,
         )
 
     @classmethod
@@ -273,7 +274,7 @@ class ExpConfig:
             algorithms=["ZI", "DeepSARSA", "PPO", "IPPO"],
             n_agents_list=[50],
             market_conditions=["v1_market"],
-            n_seeds=3, n_train_episodes=500, n_eval_episodes=30,
+            n_seeds=5, n_train_episodes=500, n_eval_episodes=30,
         )
 
 
@@ -300,3 +301,196 @@ class HTMConfig:
             f"market=v2(alpha={self.market.alpha:.3f}, beta={self.market.beta:.3f}, "
             f"crisis_prob={self.market.crisis_prob:.3f})"
         )
+
+
+DEFAULT_DIVERSITY_SCORES = [0.0, 0.5, 1.0]
+DEFAULT_QUICK_DIVERSITY_SCORES = [0.0, 0.5, 1.0]
+DEFAULT_N_AGENTS = 50
+DEFAULT_N_EPISODES = 500
+DEFAULT_N_SEEDS = 5
+DEFAULT_EPISODE_STEPS = 500
+DEFAULT_ZI_EPISODES = 30
+DEFAULT_EVAL_EPISODES = 30
+DEFAULT_LOG_EVERY = 25
+DEFAULT_ROLLING_WINDOW = 30
+DEFAULT_MARKET = MarketDynamics.stable()
+
+
+def build_sarsa_benchmark_settings(quick: bool, default_workers: int) -> dict:
+    if quick:
+        return {
+            "run_name": "quick",
+            "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "n_agents": DEFAULT_N_AGENTS,
+            "n_episodes": 20,
+            "episode_steps": 150,
+            "n_seeds": 1,
+            "zi_episodes": 5,
+            "eval_episodes": 10,
+            "log_every": 10,
+            "rolling_window": 5,
+            "n_workers": 4,
+            "market": DEFAULT_MARKET,
+            "sarsa_cfg": DeepSARSAConfig(
+                hidden_size=32,
+                lr=1e-3,
+                epsilon_start=0.30,
+                epsilon_end=0.1,
+                epsilon_decay=0.97,
+                grad_clip=1.0,
+                n_step=4,
+                reward_scale=30.0,
+            ),
+        }
+
+    return {
+        "run_name": "full",
+        "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "n_agents": DEFAULT_N_AGENTS,
+        "n_episodes": DEFAULT_N_EPISODES,
+        "episode_steps": DEFAULT_EPISODE_STEPS,
+        "n_seeds": DEFAULT_N_SEEDS,
+        "zi_episodes": DEFAULT_ZI_EPISODES,
+        "eval_episodes": DEFAULT_EVAL_EPISODES,
+        "log_every": DEFAULT_LOG_EVERY,
+        "rolling_window": DEFAULT_ROLLING_WINDOW,
+        "n_workers": default_workers,
+        "market": DEFAULT_MARKET,
+        "sarsa_cfg": DeepSARSAConfig(
+            hidden_size=64,
+            lr=1e-3,
+            epsilon_start=0.35,
+            epsilon_end=0.05,
+            epsilon_decay=0.993,
+            grad_clip=1.0,
+            n_step=6,
+            reward_scale=30.0,
+        ),
+    }
+
+
+def build_ppo_benchmark_settings(
+    quick: bool,
+    use_agent_id_features: bool,
+    default_workers: int,
+) -> dict:
+    if quick:
+        return {
+            "run_name": "quick",
+            "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "n_agents": DEFAULT_N_AGENTS,
+            "n_episodes": 20,
+            "episode_steps": 150,
+            "n_seeds": 1,
+            "zi_episodes": 5,
+            "eval_episodes": 10,
+            "log_every": 1,
+            "rolling_window": 2,
+            "n_workers": 1,
+            "market": DEFAULT_MARKET,
+            "ppo_cfg": PPOConfig(
+                hidden_size=32,
+                update_epochs=4,
+                minibatch_size=128,
+                rollout_episodes=5,
+                use_agent_id_features=use_agent_id_features,
+            ),
+        }
+
+    return {
+        "run_name": "full",
+        "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "n_agents": DEFAULT_N_AGENTS,
+        "n_episodes": DEFAULT_N_EPISODES,
+        "episode_steps": DEFAULT_EPISODE_STEPS,
+        "n_seeds": DEFAULT_N_SEEDS,
+        "zi_episodes": DEFAULT_ZI_EPISODES,
+        "eval_episodes": DEFAULT_EVAL_EPISODES,
+        "log_every": DEFAULT_LOG_EVERY,
+        "rolling_window": DEFAULT_ROLLING_WINDOW,
+        "n_workers": default_workers,
+        "market": DEFAULT_MARKET,
+        "ppo_cfg": PPOConfig(use_agent_id_features=use_agent_id_features),
+    }
+
+
+def build_ippo_benchmark_settings(quick: bool, default_workers: int) -> dict:
+    if quick:
+        return {
+            "run_name": "quick",
+            "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "n_agents": DEFAULT_N_AGENTS,
+            "n_episodes": 20,
+            "episode_steps": 150,
+            "n_seeds": 1,
+            "zi_episodes": 5,
+            "eval_episodes": 10,
+            "log_every": 1,
+            "rolling_window": 2,
+            "n_workers": 1,
+            "market": DEFAULT_MARKET,
+            "ppo_cfg": PPOConfig(
+                hidden_size=32,
+                update_epochs=3,
+                minibatch_size=128,
+                rollout_episodes=4,
+                use_agent_id_features=False,
+            ),
+        }
+
+    return {
+        "run_name": "full",
+        "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "n_agents": DEFAULT_N_AGENTS,
+        "n_episodes": DEFAULT_N_EPISODES,
+        "episode_steps": DEFAULT_EPISODE_STEPS,
+        "n_seeds": DEFAULT_N_SEEDS,
+        "zi_episodes": DEFAULT_ZI_EPISODES,
+        "eval_episodes": DEFAULT_EVAL_EPISODES,
+        "log_every": DEFAULT_LOG_EVERY,
+        "rolling_window": DEFAULT_ROLLING_WINDOW,
+        "n_workers": default_workers,
+        "market": DEFAULT_MARKET,
+        "ppo_cfg": PPOConfig(
+            hidden_size=48,
+            update_epochs=4,
+            minibatch_size=256,
+            rollout_episodes=5,
+            use_agent_id_features=False,
+        ),
+    }
+
+
+def build_signal_rule_benchmark_settings(quick: bool, default_workers: int) -> dict:
+    if quick:
+        return {
+            "run_name": "quick",
+            "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "n_agents": DEFAULT_N_AGENTS,
+            "n_episodes": 0,
+            "episode_steps": 150,
+            "n_seeds": 1,
+            "zi_episodes": 5,
+            "eval_episodes": 10,
+            "log_every": 1,
+            "rolling_window": 1,
+            "n_workers": 1,
+            "market": DEFAULT_MARKET,
+            "rule_threshold": 0.0,
+        }
+
+    return {
+        "run_name": "full",
+        "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "n_agents": DEFAULT_N_AGENTS,
+        "n_episodes": 0,
+        "episode_steps": DEFAULT_EPISODE_STEPS,
+        "n_seeds": DEFAULT_N_SEEDS,
+        "zi_episodes": DEFAULT_ZI_EPISODES,
+        "eval_episodes": DEFAULT_EVAL_EPISODES,
+        "log_every": 1,
+        "rolling_window": 1,
+        "n_workers": default_workers,
+        "market": DEFAULT_MARKET,
+        "rule_threshold": 0.0,
+    }

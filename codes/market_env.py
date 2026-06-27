@@ -397,10 +397,6 @@ f"N={self.cfg.env.n_agents}"
         obs_batch = self.get_all_observations()
         return {aid: obs_batch[i] for i, aid in enumerate(self.agent_ids)}
 
-    # backward compat alias
-    def reset_market_only(self) -> Dict[str, np.ndarray]:
-        return self.reset_episode()
-
     # -----------------------------------------------------------------------
     # Sekwencyjne wykonanie — właściwy interfejs dla RL
     # -----------------------------------------------------------------------
@@ -1086,8 +1082,6 @@ f"N={self.cfg.env.n_agents}"
             "mean_terminal_pnl":       mean_terminal_pnl,
             "terminal_positive_frac":  float(terminal_positive / max(self.cfg.env.n_agents, 1)),
             "mean_total_pnl":          mean_pnl,
-            # Backward compat alias
-            "allocative_efficiency": positive_pnl_frac,
         }
 
     def agent_metrics(self) -> Dict[str, dict]:

@@ -16,13 +16,13 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from codes.experiment_runner import init_run_artifacts
-from codes.results_store import write_run_config
+from codes.experiment import init_run_artifacts
+from codes.results import write_run_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true", help="Uruchom wybrane benchmarki w trybie quick.")
     parser.add_argument(
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Maksymalna liczba algorytmów uruchamianych równolegle w train_all.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _add_optional(cmd: List[str], flag: str, value) -> None:
@@ -58,7 +58,7 @@ def _add_optional(cmd: List[str], flag: str, value) -> None:
 
 
 def build_sarsa_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
-    cmd = [sys.executable, "-m", "codes.train_deep_sarsa"]
+    cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "sarsa"]
     if args.quick:
         cmd.append("--quick")
     _add_optional(cmd, "--episodes", args.episodes)
@@ -73,7 +73,7 @@ def build_sarsa_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> Lis
 
 
 def build_ppo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
-    cmd = [sys.executable, "-m", "codes.train_ppo"]
+    cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "ppo"]
     if args.quick:
         cmd.append("--quick")
     if args.agent_id_features:
@@ -90,7 +90,7 @@ def build_ppo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[
 
 
 def build_ippo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
-    cmd = [sys.executable, "-m", "codes.train_ippo"]
+    cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "ippo"]
     if args.quick:
         cmd.append("--quick")
     _add_optional(cmd, "--episodes", args.episodes)
@@ -105,7 +105,7 @@ def build_ippo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List
 
 
 def build_signal_rule_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[str]:
-    cmd = [sys.executable, "-m", "codes.train_signal_rule"]
+    cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "signal_rule"]
     if args.quick:
         cmd.append("--quick")
     _add_optional(cmd, "--steps", args.steps)
@@ -328,13 +328,13 @@ def print_eval_comparison(run_dir: Path) -> None:
     print("=" * 194, flush=True)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
     total_t0 = time.time()
     artifacts = init_run_artifacts(args.run_tag, None, None)
     run_id = artifacts.run_id
     run_dir = artifacts.run_dir
-    write_run_config(artifacts.run_config_path, {
+    write_run_config(run_dir / "train_all_config.json", {
         "run_id": artifacts.run_id,
         "run_tag": args.run_tag,
         "timestamp": run_id.split("_", 1)[1] if run_id.startswith("run_") else run_id,

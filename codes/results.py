@@ -70,7 +70,6 @@ EPISODE_FIELDS = [
     "eval_mean_terminal_pnl",
     "pnl_positive_frac",
     "open_positions",
-    "allocative_efficiency",
 ]
 
 AGENT_SAMPLE_FIELDS = [
@@ -213,8 +212,8 @@ def prepare_run_dir(
 def _ensure_csv(path: Path, fieldnames: list[str]) -> None:
     if path.exists():
         return
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
 
 
@@ -223,15 +222,15 @@ def append_rows(path: Path, fieldnames: list[str], rows: Iterable[dict]) -> None
     if not rows:
         return
     _ensure_csv(path, fieldnames)
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         for row in rows:
             writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
 def write_run_config(path: Path, payload: dict) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=True, sort_keys=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=True, sort_keys=True)
 
 
 def latest_run_dir() -> Optional[Path]:
@@ -241,4 +240,4 @@ def latest_run_dir() -> Optional[Path]:
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return max(candidates, key=lambda path: path.stat().st_mtime)
