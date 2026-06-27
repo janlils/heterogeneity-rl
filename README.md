@@ -1,194 +1,174 @@
 # HTM — Heterogeneous Trader Market
 
-Projekt do porównania architektur MARL w heterogenicznym środowisku tradingowym:
-- `Deep SARSA` jako independent per-agent learner
+Projekt do porownania algorytmow RL w heterogenicznym srodowisku tradingowym.
+
+Aktualnie repo zawiera:
+- `Deep SARSA` jako independent per-agent value learner w czystym `numpy`
 - `PPO` jako shared-policy baseline
 - `IPPO` jako light independent policy-gradient baseline
-- `MAPPO` jako centralized-critic PPO
-- `SignalRule` jako prosty benchmark regułowy oparty o prywatny sygnał
+- `SignalRule` jako prosty benchmark regulowy oparty o prywatny sygnal
 
-Aktualna wersja środowiska jest oparta na:
-- fundamentalnej wartości `V_t` (`eq_price`)
-- cenie rynkowej `P_t` (`ref_price`)
-- prywatnym sygnale agenta:
-  `signal_i = clip((V_t - P_t + noise_i) / signal_scale, -1, 1)`
-- heterogeniczności przez `sigma_i`:
-  niski `sigma_i` = lepszy sygnał, wysoki `sigma_i` = bardziej zaszumiony sygnał
+Kod historyczny i stare entrypointy zostaly przeniesione do `codes/old/` i nie sa czescia glownego pipeline'u.
 
-## Zależności
+## Zaleznosci
 
 ```bash
-pip install numpy matplotlib pandas torch
+pip install numpy pandas matplotlib torch
 ```
 
-Kod środowiska i SARSA działa w czystym `numpy`.
-PPO / IPPO / MAPPO wymagają `torch`.
+`Deep SARSA` i rdzen srodowiska dzialaja w `numpy`.
+`PPO` i `IPPO` wymagaja `torch`.
 
-## Najważniejsze entrypointy
+## Najwazniejsze komendy
+
+Pelny benchmark wszystkich aktualnych algorytmow:
 
 ```bash
-# Walidacja środowiska
-python -m codes.double_auction
-
-# Szybki run SARSA
-python -m codes.train_deep_sarsa --quick --run-tag quick_sarsa
-
-# Szybki run PPO
-python -m codes.train_ppo --quick --run-tag quick_ppo
-
-# Szybki run IPPO
-python -m codes.train_ippo --quick --run-tag quick_ippo
-
-# Szybki run MAPPO
-python -m codes.train_mappo --quick --run-tag quick_mappo
-
-# Szybki run SignalRule
-python -m codes.train_signal_rule --quick --run-tag quick_signal_rule
-
-# Uruchom wszystkie benchmarki
-python -m codes.train_all --quick --run-tag quick_all
-
-# Wykresy z najnowszego runu
-python -m codes.visualize
-
-# Debug jednej trajektorii z najnowszego runu
-python -m codes.analyze_debug_run
+./venv/bin/python -m codes.train_all --run-tag full_run
 ```
+
+Szybki smoke test:
+
+```bash
+./venv/bin/python -m codes.train_all --quick --run-tag quick_all
+```
+
+Pojedynczy algorytm:
+
+```bash
+./venv/bin/python -m codes.main train --algo sarsa --run-tag sarsa_run
+./venv/bin/python -m codes.main train --algo ppo --run-tag ppo_run
+./venv/bin/python -m codes.main train --algo ippo --run-tag ippo_run
+./venv/bin/python -m codes.main train --algo signal_rule --run-tag rule_run
+```
+
+Przydatne override'y:
+
+```bash
+./venv/bin/python -m codes.train_all --run-tag custom --seeds 5 --episodes 200 --steps 300 --workers 8
+./venv/bin/python -m codes.main train --algo ppo --agent-id-features --run-tag ppo_agent_id
+./venv/bin/python -m codes.main train --algo sarsa --eval-new-population --run-tag sarsa_eval_new_pop
+```
+
+## Aktualne domyslne ustawienia
+
+Tryb `full`:
+- `D = [0.0, 0.5, 1.0]`
+- `N = 50`
+- `episodes = 500`
+- `steps = 500`
+- `seeds = 5`
+- `ZI baseline = 30`
+- `eval episodes = 30`
+
+Tryb `quick`:
+- `D = [0.0, 0.5, 1.0]`
+- `N = 50`
+- `episodes = 20`
+- `steps = 150`
+- `seeds = 1`
+- `ZI baseline = 5`
+- `eval episodes = 10`
+
+Uwaga:
+- `PPO` ma opcjonalny przełącznik `--agent-id-features`
+- `SignalRule` nie ma treningu, zapisuje tylko wyniki eval
+
+## Model srodowiska
+
+Aktualna wersja rynku to model `v2`:
+- fundamentalna wartosc `V_t` (`eq_price`) jest egzogeniczna
+- cena rynkowa `P_t` (`ref_price`) reaguje na flow agentow przed egzekucja
+- po egzekucji cena dryfuje w kierunku `V_t` z dodatkowym szumem i rzadkimi szokami
+
+Prywatny sygnal agenta:
+
+```text
+signal_i = clip((V_t - P_t + noise_i) / signal_scale, -1, 1)
+```
+
+Heterogenicznosc jest budowana przez:
+- `sigma_i` — jak bardzo zaszumiony jest prywatny sygnal
+- `gamma` — horyzont czasowy agenta
+
+## Obserwacja i akcje
+
+Obserwacja ma 6 wymiarow:
+
+```text
+[signal_i, pos_norm, unrealized, time_rem, price_vs_start, trend_short]
+```
+
+Wazna zgodnosc implementacyjna:
+- `obs[1]` to `position_norm`
+- maskowanie akcji korzysta wlasnie z tego indeksu
+
+Akcje:
+- `HOLD`
+- `BUY`
+- `SELL`
+
+Przy `max_position = 1`:
+- `BUY` zwieksza pozycje o `+1`
+- `SELL` zmniejsza pozycje o `-1`
+
+## Reward i PnL
+
+Reward kroku w srodowisku:
+
+```text
+reward_t = realized_pnl_this_step + mtm_weight * position * (P_{t+1} - P_exec)
+```
+
+Czyli reward laczy:
+- zrealizowany PnL z domkniec pozycji
+- mark-to-market dla otwartej pozycji po ruchu ceny
+
+W logach epizodowych:
+- `trade_accuracy` mierzy udzial zyskownych zamknietych transakcji
+- `mean_total_pnl` oznacza sredni koncowy PnL per agent w epizodzie
+
+## Wyniki
+
+Kazdy run tworzy osobny folder:
+
+```text
+results/run_YYYYMMDD_HHMMSS_tag/
+```
+
+Typowe pliki:
+- `episodes.csv` — metryki train / eval / zi_baseline
+- `agents_sample.csv` — probka danych agentowych z eval
+- `agent_eval_summary.csv` — summary per agent po eval
+- `decision_feature_summary.csv` — korelacje cech obserwacji z kierunkiem decyzji
+- `env_steps.csv` — agregaty srodowiska per krok
+- `run_config.json` — konfiguracja pojedynczego benchmarku
+- `train_all_config.json` — konfiguracja wspolnego runu `train_all`
 
 ## Struktura kodu
 
 ```text
 htm_project/
 ├── codes/
-│   ├── config.py                 # dataclasses i konfiguracja bazowa
-│   ├── double_auction.py         # środowisko HTM + populacja agentów
-│   ├── deep_sarsa.py             # implementacja per-agent Deep SARSA
-│   ├── ppo.py                    # implementacja PPO
-│   ├── train_ippo.py             # entrypoint light-IPPO
-│   ├── train_mappo.py            # entrypoint MAPPO
-│   ├── train_signal_rule.py      # entrypoint benchmarku SignalRule
-│   ├── rule_policies.py          # proste polityki regułowe
-│   ├── experiment_settings.py    # wspólne quick/full settings
-│   ├── evaluation.py             # wspólna warstwa eval
-│   ├── experiment_runner.py      # wspólna orkiestracja runów
-│   ├── results_store.py          # zapis wyników do run folderów
-│   ├── rl_common.py              # wspólne helpery RL / logowania
-│   ├── train_deep_sarsa.py       # entrypoint SARSA
-│   ├── train_ppo.py              # entrypoint PPO
-│   ├── train_all.py              # entrypoint uruchamiający wszystkie benchmarki
-│   ├── visualize.py              # wykresy high-level
-│   └── analyze_debug_run.py      # analiza debugowego epizodu krok-po-kroku
+│   ├── config.py         # centralna konfiguracja
+│   ├── market_env.py     # srodowisko HTM i ZI baseline
+│   ├── algorithms.py     # Deep SARSA + wspolne helpery RL
+│   ├── ppo_core.py       # implementacje PPO i IPPO
+│   ├── experiment.py     # wspolna orkiestracja eksperymentow
+│   ├── main.py           # pojedynczy punkt wejscia dla treningu algorytmow
+│   ├── train_all.py      # runner wszystkich benchmarkow
+│   ├── reporting.py      # wykresy i raporty
+│   ├── results.py        # zapis wynikow do run folderow
+│   └── old/              # starsze, nieuzywane wersje kodu
 ├── results/
 ├── plots/
-└── tests/
-```
-
-## Wyniki i logowanie
-
-Każdy run tworzy osobny folder:
-
-```text
-results/run_YYYYMMDD_HHMMSS_tag/
-```
-
-W środku są:
-- `episodes.csv` — metryki epizodowe dla train / eval / zi_baseline
-- `agent_eval_summary.csv` — lekki summary per agent z końcowego eval (PnL, accuracy, buy/sell/hold, signal alignment)
-- `decision_feature_summary.csv` — lekki summary per `(algorithm, D, seed)` z siłą predykcyjną cech obserwacji względem kierunku decyzji
-- `article_summary.csv` — zbiorczy summary pod sekcję Results (`algorithm × D`)
-- `agents_sample.csv` — pełny debug ostatniego epizodu eval dla `D=1.0`, `seed=0`
-- `env_steps.csv` — agregaty środowiska per krok dla tego samego debug epizodu
-- `run_config.json` — konfiguracja runu
-
-## Aktualny model środowiska
-
-### Obserwacja
-
-Obserwacja ma 8 wymiarów:
-
-```text
-[signal_i, pos_norm, unrealized, time_rem,
- gamma, price_vs_start, trend_short, sigma_norm]
-```
-
-Ważna zgodność:
-- `obs[1]` to nadal `position_norm`
-- maskowanie akcji w SARSA i helperach używa właśnie tego indeksu
-
-### Akcje
-
-Akcje są trzy:
-- `HOLD`
-- `BUY`
-- `SELL`
-
-Przy `max_position = 1` są to de facto akcje zmiany inventory:
-- `BUY` zwiększa pozycję o `+1`, jeśli agent nie jest już max long
-- `SELL` zmniejsza pozycję o `-1`, jeśli agent nie jest już max short
-
-### Cena i wartość
-
-- `V_t` dryfuje w czasie jako proces AR(1)
-- `P_t` przechodzi do kolejnego kroku przez mean reversion do `V_t` oraz szum ceny
-- obecnie decyzje agentów nie mają permanentnego impactu na cenę, jeśli `perm_impact = 0`
-
-### Reward
-
-Reward kroku:
-
-```text
-reward = realized_pnl_this_step + mtm_weight * position * (P_{t+1} - P_t)
-```
-
-czyli:
-- `realized` — zysk/strata z zamknięć pozycji
-- `MTM` — mark-to-market dla otwartej pozycji po ruchu ceny
-
-## Debug mechanizmu sygnału
-
-Najbardziej użyteczne narzędzie do sprawdzenia:
-- czy sygnał przewiduje ruch ceny,
-- czy agenci reagują zgodnie z sygnałem,
-- czy te decyzje dają reward / PnL,
-
-to:
-
-```bash
-python -m codes.analyze_debug_run
-```
-
-Skrypt generuje w `results/run_.../debug_analysis/`:
-- `summary.json`
-- `sigma_bucket_summary.csv`
-- `signal_quality_by_sigma.csv`
-- `agent_decision_summary.csv`
-- wykresy diagnostyczne PNG
-
-Najważniejsze pola w `summary.json`:
-- `env_signal.corr_mean_signal_to_price_delta`
-- `agent_decisions.signal_action_alignment`
-- `agent_decisions.reward_when_aligned`
-- `agent_reward.corr_sigma_to_reward`
-- `diagnostic_checks.*`
-
-## Wykresy
-
-High-level wykresy z run folderów:
-
-```bash
-python -m codes.visualize
-```
-
-Wolniejsze wykresy z nowych symulacji:
-
-```bash
-python -m codes.visualize --simulate-diagnostics
+├── logs/
+└── README.md
 ```
 
 ## Uwagi praktyczne
 
-- `quick` używa obecnie tylko `D = [0.5]`
-- `quick` i `full` są teraz definiowane centralnie w `codes/experiment_settings.py`
-- runnery SARSA/PPO/IPPO/MAPPO są cienkimi entrypointami, a wspólna orkiestracja jest w `codes/experiment_runner.py`
-- eval same-population i debug logging przechodzą przez wspólne `codes/evaluation.py`
-- `SignalRule` nie ma treningu; zapisuje tylko rekordy `eval_same_population` i opcjonalnie `eval_new_population`
+- Glowny aktualny interfejs to `codes.main` i `codes.train_all`
+- `codes/old/` jest zachowane tylko referencyjnie
+- katalogi `results/`, `plots/` i `logs/` sa generowane automatycznie
+- lokalne cache `.matplotlib_cache/` i `.cache/` sa ignorowane przez Git
