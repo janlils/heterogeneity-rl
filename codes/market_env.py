@@ -33,7 +33,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from codes.config import HTMConfig, EnvConfig, SentimentConfig, DiversityConfig, MarketDynamics
+from codes.config import (
+    HTMConfig,
+    EnvConfig,
+    SentimentConfig,
+    DiversityConfig,
+    MarketDynamics,
+    normalize_fixed_gamma,
+)
 
 _log = logging.getLogger("htm.auction")
 
@@ -56,6 +63,8 @@ class AgentParams:
     position:           int   = 0
     entry_price:        float = 0.0
     realized_pnl:       float = 0.0
+    gross_realized_pnl: float = 0.0
+    transaction_cost_paid: float = 0.0
     n_trades_closed:    int   = 0
     n_trades_won:       int   = 0
 
@@ -64,6 +73,8 @@ class AgentParams:
         self.position        = 0
         self.entry_price     = 0.0
         self.realized_pnl    = 0.0
+        self.gross_realized_pnl = 0.0
+        self.transaction_cost_paid = 0.0
         self.n_trades_closed = 0
         self.n_trades_won    = 0
 
@@ -153,6 +164,8 @@ class AgentPopulation:
         Dolna granica 0.80: agent z γ<0.80 ma bardzo krótki horyzont
         przy T=200 — niestabilna nauka, bez sensu ekonomicznego.
         """
+        if cfg.fixed_gamma is not None:
+            return float(normalize_fixed_gamma(cfg.fixed_gamma))
         if not cfg.gamma_spread or d < 1e-6:
             return 0.90
         gamma_lo = 0.95 - trader_type * 0.15
@@ -197,7 +210,7 @@ class DoubleAuction:
       krótki trend oraz poziom szumu agenta.
 
     Reward:
-      realized_pnl_this_step + składnik MTM (bez kar mid-episode).
+      realized_pnl_this_step netto (po koszcie transakcyjnym) + składnik MTM.
     """
 
     def __init__(self, cfg: HTMConfig, seed: Optional[int] = None):
@@ -209,6 +222,8 @@ class DoubleAuction:
         self._positions_arr = np.zeros(0, dtype=np.int32)
         self._entry_prices_arr = np.zeros(0, dtype=np.float32)
         self._realized_pnl_arr = np.zeros(0, dtype=np.float32)
+        self._gross_realized_pnl_arr = np.zeros(0, dtype=np.float32)
+        self._transaction_cost_arr = np.zeros(0, dtype=np.float32)
         self._n_trades_closed_arr = np.zeros(0, dtype=np.int32)
         self._n_trades_won_arr = np.zeros(0, dtype=np.int32)
         self._sigma_i_arr = np.zeros(0, dtype=np.float32)
@@ -230,6 +245,8 @@ class DoubleAuction:
         self._price_window:       List[float]      = []
         self._episode_pnl_arr = np.zeros(0, dtype=np.float32)
         self._realized_this_step_arr = np.zeros(0, dtype=np.float32)
+        self._gross_realized_this_step_arr = np.zeros(0, dtype=np.float32)
+        self._transaction_cost_this_step_arr = np.zeros(0, dtype=np.float32)
         self._price_history:      List[float]      = []
         self._n_fills:            int              = 0
         self._n_position_closes:  int              = 0
@@ -256,6 +273,8 @@ class DoubleAuction:
         p.position = int(self._positions_arr[idx])
         p.entry_price = float(self._entry_prices_arr[idx])
         p.realized_pnl = float(self._realized_pnl_arr[idx])
+        p.gross_realized_pnl = float(self._gross_realized_pnl_arr[idx])
+        p.transaction_cost_paid = float(self._transaction_cost_arr[idx])
         p.n_trades_closed = int(self._n_trades_closed_arr[idx])
         p.n_trades_won = int(self._n_trades_won_arr[idx])
 
@@ -266,6 +285,8 @@ class DoubleAuction:
             self._positions_arr = np.zeros(0, dtype=np.int32)
             self._entry_prices_arr = np.zeros(0, dtype=np.float32)
             self._realized_pnl_arr = np.zeros(0, dtype=np.float32)
+            self._gross_realized_pnl_arr = np.zeros(0, dtype=np.float32)
+            self._transaction_cost_arr = np.zeros(0, dtype=np.float32)
             self._n_trades_closed_arr = np.zeros(0, dtype=np.int32)
             self._n_trades_won_arr = np.zeros(0, dtype=np.int32)
             self._sigma_i_arr = np.zeros(0, dtype=np.float32)
@@ -273,6 +294,8 @@ class DoubleAuction:
             self._max_position_arr = np.zeros(0, dtype=np.int32)
             self._episode_pnl_arr = np.zeros(0, dtype=np.float32)
             self._realized_this_step_arr = np.zeros(0, dtype=np.float32)
+            self._gross_realized_this_step_arr = np.zeros(0, dtype=np.float32)
+            self._transaction_cost_this_step_arr = np.zeros(0, dtype=np.float32)
             self._terminal_pnl_arr = np.zeros(0, dtype=np.float32)
             return
         self.agent_ids = list(self.population.agents.keys())
@@ -281,6 +304,8 @@ class DoubleAuction:
         self._positions_arr = np.array([p.position for p in agents], dtype=np.int32)
         self._entry_prices_arr = np.array([p.entry_price for p in agents], dtype=np.float32)
         self._realized_pnl_arr = np.array([p.realized_pnl for p in agents], dtype=np.float32)
+        self._gross_realized_pnl_arr = np.array([p.gross_realized_pnl for p in agents], dtype=np.float32)
+        self._transaction_cost_arr = np.array([p.transaction_cost_paid for p in agents], dtype=np.float32)
         self._n_trades_closed_arr = np.array([p.n_trades_closed for p in agents], dtype=np.int32)
         self._n_trades_won_arr = np.array([p.n_trades_won for p in agents], dtype=np.int32)
         self._sigma_i_arr = np.array([p.sigma_i for p in agents], dtype=np.float32)
@@ -289,6 +314,8 @@ class DoubleAuction:
         n = len(agents)
         self._episode_pnl_arr = np.zeros(n, dtype=np.float32)
         self._realized_this_step_arr = np.zeros(n, dtype=np.float32)
+        self._gross_realized_this_step_arr = np.zeros(n, dtype=np.float32)
+        self._transaction_cost_this_step_arr = np.zeros(n, dtype=np.float32)
         self._terminal_pnl_arr = np.zeros(n, dtype=np.float32)
 
     # -----------------------------------------------------------------------
@@ -514,7 +541,7 @@ f"N={self.cfg.env.n_agents}"
           1. Jeśli trzeba, zbierz zbuforowane akcje do jednej egzekucji.
           2. Fill wszystkich akcji po P_exec = P + impact(flow, sigma).
           3. Egzogeniczne przejście ceny do P_next.
-          4. Reward = realized(@P_exec) + MTM * position * (P_next - P_exec).
+          4. Reward = realized_net(@P_exec) + MTM * position * (P_next - P_exec).
           5. Przygotowanie V i sigma na kolejny krok decyzyjny.
         """
         e = self.cfg.env
@@ -550,6 +577,8 @@ f"N={self.cfg.env.n_agents}"
         self._last_step_sigma = float(self._sigma_level)
         self._last_step_crisis = bool(self._crisis_active)
         self._realized_this_step_arr.fill(0.0)
+        self._gross_realized_this_step_arr.fill(0.0)
+        self._transaction_cost_this_step_arr.fill(0.0)
         self._pending_exec_price = None
         self._pending_net_flow = 0
         self._staged_actions = {}
@@ -599,6 +628,9 @@ f"N={self.cfg.env.n_agents}"
         if len(self._price_window) > 20:
             self._price_window.pop(0)
 
+    def _transaction_cost(self, units: int = 1) -> float:
+        return float(max(units, 0) * self.cfg.env.transaction_cost_per_fill)
+
     def _execute_fill(self, agent_id: str, side: str, p_exec: float) -> float:
         """
         Rozlicza jedną jednostkę pozycji po cenie wykonania.
@@ -608,13 +640,13 @@ f"N={self.cfg.env.n_agents}"
         """
         idx = self._agent_idx[agent_id]
         old = int(self._positions_arr[idx])
-        realized = 0.0
+        gross_realized = 0.0
         entry_price = float(self._entry_prices_arr[idx])
 
         if side == "buy":
             if old < 0:
-                realized = entry_price - p_exec
-                self._register_close(idx, realized)
+                gross_realized = entry_price - p_exec
+                self._register_close(idx, gross_realized)
                 if old + 1 == 0:
                     self._entry_prices_arr[idx] = 0.0
             elif old == 0:
@@ -625,8 +657,8 @@ f"N={self.cfg.env.n_agents}"
 
         elif side == "sell":
             if old > 0:
-                realized = p_exec - entry_price
-                self._register_close(idx, realized)
+                gross_realized = p_exec - entry_price
+                self._register_close(idx, gross_realized)
                 if old - 1 == 0:
                     self._entry_prices_arr[idx] = 0.0
             elif old == 0:
@@ -637,14 +669,20 @@ f"N={self.cfg.env.n_agents}"
         else:
             raise ValueError(f"Unknown side: {side}")
 
-        self._realized_pnl_arr[idx] += float(realized)
-        self._realized_this_step_arr[idx] += float(realized)
+        transaction_cost = self._transaction_cost(units=1)
+        realized_net = float(gross_realized - transaction_cost)
+        self._gross_realized_pnl_arr[idx] += float(gross_realized)
+        self._transaction_cost_arr[idx] += float(transaction_cost)
+        self._realized_pnl_arr[idx] += realized_net
+        self._gross_realized_this_step_arr[idx] += float(gross_realized)
+        self._transaction_cost_this_step_arr[idx] += float(transaction_cost)
+        self._realized_this_step_arr[idx] += realized_net
         self._sync_agent_from_idx(idx)
         _log.debug(
             f"  FILL {agent_id} {side} pos:{old}->{int(self._positions_arr[idx])} "
-            f"p={p_exec:.4f} r={realized:.4f}"
+            f"p={p_exec:.4f} gross={gross_realized:.4f} cost={transaction_cost:.4f} net={realized_net:.4f}"
         )
-        return realized
+        return realized_net
 
     def _register_close(self, idx: int, realized: float) -> None:
         self._n_trades_closed_arr[idx] += 1
@@ -671,30 +709,35 @@ f"N={self.cfg.env.n_agents}"
 
         for aid in self.agent_ids:
             idx = self._agent_idx[aid]
-            total = 0.0
+            total_gross = 0.0
+            total_cost = 0.0
             position = int(self._positions_arr[idx])
             entry_price = float(self._entry_prices_arr[idx])
 
             while position > 0:
                 p_exec = float(np.clip(self._ref_price, e.p_min, e.p_max))
                 realized = p_exec - entry_price
-                total += realized
-                self._realized_pnl_arr[idx] += float(realized)
+                total_gross += realized
+                total_cost += self._transaction_cost(units=1)
                 position -= 1
 
             while position < 0:
                 p_exec = float(np.clip(self._ref_price, e.p_min, e.p_max))
                 realized = entry_price - p_exec
-                total += realized
-                self._realized_pnl_arr[idx] += float(realized)
+                total_gross += realized
+                total_cost += self._transaction_cost(units=1)
                 position += 1
 
+            total_net = float(total_gross - total_cost)
+            self._gross_realized_pnl_arr[idx] += float(total_gross)
+            self._transaction_cost_arr[idx] += float(total_cost)
+            self._realized_pnl_arr[idx] += total_net
             self._positions_arr[idx] = 0
             self._entry_prices_arr[idx] = 0.0
-            self._terminal_pnl_arr[idx] = float(total)
+            self._terminal_pnl_arr[idx] = total_net
             self._sync_agent_from_idx(idx)
-            if total != 0.0:
-                realized_by_agent[aid] = total
+            if total_net != 0.0:
+                realized_by_agent[aid] = total_net
 
         return realized_by_agent
 
@@ -994,9 +1037,15 @@ f"N={self.cfg.env.n_agents}"
         prices  = self._price_history
         # Realized P&L agentów (z zamkniętych pozycji)
         pnls_arr = self._episode_pnl_arr.astype(np.float32, copy=False)
+        gross_pnls_arr = self._gross_realized_pnl_arr.astype(np.float32, copy=False)
+        transaction_cost_arr = self._transaction_cost_arr.astype(np.float32, copy=False)
         pnls = {aid: float(pnls_arr[i]) for i, aid in enumerate(self.agent_ids)}
         pnl_vals = pnls_arr.tolist()
+        gross_pnl_vals = gross_pnls_arr.tolist()
+        transaction_cost_vals = transaction_cost_arr.tolist()
         mean_pnl = float(np.mean(pnl_vals)) if pnl_vals else 0.0
+        mean_pnl_gross = float(np.mean(gross_pnl_vals)) if gross_pnl_vals else 0.0
+        mean_transaction_cost = float(np.mean(transaction_cost_vals)) if transaction_cost_vals else 0.0
         positive_pnl = int(np.sum(pnls_arr > 0))
 
         # Trade accuracy: ile zamkniętych transakcji było zyskownych
@@ -1054,6 +1103,7 @@ f"N={self.cfg.env.n_agents}"
         return {
             "mean_pnl":            mean_pnl,
             "mean_realized_pnl":   mean_pnl,
+            "mean_realized_pnl_gross": mean_pnl_gross,
             "pnl_positive_agents": positive_pnl,
             "positive_pnl_frac":   positive_pnl_frac,
             "gini_pnl":            _gini([max(0, v) for v in pnls.values()]),
@@ -1079,9 +1129,11 @@ f"N={self.cfg.env.n_agents}"
             "action_buy_frac":     n_buy  / n_acts,
             "action_sell_frac":    n_sell / n_acts,
             "action_hold_frac":    n_hold / n_acts,
+            "mean_transaction_cost":   mean_transaction_cost,
             "mean_terminal_pnl":       mean_terminal_pnl,
             "terminal_positive_frac":  float(terminal_positive / max(self.cfg.env.n_agents, 1)),
             "mean_total_pnl":          mean_pnl,
+            "mean_total_pnl_gross":    mean_pnl_gross,
         }
 
     def agent_metrics(self) -> Dict[str, dict]:
@@ -1093,6 +1145,8 @@ f"N={self.cfg.env.n_agents}"
                 "entry_price":     float(self._entry_prices_arr[self._agent_idx[aid]]),
                 "ep_pnl":          float(self._episode_pnl_arr[self._agent_idx[aid]]),
                 "realized_pnl":    float(self._realized_pnl_arr[self._agent_idx[aid]]),
+                "gross_realized_pnl": float(self._gross_realized_pnl_arr[self._agent_idx[aid]]),
+                "transaction_cost_paid": float(self._transaction_cost_arr[self._agent_idx[aid]]),
                 "n_trades_closed": int(self._n_trades_closed_arr[self._agent_idx[aid]]),
                 "n_trades_won":    int(self._n_trades_won_arr[self._agent_idx[aid]]),
                 "trade_accuracy":  float(

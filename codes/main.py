@@ -3,6 +3,7 @@ Jeden punkt wejścia do głównych zadań projektu.
 
 Przykłady:
     python -m codes.main train-all --quick
+    python -m codes.main train-all --medium
     python -m codes.main train --algo ppo --quick
     python -m codes.main train --algo signal_rule --quick
 """

@@ -68,6 +68,7 @@ def plot_sarsa_learning_curves(
     diversity_scores: List[float],
     rolling_window: int,
     n_agents: int,
+    algorithm_label: str = "Deep SARSA",
     logger: Optional[logging.Logger] = None,
 ) -> None:
     df = pd.DataFrame(all_records)
@@ -81,7 +82,7 @@ def plot_sarsa_learning_curves(
         axes = axes.reshape(2, 1)
 
     fig.suptitle(
-        f"Deep SARSA — krzywe uczenia | N={n_agents} agentów | model spekulacyjny",
+        f"{algorithm_label} — krzywe uczenia | N={n_agents} agentów | model spekulacyjny",
         fontsize=13,
         fontweight="bold",
     )
@@ -105,7 +106,7 @@ def plot_sarsa_learning_curves(
             alpha=0.15,
             color=color,
         )
-        ax.plot(eps_idx, smooth, color=color, lw=2.5, label="Deep SARSA")
+        ax.plot(eps_idx, smooth, color=color, lw=2.5, label=algorithm_label)
         if zi is not None:
             ax.axhline(zi, color="gray", ls="--", lw=1.5, label=f"ZI ({zi:.3f})", alpha=0.8)
 
@@ -161,6 +162,7 @@ def plot_sarsa_final_comparison(
     save_path: Path,
     diversity_scores: List[float],
     n_episodes: int,
+    algorithm_label: str = "Deep SARSA",
     logger: Optional[logging.Logger] = None,
 ) -> None:
     df = pd.DataFrame(all_records)
@@ -177,7 +179,7 @@ def plot_sarsa_final_comparison(
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     fig.suptitle(
-        f"Deep SARSA vs ZI Baseline — końcowe wyniki (ostatnie {final_window} epizodów)\n"
+        f"{algorithm_label} vs ZI Baseline — końcowe wyniki (ostatnie {final_window} epizodów)\n"
         "Model spekulacyjny: N agentów z prywatnymi wycenami",
         fontsize=12,
         fontweight="bold",
@@ -191,7 +193,7 @@ def plot_sarsa_final_comparison(
     sarsa_stds = [sarsa_eff.loc[d, "std"] if d in sarsa_eff.index else 0 for d in d_vals]
     zi_means = [zi_baselines.get(d, 0) for d in d_vals]
 
-    ax.bar(x - w / 2, sarsa_means, w, yerr=sarsa_stds, label="Deep SARSA", color="#1565C0", alpha=0.85, capsize=4, error_kw={"lw": 1.5})
+    ax.bar(x - w / 2, sarsa_means, w, yerr=sarsa_stds, label=algorithm_label, color="#1565C0", alpha=0.85, capsize=4, error_kw={"lw": 1.5})
     ax.bar(x + w / 2, zi_means, w, label="ZI Baseline", color="#616161", alpha=0.75)
 
     for i, (sm, zm) in enumerate(zip(sarsa_means, zi_means)):

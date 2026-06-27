@@ -3,6 +3,7 @@ Uruchamia benchmarki Deep SARSA, PPO, IPPO i SignalRule jednym poleceniem.
 
 Przykłady:
     python -m codes.train_all --quick
+    python -m codes.train_all --medium
     python -m codes.train_all --quick --episodes 20 --steps 200 --eval-episodes 10
     python -m codes.train_all --quick --agent-id-features
 """
@@ -22,9 +23,19 @@ from codes.results import write_run_config
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def resolve_cli_benchmark_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "quick", False):
+        return "quick"
+    if getattr(args, "medium", False):
+        return "medium"
+    return "full"
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Uruchom wybrane benchmarki w trybie quick.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--quick", action="store_true", help="Uruchom wybrane benchmarki w trybie quick.")
+    mode_group.add_argument("--medium", action="store_true", help="Uruchom wybrane benchmarki w trybie pośrednim.")
     parser.add_argument(
         "--only",
         choices=["all", "sarsa", "ppo", "ippo", "signal_rule"],
@@ -35,6 +46,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--steps", type=int, help="Override liczby kroków w epizodzie dla wszystkich algorytmów.")
     parser.add_argument("--seeds", type=int, help="Override liczby seedów dla wszystkich algorytmów.")
     parser.add_argument("--agents", type=int, help="Override liczby agentów dla wszystkich algorytmów.")
+    parser.add_argument("--max-position", type=int, help="Override maksymalnej pozycji |position| per agent dla wszystkich algorytmów.")
+    parser.add_argument("--gamma-spread", action="store_true", help="Włącz dodatkową heterogeniczność gamma obok sigma_i.")
+    parser.add_argument("--fixed-gamma", type=float, help="Ustaw wspólną gammę wszystkich agentów, np. 0.90.")
+    parser.add_argument("--transaction-cost", type=float, help="Koszt transakcyjny odejmowany od każdego wykonanego filla.")
     parser.add_argument("--zi-episodes", type=int, help="Override liczby epizodów ZI baseline dla wszystkich algorytmów.")
     parser.add_argument("--eval-episodes", type=int, help="Override liczby epizodów eval dla wszystkich algorytmów.")
     parser.add_argument("--workers", type=int, help="Override workerów dla SARSA, PPO, IPPO i SignalRule.")
@@ -61,10 +76,17 @@ def build_sarsa_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> Lis
     cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "sarsa"]
     if args.quick:
         cmd.append("--quick")
+    elif args.medium:
+        cmd.append("--medium")
     _add_optional(cmd, "--episodes", args.episodes)
     _add_optional(cmd, "--steps", args.steps)
     _add_optional(cmd, "--seeds", args.seeds)
     _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--max-position", args.max_position)
+    if args.gamma_spread:
+        cmd.append("--gamma-spread")
+    _add_optional(cmd, "--fixed-gamma", args.fixed_gamma)
+    _add_optional(cmd, "--transaction-cost", args.transaction_cost)
     _add_optional(cmd, "--zi-episodes", args.zi_episodes)
     _add_optional(cmd, "--eval-episodes", args.eval_episodes)
     _add_optional(cmd, "--workers", args.workers)
@@ -76,12 +98,19 @@ def build_ppo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List[
     cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "ppo"]
     if args.quick:
         cmd.append("--quick")
+    elif args.medium:
+        cmd.append("--medium")
     if args.agent_id_features:
         cmd.append("--agent-id-features")
     _add_optional(cmd, "--episodes", args.episodes)
     _add_optional(cmd, "--steps", args.steps)
     _add_optional(cmd, "--seeds", args.seeds)
     _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--max-position", args.max_position)
+    if args.gamma_spread:
+        cmd.append("--gamma-spread")
+    _add_optional(cmd, "--fixed-gamma", args.fixed_gamma)
+    _add_optional(cmd, "--transaction-cost", args.transaction_cost)
     _add_optional(cmd, "--zi-episodes", args.zi_episodes)
     _add_optional(cmd, "--eval-episodes", args.eval_episodes)
     _add_optional(cmd, "--workers", args.workers)
@@ -93,10 +122,17 @@ def build_ippo_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) -> List
     cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "ippo"]
     if args.quick:
         cmd.append("--quick")
+    elif args.medium:
+        cmd.append("--medium")
     _add_optional(cmd, "--episodes", args.episodes)
     _add_optional(cmd, "--steps", args.steps)
     _add_optional(cmd, "--seeds", args.seeds)
     _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--max-position", args.max_position)
+    if args.gamma_spread:
+        cmd.append("--gamma-spread")
+    _add_optional(cmd, "--fixed-gamma", args.fixed_gamma)
+    _add_optional(cmd, "--transaction-cost", args.transaction_cost)
     _add_optional(cmd, "--zi-episodes", args.zi_episodes)
     _add_optional(cmd, "--eval-episodes", args.eval_episodes)
     _add_optional(cmd, "--workers", args.workers)
@@ -108,9 +144,16 @@ def build_signal_rule_cmd(args: argparse.Namespace, run_id: str, run_dir: Path) 
     cmd = [sys.executable, "-m", "codes.main", "train", "--algo", "signal_rule"]
     if args.quick:
         cmd.append("--quick")
+    elif args.medium:
+        cmd.append("--medium")
     _add_optional(cmd, "--steps", args.steps)
     _add_optional(cmd, "--seeds", args.seeds)
     _add_optional(cmd, "--agents", args.agents)
+    _add_optional(cmd, "--max-position", args.max_position)
+    if args.gamma_spread:
+        cmd.append("--gamma-spread")
+    _add_optional(cmd, "--fixed-gamma", args.fixed_gamma)
+    _add_optional(cmd, "--transaction-cost", args.transaction_cost)
     _add_optional(cmd, "--zi-episodes", args.zi_episodes)
     _add_optional(cmd, "--eval-episodes", args.eval_episodes)
     _add_optional(cmd, "--workers", args.workers)
@@ -253,7 +296,8 @@ def print_eval_comparison(run_dir: Path) -> None:
 
     episodes = pd.read_csv(episodes_csv)
     eval_df = episodes[episodes["phase"].astype(str).str.startswith("eval")].copy()
-    sarsa = eval_df[eval_df["algorithm"].astype(str).str.contains("SARSA", case=False, na=False)]
+    algo_col = eval_df["algorithm"].astype(str)
+    sarsa = eval_df[algo_col.str.contains("SARSA", case=False, na=False)]
     ippo = eval_df[eval_df["algorithm"].astype(str).str.contains("IPPO", case=False, na=False)]
     signal_rule = eval_df[eval_df["algorithm"].astype(str).str.contains("SIGNAL_RULE", case=False, na=False)]
     ppo = eval_df[eval_df["algorithm"].astype(str).str.match(r"^PPO", case=False, na=False)]
@@ -276,10 +320,9 @@ def print_eval_comparison(run_dir: Path) -> None:
     print("=" * 194, flush=True)
     print("PORÓWNANIE EVAL — SARSA vs PPO vs IPPO vs SignalRule", flush=True)
     print(
-        f"{'D':>5} | {'ZI':>6} | {'SARSA acc':>9} | {'PPO acc':>7} | {'IPPO acc':>8} | {'Rule acc':>8} | "
-        f"{'PPO-S':>7} | {'IPPO-S':>8} | {'Rule-S':>8} | "
-        f"{'SARSA pnl':>9} | {'PPO pnl':>8} | {'IPPO pnl':>9} | {'Rule pnl':>9} | "
-        f"{'SARSA Closed':>12} | {'PPO Closed':>10} | {'IPPO Closed':>11} | {'Rule Closed':>11}",
+        f"{'D':>5} | {'ZI':>6} | {'SARSA acc':>10} | {'PPO acc':>7} | {'IPPO acc':>8} | {'Rule acc':>8} | "
+        f"{'SARSA pnl':>10} | {'PPO pnl':>8} | {'IPPO pnl':>9} | {'Rule pnl':>9} | "
+        f"{'SARSA Closed':>13} | {'PPO Closed':>10} | {'IPPO Closed':>11} | {'Rule Closed':>11}",
         flush=True,
     )
     print("-" * 194, flush=True)
@@ -294,9 +337,6 @@ def print_eval_comparison(run_dir: Path) -> None:
         p_acc = _mean_or_none(p_d, "trade_accuracy")
         i_acc = _mean_or_none(i_d, "trade_accuracy")
         r_acc = _mean_or_none(r_d, "trade_accuracy")
-        delta_p = None if s_acc is None or p_acc is None else p_acc - s_acc
-        delta_i = None if s_acc is None or i_acc is None else i_acc - s_acc
-        delta_r = None if s_acc is None or r_acc is None else r_acc - s_acc
         zi = _mean_or_none(s_d, "zi_baseline_trade_accuracy")
         if zi is None:
             zi = _mean_or_none(p_d, "zi_baseline_trade_accuracy")
@@ -315,10 +355,9 @@ def print_eval_comparison(run_dir: Path) -> None:
         r_closed = _mean_or_none(r_d, "n_trades_closed")
 
         print(
-            f"{d:5.1f} | {_fmt(zi, 6)} | {_fmt(s_acc, 9)} | {_fmt(p_acc, 7)} | {_fmt(i_acc, 8)} | {_fmt(r_acc, 8)} | "
-            f"{_fmt(delta_p, 7)} | {_fmt(delta_i, 8)} | {_fmt(delta_r, 8)} | "
-            f"{_fmt(s_pnl, 9, 4)} | {_fmt(p_pnl, 8, 4)} | {_fmt(i_pnl, 9, 4)} | {_fmt(r_pnl, 9, 4)} | "
-            f"{_fmt(s_closed, 12, 1)} | {_fmt(p_closed, 10, 1)} | {_fmt(i_closed, 11, 1)} | {_fmt(r_closed, 11, 1)}",
+            f"{d:5.1f} | {_fmt(zi, 6)} | {_fmt(s_acc, 10)} | {_fmt(p_acc, 7)} | {_fmt(i_acc, 8)} | {_fmt(r_acc, 8)} | "
+            f"{_fmt(s_pnl, 10, 4)} | {_fmt(p_pnl, 8, 4)} | {_fmt(i_pnl, 9, 4)} | {_fmt(r_pnl, 9, 4)} | "
+            f"{_fmt(s_closed, 13, 1)} | {_fmt(p_closed, 10, 1)} | {_fmt(i_closed, 11, 1)} | {_fmt(r_closed, 11, 1)}",
             flush=True,
         )
 
@@ -339,12 +378,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         "run_tag": args.run_tag,
         "timestamp": run_id.split("_", 1)[1] if run_id.startswith("run_") else run_id,
         "algorithm": "train_all",
+        "mode": resolve_cli_benchmark_mode(args),
         "quick": args.quick,
+        "medium": args.medium,
         "only": args.only,
         "episodes": args.episodes,
         "steps": args.steps,
         "seeds": args.seeds,
         "agents": args.agents,
+        "max_position": args.max_position,
+        "gamma_spread": args.gamma_spread,
+        "fixed_gamma": args.fixed_gamma,
+        "transaction_cost": args.transaction_cost,
         "zi_episodes": args.zi_episodes,
         "eval_episodes": args.eval_episodes,
         "workers": args.workers,

@@ -51,6 +51,9 @@ from codes.config import (
     build_ppo_benchmark_settings,
     build_sarsa_benchmark_settings,
     build_signal_rule_benchmark_settings,
+    diversity_mode_name,
+    normalize_benchmark_mode,
+    normalize_fixed_gamma,
 )
 from codes.market_env import DoubleAuction, ZeroIntelligenceAgent
 from codes.results import (
@@ -73,6 +76,33 @@ from codes.reporting import (
 T = TypeVar("T")
 R = TypeVar("R")
 log = logging.getLogger("htm.experiment")
+
+
+def resolve_cli_benchmark_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "quick", False):
+        return "quick"
+    if getattr(args, "medium", False):
+        return "medium"
+    return "full"
+
+
+def resolve_cli_use_gamma_spread(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "gamma_spread", False))
+
+
+def resolve_cli_fixed_gamma(args: argparse.Namespace) -> float | None:
+    return normalize_fixed_gamma(getattr(args, "fixed_gamma", None))
+
+
+def fixed_gamma_log_fragment(cfg: HTMConfig) -> str:
+    if cfg.diversity.fixed_gamma is None:
+        return ""
+    return f" | fixed_gamma={cfg.diversity.fixed_gamma:.2f}"
+
+
+def build_artifact_stem(base_name: str, run_name: str) -> str:
+    run_name = normalize_benchmark_mode(run_name)
+    return base_name if run_name == "full" else f"{base_name}_{run_name}"
 
 def _action_for_policy(algorithm_name: str, policy, obs, aid: str) -> int:
     name = algorithm_name.lower()
@@ -121,6 +151,8 @@ def _build_record(
         "mean_pnl": metrics.get("mean_pnl", 0.0),
         "pnl_positive_frac": positive_pnl_frac,
         "trade_accuracy": trade_acc,
+        "mean_total_pnl_gross": metrics.get("mean_total_pnl_gross", metrics.get("mean_total_pnl", 0.0)),
+        "mean_transaction_cost": metrics.get("mean_transaction_cost", 0.0),
         "n_trades": metrics.get("n_trades", 0),
         "n_trades_closed": metrics.get("n_trades_closed", 0),
         "n_position_closes": metrics.get("n_position_closes", 0),
@@ -137,6 +169,7 @@ def _build_record(
         "zi_baseline_trade_accuracy": zi_baseline_trade_accuracy,
         "zi_baseline_positive_pnl_frac": zi_baseline_positive_pnl_frac,
         "primary_metric": "trade_accuracy",
+        "transaction_cost_per_fill": cfg.env.transaction_cost_per_fill,
         "beats_zi": trade_acc > zi_baseline_trade_accuracy,
         "positive_pnl_frac": positive_pnl_frac,
         "zi_baseline": zi_baseline_trade_accuracy,
@@ -234,9 +267,10 @@ def evaluate_sarsa(
     seed: int,
     zi_baseline_trade_accuracy: Optional[float] = None,
     zi_baseline_positive_pnl_frac: Optional[float] = None,
+    algorithm_name: str = "DeepSARSA_EVAL",
  ) -> tuple[List[dict], List[dict], List[dict]]:
     return evaluate_policy(
-        "DeepSARSA_EVAL",
+        algorithm_name,
         policy,
         cfg,
         diversity_score,
@@ -358,6 +392,14 @@ def evaluate_same_population(
                 aid: da.population.agents[aid].realized_pnl
                 for aid in agent_ids
             }
+            gross_realized_before = {
+                aid: da.population.agents[aid].gross_realized_pnl
+                for aid in agent_ids
+            }
+            transaction_cost_before = {
+                aid: da.population.agents[aid].transaction_cost_paid
+                for aid in agent_ids
+            }
             for aid in agent_ids:
                 obs = da.get_observation(aid)
                 obs_by_agent[aid] = obs
@@ -389,7 +431,9 @@ def evaluate_same_population(
                     else:
                         agent_type = "mieszany"
                     executed = agent.position != positions_before[aid]
+                    gross_realized_pnl_this_step = float(agent.gross_realized_pnl - gross_realized_before[aid])
                     realized_pnl_this_step = float(agent.realized_pnl - realized_before[aid])
+                    transaction_cost_this_step = float(agent.transaction_cost_paid - transaction_cost_before[aid])
                     sample_rows.append(build_agent_sample_row(
                         algorithm=algorithm_name,
                         phase=phase,
@@ -414,8 +458,12 @@ def evaluate_same_population(
                         position=agent.position,
                         entry_price_after=agent.entry_price,
                         reward_this_step=float(rewards.get(aid, 0.0)),
+                        gross_realized_pnl_this_step=gross_realized_pnl_this_step,
                         realized_pnl_this_step=realized_pnl_this_step,
+                        transaction_cost_this_step=transaction_cost_this_step,
+                        gross_realized_pnl_cum=agent.gross_realized_pnl,
                         realized_pnl_cum=agent.realized_pnl,
+                        transaction_cost_cum=agent.transaction_cost_paid,
                         n_trades_closed=agent.n_trades_closed,
                         sigma_i=agent.sigma_i,
                     ))
@@ -434,7 +482,15 @@ def evaluate_same_population(
                 n_sell = sum(1 for aid, delta in position_changes.items() if delta < 0)
                 n_hold = sum(1 for aid in agent_ids if actions[aid] == cfg.env.ACTION_HOLD)
                 net_flow_actual = int(sum(position_changes.values()))
+                gross_realized_vals = [
+                    float(da.population.agents[aid].gross_realized_pnl - gross_realized_before[aid])
+                    for aid in agent_ids
+                ]
                 realized_vals = [float(da.population.agents[aid].realized_pnl - realized_before[aid]) for aid in agent_ids]
+                transaction_cost_vals = [
+                    float(da.population.agents[aid].transaction_cost_paid - transaction_cost_before[aid])
+                    for aid in agent_ids
+                ]
                 reward_vals = [float(rewards.get(aid, 0.0)) for aid in agent_ids]
                 env_step_rows.append(build_env_step_row(
                     algorithm=algorithm_name,
@@ -463,7 +519,9 @@ def evaluate_same_population(
                     n_hold=n_hold,
                     net_flow=net_flow_actual,
                     mean_reward=float(np.mean(reward_vals)),
+                    mean_gross_realized_pnl=float(np.mean(gross_realized_vals)),
                     mean_realized_pnl=float(np.mean(realized_vals)),
+                    mean_transaction_cost=float(np.mean(transaction_cost_vals)),
                     mean_mtm=float(np.mean([r - x for r, x in zip(reward_vals, realized_vals)])),
                     n_executed=sum(1 for delta in position_changes.values() if delta != 0),
                     n_trades_closed_cum=sum(da.population.agents[aid].n_trades_closed for aid in agent_ids),
@@ -659,14 +717,23 @@ def ensure_run_config(
         ),
         "algorithm": algorithm,
         "diversity_scores": settings["diversity_scores"],
+        "diversity_mode": settings.get("diversity_mode", diversity_mode_name(cfg.diversity)),
+        "diversity_config": {
+            "sigma_spread": bool(cfg.diversity.sigma_spread),
+            "gamma_spread": bool(cfg.diversity.gamma_spread),
+            "fixed_gamma": cfg.diversity.fixed_gamma,
+        },
         "n_seeds": settings["n_seeds"],
         "n_episodes": settings["n_episodes"],
         "n_agents": cfg.env.n_agents,
+        "max_position": cfg.env.max_position,
         "market_condition": {
             "init_value": cfg.market.init_value,
             "alpha": cfg.market.alpha,
             "beta": cfg.market.beta,
             "impact_stress_gain": cfg.market.impact_stress_gain,
+            "transaction_cost_per_fill": cfg.env.transaction_cost_per_fill,
+            "max_position": cfg.env.max_position,
             "nu": cfg.market.nu,
             "garch_w": cfg.market.garch_w,
             "garch_a": cfg.market.garch_a,
@@ -808,6 +875,10 @@ def run_sarsa_experiment(
     plot_learning_curves: Callable[..., None],
     plot_final_comparison: Callable[..., None],
     plot_agent_eval_distribution: Callable[..., None],
+    algorithm_name: str = "DeepSARSA",
+    display_name: str = "Deep SARSA",
+    summary_label: str = "SARSA",
+    output_stem_base: str = "deep_sarsa",
 ) -> None:
     import pandas as pd
     import numpy as np
@@ -830,11 +901,12 @@ def run_sarsa_experiment(
     n_workers = settings["n_workers"]
     sarsa_cfg = settings["sarsa_cfg"]
     run_name = settings["run_name"]
-    output_stem = "deep_sarsa" if run_name == "full" else f"deep_sarsa_{run_name}"
+    output_stem = output_stem_base if run_name == "full" else f"{output_stem_base}_{run_name}"
 
     log.info("=" * 65)
-    log.info("HTM Benchmark — Deep SARSA (model spekulacyjny)")
+    log.info(f"HTM Benchmark — {display_name} (model spekulacyjny)")
     log.info(f"Tryb: {run_name}")
+    log.info(f"Heterogeniczność: {settings['diversity_mode']}")
     log.info(f"N={n_agents} | D={diversity_scores} | ep={n_episodes} | steps/ep={episode_steps} | seeds={n_seeds}")
     log.info(f"Łączne kroki per agent per D: {n_episodes}×{episode_steps}={n_episodes*episode_steps}")
     log.info(
@@ -843,7 +915,9 @@ def run_sarsa_experiment(
     )
     log.info(
         f"Market: v2 | alpha={cfg.market.alpha:.3f} | beta={cfg.market.beta:.3f} | "
-        f"impact_gain={cfg.market.impact_stress_gain:.2f} | crisis_prob={cfg.market.crisis_prob:.3f}"
+        f"impact_gain={cfg.market.impact_stress_gain:.2f} | crisis_prob={cfg.market.crisis_prob:.3f} | "
+        f"max_pos={cfg.env.max_position}{fixed_gamma_log_fragment(cfg)} | "
+        f"tx_cost={cfg.env.transaction_cost_per_fill:.5f}"
     )
     log.info("=" * 65)
 
@@ -853,7 +927,7 @@ def run_sarsa_experiment(
     ensure_run_config(
         artifacts=artifacts,
         run_tag=args.run_tag,
-        algorithm="DeepSARSA",
+        algorithm=algorithm_name,
         settings=settings,
         cfg=cfg,
         eval_new_population=args.eval_new_population,
@@ -987,7 +1061,7 @@ def run_sarsa_experiment(
 
     if not eval_df.empty:
         log.info("")
-        log.info("EWALUACJA SARSA — ta sama populacja treningowa, reset_episode(), explore=False")
+        log.info(f"EWALUACJA {summary_label} — ta sama populacja treningowa, reset_episode(), explore=False")
         log.info(
             f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
             f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
@@ -1012,7 +1086,7 @@ def run_sarsa_experiment(
 
     if not eval_new_df.empty:
         log.info("")
-        log.info("EWALUACJA SARSA — nowa populacja, seed+1000, explore=False")
+        log.info(f"EWALUACJA {summary_label} — nowa populacja, seed+1000, explore=False")
         log.info(
             f"{'D':>5} | {'eval acc':>8} | {'ZI acc':>7} | {'eval pnl':>9} | "
             f"{'term':>8} | {'Trades':>7} | {'Closed':>7}"
@@ -1070,13 +1144,15 @@ def run_ppo_experiment(
     agent_eval_summary_csv = artifacts.agent_eval_summary_csv
     decision_feature_summary_csv = artifacts.decision_feature_summary_csv
 
-    run_name = artifact_stem or ("ppo_quick" if args.quick else "ppo")
+    run_name = build_artifact_stem(artifact_stem or algorithm_label.lower(), settings["run_name"])
     log.info("=" * 70)
     log.info(
         f"{algorithm_label} | {run_name} | N={cfg.env.n_agents} | D={settings['diversity_scores']} | "
         f"ep={settings['n_episodes']} | steps={cfg.env.episode_steps} | "
         f"seeds={settings['n_seeds']} | workers={settings['n_workers']} | "
-        f"agent_id_features={cfg.ppo.use_agent_id_features}"
+        f"hetero={settings['diversity_mode']} | agent_id_features={cfg.ppo.use_agent_id_features} | "
+        f"max_pos={cfg.env.max_position}{fixed_gamma_log_fragment(cfg)} | "
+        f"tx_cost={cfg.env.transaction_cost_per_fill:.5f}"
     )
     log.info("=" * 70)
 
@@ -1191,16 +1267,17 @@ def run_ppo_experiment(
 
 def evaluate_trained_sarsa_same_population(
     da: DoubleAuction,
-    sarsa: DeepSARSAMultiAgent,
+    sarsa_policy,
     diversity_score: float,
     seed: int,
     cfg: HTMConfig,
     n_eval_episodes: int,
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
+    algorithm_name: str = "DeepSARSA_EVAL_SAME_POPULATION",
 ) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
     def action_selector(aid: str, obs: np.ndarray) -> int:
-        return int(sarsa.agents[aid].act(obs, explore=False))
+        return int(sarsa_policy.agents[aid].act(obs, explore=False))
 
     extra_builder = build_standard_eval_extra_builder(
         cfg,
@@ -1214,12 +1291,30 @@ def evaluate_trained_sarsa_same_population(
         diversity_score=diversity_score,
         seed=seed,
         n_eval_episodes=n_eval_episodes,
-        algorithm_name="DeepSARSA_EVAL_SAME_POPULATION",
+        algorithm_name=algorithm_name,
         action_selector=action_selector,
         extra_builder=extra_builder,
         collect_coordination=False,
     )
     return records, sample_rows, agent_eval_rows, feature_rows, env_step_rows
+
+
+def _build_sarsa_policy(
+    *,
+    agent_ids: List[str],
+    agent_gammas: np.ndarray,
+    cfg: HTMConfig,
+    sarsa_cfg: DeepSARSAConfig,
+    seed: int,
+):
+    return DeepSARSAMultiAgent(
+        agent_ids=agent_ids,
+        agent_gammas=agent_gammas,
+        n_obs=cfg.env.n_obs,
+        n_actions=cfg.env.n_actions,
+        cfg=sarsa_cfg,
+        seed=seed,
+    )
 
 def run_sarsa_training(
     diversity_score: float,
@@ -1230,7 +1325,9 @@ def run_sarsa_training(
     zi_baseline_positive_pnl_frac: float,
     sarsa_cfg:       DeepSARSAConfig,
     log_every:       int,
- ) -> tuple[List[dict], List[dict], List[dict], DeepSARSAMultiAgent, DoubleAuction]:
+    record_algorithm_name: str = "DeepSARSA_CT",
+    eval_algorithm_name: str = "DeepSARSA_EVAL",
+ ) -> tuple[List[dict], List[dict], List[dict], object, DoubleAuction]:
     """
     Trenuje Deep SARSA — Continuous Trading.
 
@@ -1254,10 +1351,12 @@ def run_sarsa_training(
         f"gamma=[{min(gammas_pop):.2f}, {max(gammas_pop):.2f}] mean={np.mean(gammas_pop):.3f}"
     )
 
-    sarsa = DeepSARSAMultiAgent(
-        agent_ids=agent_ids, agent_gammas=agent_gammas,
-        n_obs=cfg.env.n_obs, n_actions=cfg.env.n_actions,
-        cfg=sarsa_cfg, seed=seed,
+    sarsa = _build_sarsa_policy(
+        agent_ids=agent_ids,
+        agent_gammas=agent_gammas,
+        cfg=cfg,
+        sarsa_cfg=sarsa_cfg,
+        seed=seed,
     )
 
     # Parametry populacji — stałe przez cały run, zapisywane do każdego rekordu
@@ -1355,7 +1454,7 @@ def run_sarsa_training(
             seed=seed,
             cfg=cfg,
             metrics=m,
-            algorithm="DeepSARSA_CT",
+            algorithm=record_algorithm_name,
             zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
             zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
             extra={
@@ -1375,13 +1474,15 @@ def run_sarsa_training(
             )
             short_eval_records, _, _, _, _ = evaluate_trained_sarsa(
                 da=da,
-                sarsa=sarsa,
+                sarsa_policy=sarsa,
                 diversity_score=diversity_score,
                 seed=seed + 1000,
                 cfg=cfg,
                 n_eval_episodes=5,
                 zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
                 zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+                eval_algorithm_name=eval_algorithm_name,
+                eval_same_population_algorithm_name=f"{eval_algorithm_name}_SAME_POPULATION",
             )
             learning_curve_records.append({
                 "episode": episode + 1,
@@ -1415,7 +1516,7 @@ def run_sarsa_training(
 
 def evaluate_trained_sarsa(
     da: DoubleAuction,
-    sarsa: DeepSARSAMultiAgent,
+    sarsa_policy,
     diversity_score: float,
     seed: int,
     cfg: HTMConfig,
@@ -1423,6 +1524,8 @@ def evaluate_trained_sarsa(
     zi_baseline_trade_accuracy: float,
     zi_baseline_positive_pnl_frac: float,
     same_population: bool = True,
+    eval_algorithm_name: str = "DeepSARSA_EVAL",
+    eval_same_population_algorithm_name: str = "DeepSARSA_EVAL_SAME_POPULATION",
 ) -> tuple[List[dict], List[dict], List[dict], List[dict], List[dict]]:
     """
     Ewaluacja wytrenowanej polityki z końcowym epsilonem i bez update'ów sieci.
@@ -1432,41 +1535,44 @@ def evaluate_trained_sarsa(
     if same_population:
         return evaluate_trained_sarsa_same_population(
             da=da,
-            sarsa=sarsa,
+            sarsa_policy=sarsa_policy,
             diversity_score=diversity_score,
             seed=seed,
             cfg=cfg,
             n_eval_episodes=n_eval_episodes,
             zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
             zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+            algorithm_name=eval_same_population_algorithm_name,
         )
 
     eval_seed = seed if seed >= 1000 else seed + 1000
     records, sample_rows, env_step_rows = evaluate_sarsa(
-        sarsa,
+        sarsa_policy,
         cfg,
         diversity_score,
         n_eval_episodes,
         eval_seed,
         zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
+        algorithm_name=eval_algorithm_name,
     )
     return records, sample_rows, [], [], env_step_rows
 
-def _sarsa_train_worker(args: tuple) -> list:
-    """
-    Uruchamia run_training dla jednej kombinacji (D, seed).
-    Musi być funkcją modułu (nie lambda) żeby pickle działał.
-    Każdy worker ma własny proces — brak konfliktów między sieciami.
-    """
-    # numpy-only — brak zależności PyTorch, nic do konfigurowania
+def _run_sarsa_worker(
+    args: tuple,
+    *,
+    worker_log_prefix: str,
+    record_algorithm_name: str,
+    eval_algorithm_name: str,
+    eval_same_population_algorithm_name: str,
+) -> list:
     (
         diversity_score, seed, cfg, zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac, n_episodes, n_eval_episodes,
         sarsa_cfg, log_every, eval_new_population,
     ) = args
     global log
-    log = configure_worker_logger(f"sarsa_worker_D{diversity_score:.1f}_seed{seed}.log")
+    log = configure_worker_logger(f"{worker_log_prefix}_D{diversity_score:.1f}_seed{seed}.log")
     train_records, _learning_curve_records, _agent_diagnostics, sarsa, da = run_sarsa_training(
         diversity_score = diversity_score,
         n_episodes      = n_episodes,
@@ -1476,10 +1582,12 @@ def _sarsa_train_worker(args: tuple) -> list:
         zi_baseline_positive_pnl_frac = zi_baseline_positive_pnl_frac,
         sarsa_cfg       = sarsa_cfg,
         log_every       = log_every,
+        record_algorithm_name = record_algorithm_name,
+        eval_algorithm_name = eval_algorithm_name,
     )
     eval_same_population_records, sample_rows, agent_eval_rows, decision_feature_rows, env_step_rows = evaluate_trained_sarsa(
         da=da,
-        sarsa=sarsa,
+        sarsa_policy=sarsa,
         diversity_score=diversity_score,
         seed=seed,
         cfg=cfg,
@@ -1487,12 +1595,14 @@ def _sarsa_train_worker(args: tuple) -> list:
         zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
         zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
         same_population=True,
+        eval_algorithm_name=eval_algorithm_name,
+        eval_same_population_algorithm_name=eval_same_population_algorithm_name,
     )
     eval_new_population_records: List[dict] = []
     if eval_new_population:
         eval_new_population_records, _, _, _, _ = evaluate_trained_sarsa(
             da=da,
-            sarsa=sarsa,
+            sarsa_policy=sarsa,
             diversity_score=diversity_score,
             seed=seed + 1000,
             cfg=cfg,
@@ -1500,20 +1610,47 @@ def _sarsa_train_worker(args: tuple) -> list:
             zi_baseline_trade_accuracy=zi_baseline_trade_accuracy,
             zi_baseline_positive_pnl_frac=zi_baseline_positive_pnl_frac,
             same_population=False,
+            eval_algorithm_name=eval_algorithm_name,
+            eval_same_population_algorithm_name=eval_same_population_algorithm_name,
         )
     return train_records, eval_same_population_records, eval_new_population_records, sample_rows, agent_eval_rows, decision_feature_rows, env_step_rows
 
+
+def _sarsa_train_worker(args: tuple) -> list:
+    """
+    Uruchamia run_training dla jednej kombinacji (D, seed).
+    Musi być funkcją modułu (nie lambda) żeby pickle działał.
+    Każdy worker ma własny proces — brak konfliktów między sieciami.
+    """
+    return _run_sarsa_worker(
+        args,
+        worker_log_prefix="sarsa_worker",
+        record_algorithm_name="DeepSARSA_CT",
+        eval_algorithm_name="DeepSARSA_EVAL",
+        eval_same_population_algorithm_name="DeepSARSA_EVAL_SAME_POPULATION",
+    )
+
 def parse_sarsa_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Trening Deep SARSA dla HTM.")
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--quick",
         action="store_true",
         help="Szybki smoke trening: mniej D, seedów, epizodów i kroków.",
+    )
+    mode_group.add_argument(
+        "--medium",
+        action="store_true",
+        help="Pośredni preset do szybkiego sprawdzania kierunku uczenia.",
     )
     parser.add_argument("--episodes", type=int, help="Nadpisz liczbę epizodów treningu.")
     parser.add_argument("--steps", type=int, help="Nadpisz liczbę kroków w epizodzie.")
     parser.add_argument("--seeds", type=int, help="Nadpisz liczbę seedów.")
     parser.add_argument("--agents", type=int, help="Nadpisz liczbę agentów.")
+    parser.add_argument("--max-position", type=int, help="Nadpisz maksymalną pozycję |position| per agent.")
+    parser.add_argument("--gamma-spread", action="store_true", help="Włącz dodatkową heterogeniczność gamma obok sigma_i.")
+    parser.add_argument("--fixed-gamma", type=float, help="Ustaw wspólną gammę wszystkich agentów, np. 0.90.")
+    parser.add_argument("--transaction-cost", type=float, help="Koszt transakcyjny odejmowany od każdego wykonanego filla.")
     parser.add_argument("--zi-episodes", type=int, help="Nadpisz liczbę epizodów ZI baseline.")
     parser.add_argument("--eval-episodes", type=int, help="Nadpisz liczbę epizodów ewaluacji bez eksploracji.")
     parser.add_argument("--workers", type=int, help="Nadpisz liczbę workerów.")
@@ -1528,7 +1665,12 @@ def parse_sarsa_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 def build_sarsa_run_settings(args: argparse.Namespace) -> dict:
-    settings = build_sarsa_benchmark_settings(args.quick, default_workers=cpu_count())
+    settings = build_sarsa_benchmark_settings(
+        resolve_cli_benchmark_mode(args),
+        default_workers=cpu_count(),
+        use_gamma_spread=resolve_cli_use_gamma_spread(args),
+        fixed_gamma=resolve_cli_fixed_gamma(args),
+    )
 
     if args.episodes is not None:
         settings["n_episodes"] = args.episodes
@@ -1538,6 +1680,10 @@ def build_sarsa_run_settings(args: argparse.Namespace) -> dict:
         settings["n_seeds"] = args.seeds
     if args.agents is not None:
         settings["n_agents"] = args.agents
+    if args.max_position is not None:
+        settings["max_position"] = args.max_position
+    if args.transaction_cost is not None:
+        settings["transaction_cost_per_fill"] = max(0.0, float(args.transaction_cost))
     if args.zi_episodes is not None:
         settings["zi_episodes"] = args.zi_episodes
     if args.eval_episodes is not None:
@@ -1549,6 +1695,7 @@ def build_sarsa_run_settings(args: argparse.Namespace) -> dict:
     settings["episode_steps"] = max(1, settings["episode_steps"])
     settings["n_seeds"] = max(1, settings["n_seeds"])
     settings["n_agents"] = max(1, settings["n_agents"])
+    settings["max_position"] = max(1, int(settings["max_position"]))
     settings["zi_episodes"] = max(1, settings["zi_episodes"])
     settings["eval_episodes"] = max(1, settings["eval_episodes"])
     max_workers = settings["n_seeds"] * len(settings["diversity_scores"])
@@ -1556,6 +1703,20 @@ def build_sarsa_run_settings(args: argparse.Namespace) -> dict:
     settings["log_every"] = max(1, min(settings["log_every"], settings["n_episodes"]))
     settings["rolling_window"] = max(1, min(settings["rolling_window"], settings["n_episodes"]))
     return settings
+
+def make_sarsa_cfg(settings: dict) -> HTMConfig:
+    return HTMConfig(
+        env=EnvConfig(
+            n_agents=settings["n_agents"],
+            episode_steps=settings["episode_steps"],
+            max_position=settings["max_position"],
+            transaction_cost_per_fill=settings["transaction_cost_per_fill"],
+        ),
+        market=settings["market"],
+        diversity=settings["diversity_cfg"],
+        log=LogConfig(level="INFO", save_to_file=True, save_plots=True),
+        sarsa=settings["sarsa_cfg"],
+    )
 
 def plot_learning_curves(
     all_records:  List[dict],
@@ -1572,6 +1733,7 @@ def plot_learning_curves(
         diversity_scores=diversity_scores,
         rolling_window=rolling_window,
         n_agents=n_agents,
+        algorithm_label="Deep SARSA",
         logger=log,
     )
 
@@ -1588,6 +1750,7 @@ def plot_final_comparison(
         save_path=save_path,
         diversity_scores=diversity_scores,
         n_episodes=n_episodes,
+        algorithm_label="Deep SARSA",
         logger=log,
     )
 
@@ -1610,12 +1773,7 @@ def run_sarsa_cli(argv: Optional[List[str]] = None):
     settings = build_sarsa_run_settings(args)
     artifacts = init_run_artifacts(args.run_tag, args.run_id, args.run_dir)
     log = configure_experiment_logger(artifacts, "deep_sarsa.log")
-    cfg = HTMConfig(
-        env    = EnvConfig(n_agents=settings["n_agents"], episode_steps=settings["episode_steps"]),
-        market = settings["market"],
-        log    = LogConfig(level="INFO", save_to_file=True, save_plots=True),
-        sarsa  = settings["sarsa_cfg"],
-    )
+    cfg = make_sarsa_cfg(settings)
     run_sarsa_experiment(
         log=log,
         project_root=PROJECT_ROOT,
@@ -1629,6 +1787,10 @@ def run_sarsa_cli(argv: Optional[List[str]] = None):
         plot_learning_curves=plot_learning_curves,
         plot_final_comparison=plot_final_comparison,
         plot_agent_eval_distribution=plot_agent_eval_distribution,
+        algorithm_name="DeepSARSA",
+        display_name="Deep SARSA",
+        summary_label="SARSA",
+        output_stem_base="deep_sarsa",
     )
 
 def evaluate_trained_ppo_same_population(
@@ -1674,11 +1836,13 @@ def evaluate_trained_ppo_same_population(
     )
     return records, sample_rows, agent_eval_rows, feature_rows, env_step_rows
 
-def build_ppo_run_settings(quick: bool, args) -> dict:
+def build_ppo_run_settings(mode: str, args) -> dict:
     settings = build_ppo_benchmark_settings(
-        quick=quick,
+        mode=mode,
         use_agent_id_features=args.agent_id_features,
         default_workers=cpu_count(),
+        use_gamma_spread=resolve_cli_use_gamma_spread(args),
+        fixed_gamma=resolve_cli_fixed_gamma(args),
     )
 
     if args.episodes is not None:
@@ -1689,6 +1853,10 @@ def build_ppo_run_settings(quick: bool, args) -> dict:
         settings["n_seeds"] = args.seeds
     if args.agents is not None:
         settings["n_agents"] = args.agents
+    if args.max_position is not None:
+        settings["max_position"] = args.max_position
+    if args.transaction_cost is not None:
+        settings["transaction_cost_per_fill"] = max(0.0, float(args.transaction_cost))
     if args.zi_episodes is not None:
         settings["zi_episodes"] = args.zi_episodes
     if args.eval_episodes is not None:
@@ -1696,6 +1864,7 @@ def build_ppo_run_settings(quick: bool, args) -> dict:
     if args.workers is not None:
         settings["n_workers"] = args.workers
 
+    settings["max_position"] = max(1, int(settings["max_position"]))
     max_workers = settings["n_seeds"] * len(settings["diversity_scores"])
     settings["n_workers"] = max(1, min(settings["n_workers"], max_workers))
     settings["log_every"] = max(1, min(settings["log_every"], settings["n_episodes"]))
@@ -1707,8 +1876,11 @@ def make_ppo_cfg(settings: dict) -> HTMConfig:
         env=EnvConfig(
             n_agents=settings["n_agents"],
             episode_steps=settings["episode_steps"],
+            max_position=settings["max_position"],
+            transaction_cost_per_fill=settings["transaction_cost_per_fill"],
         ),
         market=settings["market"],
+        diversity=settings["diversity_cfg"],
         ppo=settings["ppo_cfg"],
         log=LogConfig(level="INFO", save_to_file=True, save_plots=True),
     )
@@ -2114,11 +2286,17 @@ def _ppo_train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict], 
 def run_ppo_cli(argv: List[str] | None = None) -> None:
     global log
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Szybki smoke test PPO")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--quick", action="store_true", help="Szybki smoke test PPO")
+    mode_group.add_argument("--medium", action="store_true", help="Pośredni preset PPO do szybkiego testu kierunku uczenia.")
     parser.add_argument("--episodes", type=int, help="Override liczby epizodów.")
     parser.add_argument("--steps", type=int, help="Override liczby kroków w epizodzie.")
     parser.add_argument("--seeds", type=int, help="Override liczby seedów.")
     parser.add_argument("--agents", type=int, help="Override liczby agentów.")
+    parser.add_argument("--max-position", type=int, help="Override maksymalnej pozycji |position| per agent.")
+    parser.add_argument("--gamma-spread", action="store_true", help="Włącz dodatkową heterogeniczność gamma obok sigma_i.")
+    parser.add_argument("--fixed-gamma", type=float, help="Ustaw wspólną gammę wszystkich agentów, np. 0.90.")
+    parser.add_argument("--transaction-cost", type=float, help="Koszt transakcyjny odejmowany od każdego wykonanego filla.")
     parser.add_argument("--zi-episodes", type=int, help="Override liczby epizodów ZI baseline.")
     parser.add_argument("--eval-episodes", type=int, help="Override liczby epizodów eval.")
     parser.add_argument(
@@ -2141,7 +2319,7 @@ def run_ppo_cli(argv: List[str] | None = None) -> None:
     parser.add_argument("--run-dir", type=str, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    settings = build_ppo_run_settings(args.quick, args)
+    settings = build_ppo_run_settings(resolve_cli_benchmark_mode(args), args)
     cfg = make_ppo_cfg(settings)
     cfg.exp.n_eval_episodes = settings["eval_episodes"]
     cfg.exp.diversity_scores = list(settings["diversity_scores"])
@@ -2204,8 +2382,13 @@ def evaluate_trained_ippo_same_population(
     )
     return records, sample_rows, agent_eval_rows, feature_rows, env_step_rows
 
-def build_ippo_run_settings(quick: bool, args) -> dict:
-    settings = build_ippo_benchmark_settings(quick=quick, default_workers=cpu_count())
+def build_ippo_run_settings(mode: str, args) -> dict:
+    settings = build_ippo_benchmark_settings(
+        mode=mode,
+        default_workers=cpu_count(),
+        use_gamma_spread=resolve_cli_use_gamma_spread(args),
+        fixed_gamma=resolve_cli_fixed_gamma(args),
+    )
     if args.episodes is not None:
         settings["n_episodes"] = args.episodes
     if args.steps is not None:
@@ -2214,12 +2397,17 @@ def build_ippo_run_settings(quick: bool, args) -> dict:
         settings["n_seeds"] = args.seeds
     if args.agents is not None:
         settings["n_agents"] = args.agents
+    if args.max_position is not None:
+        settings["max_position"] = args.max_position
+    if args.transaction_cost is not None:
+        settings["transaction_cost_per_fill"] = max(0.0, float(args.transaction_cost))
     if args.zi_episodes is not None:
         settings["zi_episodes"] = args.zi_episodes
     if args.eval_episodes is not None:
         settings["eval_episodes"] = args.eval_episodes
     if args.workers is not None:
         settings["n_workers"] = args.workers
+    settings["max_position"] = max(1, int(settings["max_position"]))
     max_workers = settings["n_seeds"] * len(settings["diversity_scores"])
     settings["n_workers"] = max(1, min(settings["n_workers"], max_workers))
     settings["log_every"] = max(1, min(settings["log_every"], settings["n_episodes"]))
@@ -2231,8 +2419,11 @@ def make_ippo_cfg(settings: dict) -> HTMConfig:
         env=EnvConfig(
             n_agents=settings["n_agents"],
             episode_steps=settings["episode_steps"],
+            max_position=settings["max_position"],
+            transaction_cost_per_fill=settings["transaction_cost_per_fill"],
         ),
         market=settings["market"],
+        diversity=settings["diversity_cfg"],
         ppo=settings["ppo_cfg"],
         log=LogConfig(level="INFO", save_to_file=True, save_plots=True),
     )
@@ -2604,11 +2795,17 @@ def _ippo_train_worker(args: tuple) -> tuple[List[dict], List[dict], List[dict],
 def run_ippo_cli(argv: List[str] | None = None) -> None:
     global log
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Szybki smoke test IPPO")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--quick", action="store_true", help="Szybki smoke test IPPO")
+    mode_group.add_argument("--medium", action="store_true", help="Pośredni preset IPPO do szybkiego testu kierunku uczenia.")
     parser.add_argument("--episodes", type=int, help="Override liczby epizodów.")
     parser.add_argument("--steps", type=int, help="Override liczby kroków w epizodzie.")
     parser.add_argument("--seeds", type=int, help="Override liczby seedów.")
     parser.add_argument("--agents", type=int, help="Override liczby agentów.")
+    parser.add_argument("--max-position", type=int, help="Override maksymalnej pozycji |position| per agent.")
+    parser.add_argument("--gamma-spread", action="store_true", help="Włącz dodatkową heterogeniczność gamma obok sigma_i.")
+    parser.add_argument("--fixed-gamma", type=float, help="Ustaw wspólną gammę wszystkich agentów, np. 0.90.")
+    parser.add_argument("--transaction-cost", type=float, help="Koszt transakcyjny odejmowany od każdego wykonanego filla.")
     parser.add_argument("--zi-episodes", type=int, help="Override liczby epizodów ZI baseline.")
     parser.add_argument("--eval-episodes", type=int, help="Override liczby epizodów eval.")
     parser.add_argument("--workers", type=int, help="Liczba równoległych procesów dla niezależnych zadań (D, seed).")
@@ -2622,7 +2819,7 @@ def run_ippo_cli(argv: List[str] | None = None) -> None:
     parser.add_argument("--run-dir", type=str, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    settings = build_ippo_run_settings(args.quick, args)
+    settings = build_ippo_run_settings(resolve_cli_benchmark_mode(args), args)
     cfg = make_ippo_cfg(settings)
     cfg.exp.n_eval_episodes = settings["eval_episodes"]
     cfg.exp.diversity_scores = list(settings["diversity_scores"])
@@ -2641,23 +2838,33 @@ def run_ippo_cli(argv: List[str] | None = None) -> None:
         plot_learning_curves=plot_ippo_learning_curves,
         log_final_summary=log_ippo_final_summary,
         algorithm_label="IPPO",
-        artifact_stem="ippo_quick" if args.quick else "ippo",
+        artifact_stem="ippo",
     )
 
-def build_signal_rule_cli_settings(quick: bool, args) -> dict:
-    settings = build_signal_rule_benchmark_settings(quick=quick, default_workers=cpu_count())
+def build_signal_rule_cli_settings(mode: str, args) -> dict:
+    settings = build_signal_rule_benchmark_settings(
+        mode=mode,
+        default_workers=cpu_count(),
+        use_gamma_spread=resolve_cli_use_gamma_spread(args),
+        fixed_gamma=resolve_cli_fixed_gamma(args),
+    )
     if args.steps is not None:
         settings["episode_steps"] = args.steps
     if args.seeds is not None:
         settings["n_seeds"] = args.seeds
     if args.agents is not None:
         settings["n_agents"] = args.agents
+    if args.max_position is not None:
+        settings["max_position"] = args.max_position
+    if args.transaction_cost is not None:
+        settings["transaction_cost_per_fill"] = max(0.0, float(args.transaction_cost))
     if args.zi_episodes is not None:
         settings["zi_episodes"] = args.zi_episodes
     if args.eval_episodes is not None:
         settings["eval_episodes"] = args.eval_episodes
     if args.workers is not None:
         settings["n_workers"] = args.workers
+    settings["max_position"] = max(1, int(settings["max_position"]))
     max_workers = settings["n_seeds"] * len(settings["diversity_scores"])
     settings["n_workers"] = max(1, min(settings["n_workers"], max_workers))
     return settings
@@ -2667,8 +2874,11 @@ def make_signal_rule_cfg(settings: dict) -> HTMConfig:
         env=EnvConfig(
             n_agents=settings["n_agents"],
             episode_steps=settings["episode_steps"],
+            max_position=settings["max_position"],
+            transaction_cost_per_fill=settings["transaction_cost_per_fill"],
         ),
         market=settings["market"],
+        diversity=settings["diversity_cfg"],
         log=LogConfig(level="INFO", save_to_file=True, save_plots=False),
     )
 
@@ -2753,10 +2963,16 @@ def _signal_rule_worker(task: tuple) -> tuple:
 
 def parse_signal_rule_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Uruchom benchmark SignalRule w trybie quick.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--quick", action="store_true", help="Uruchom benchmark SignalRule w trybie quick.")
+    mode_group.add_argument("--medium", action="store_true", help="Uruchom benchmark SignalRule w trybie pośrednim.")
     parser.add_argument("--steps", type=int, help="Override liczby kroków w epizodzie.")
     parser.add_argument("--seeds", type=int, help="Override liczby seedów.")
     parser.add_argument("--agents", type=int, help="Override liczby agentów.")
+    parser.add_argument("--max-position", type=int, help="Override maksymalnej pozycji |position| per agent.")
+    parser.add_argument("--gamma-spread", action="store_true", help="Włącz dodatkową heterogeniczność gamma obok sigma_i.")
+    parser.add_argument("--fixed-gamma", type=float, help="Ustaw wspólną gammę wszystkich agentów, np. 0.90.")
+    parser.add_argument("--transaction-cost", type=float, help="Koszt transakcyjny odejmowany od każdego wykonanego filla.")
     parser.add_argument("--zi-episodes", type=int, help="Override liczby epizodów ZI baseline.")
     parser.add_argument("--eval-episodes", type=int, help="Override liczby epizodów eval.")
     parser.add_argument("--workers", type=int, help="Override workerów dla benchmarku.")
@@ -2769,7 +2985,7 @@ def parse_signal_rule_args(argv: Optional[List[str]] = None) -> argparse.Namespa
 def run_signal_rule_cli(argv: Optional[List[str]] = None) -> None:
     global log
     args = parse_signal_rule_args(argv)
-    settings = build_signal_rule_cli_settings(args.quick, args)
+    settings = build_signal_rule_cli_settings(resolve_cli_benchmark_mode(args), args)
     cfg = make_signal_rule_cfg(settings)
     artifacts = init_run_artifacts(args.run_tag, args.run_id, args.run_dir)
     log = configure_experiment_logger(artifacts, "signal_rule.log")
@@ -2788,7 +3004,9 @@ def run_signal_rule_cli(argv: Optional[List[str]] = None) -> None:
         f"SignalRule | {settings['run_name']} | N={cfg.env.n_agents} | "
         f"D={settings['diversity_scores']} | steps={cfg.env.episode_steps} | "
         f"seeds={settings['n_seeds']} | workers={settings['n_workers']} | "
-        f"eval_ep={settings['eval_episodes']} | thr={settings['rule_threshold']:.3f}"
+        f"hetero={settings['diversity_mode']} | eval_ep={settings['eval_episodes']} | thr={settings['rule_threshold']:.3f} | "
+        f"max_pos={cfg.env.max_position}{fixed_gamma_log_fragment(cfg)} | "
+        f"tx_cost={cfg.env.transaction_cost_per_fill:.5f}"
     )
     log.info("=" * 70)
 

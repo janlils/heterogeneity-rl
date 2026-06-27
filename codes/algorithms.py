@@ -95,6 +95,8 @@ def build_episode_record(
         "trade_accuracy": metrics.get("trade_accuracy", 0.0),
         "mean_pnl": metrics.get("mean_pnl", 0.0),
         "mean_total_pnl": metrics.get("mean_total_pnl", 0.0),
+        "mean_total_pnl_gross": metrics.get("mean_total_pnl_gross", metrics.get("mean_total_pnl", 0.0)),
+        "mean_transaction_cost": metrics.get("mean_transaction_cost", 0.0),
         "mean_terminal_pnl": metrics.get("mean_terminal_pnl", 0.0),
         "positive_pnl_frac": metrics.get("positive_pnl_frac", 0.0),
         "terminal_positive_frac": metrics.get("terminal_positive_frac", 0.0),
@@ -112,6 +114,7 @@ def build_episode_record(
         "action_hold_frac": metrics.get("action_hold_frac", 0.0),
         "gini": metrics.get("gini_pnl", metrics.get("gini", 0.0)),
         "primary_metric": "trade_accuracy",
+        "transaction_cost_per_fill": cfg.env.transaction_cost_per_fill,
     }
     if extra:
         record.update(extra)
@@ -143,13 +146,19 @@ def build_agent_sample_row(
     position: int,
     entry_price_after: float,
     reward_this_step: float,
+    gross_realized_pnl_this_step: float,
     realized_pnl_this_step: float,
+    transaction_cost_this_step: float,
+    gross_realized_pnl_cum: float,
     realized_pnl_cum: float,
+    transaction_cost_cum: float,
     n_trades_closed: int,
     sigma_i: float,
 ) -> dict:
     reward_this_step = float(reward_this_step)
+    gross_realized_pnl_this_step = float(gross_realized_pnl_this_step)
     realized_pnl_this_step = float(realized_pnl_this_step)
+    transaction_cost_this_step = float(transaction_cost_this_step)
     return {
         "algorithm": algorithm,
         "phase": phase,
@@ -179,9 +188,13 @@ def build_agent_sample_row(
         "position": int(position),
         "entry_price_after": float(entry_price_after),
         "reward_this_step": reward_this_step,
+        "gross_realized_pnl_this_step": gross_realized_pnl_this_step,
         "realized_pnl_this_step": realized_pnl_this_step,
+        "transaction_cost_this_step": transaction_cost_this_step,
         "mtm_this_step": reward_this_step - realized_pnl_this_step,
+        "gross_realized_pnl_cum": float(gross_realized_pnl_cum),
         "realized_pnl_cum": float(realized_pnl_cum),
+        "transaction_cost_cum": float(transaction_cost_cum),
         "n_trades_closed": int(n_trades_closed),
         "sigma_i": float(sigma_i),
     }
@@ -215,7 +228,9 @@ def build_env_step_row(
     n_hold: int,
     net_flow: int,
     mean_reward: float,
+    mean_gross_realized_pnl: float,
     mean_realized_pnl: float,
+    mean_transaction_cost: float,
     mean_mtm: float,
     n_executed: int,
     n_trades_closed_cum: int,
@@ -247,7 +262,9 @@ def build_env_step_row(
         "n_hold": int(n_hold),
         "net_flow": int(net_flow),
         "mean_reward": float(mean_reward),
+        "mean_gross_realized_pnl": float(mean_gross_realized_pnl),
         "mean_realized_pnl": float(mean_realized_pnl),
+        "mean_transaction_cost": float(mean_transaction_cost),
         "mean_mtm": float(mean_mtm),
         "n_executed": int(n_executed),
         "n_trades_closed_cum": int(n_trades_closed_cum),
@@ -724,7 +741,6 @@ class DeepSARSAMultiAgent:
             if aid in self.agents:
                 self.agents[aid].load_state_dict(sd)
         logger.info(f"Loaded <- {path}")
-
 
 class SignalRulePolicy:
     """

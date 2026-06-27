@@ -33,6 +33,36 @@ Szybki smoke test:
 ./venv/bin/python -m codes.train_all --quick --run-tag quick_all
 ```
 
+Tryb pośredni do testów rewardu i kierunku uczenia:
+
+```bash
+./venv/bin/python -m codes.train_all --medium --run-tag medium_all
+```
+
+To samo z minimalnym kosztem transakcyjnym na fill:
+
+```bash
+./venv/bin/python -m codes.train_all --medium --transaction-cost 0.0001 --run-tag medium_cost
+```
+
+Opcjonalnie mozna wlaczyc dodatkowy spread `gamma`:
+
+```bash
+./venv/bin/python -m codes.train_all --medium --gamma-spread --run-tag medium_gamma
+```
+
+Opcjonalnie mozna wymusic wspolna gamme dla wszystkich agentow:
+
+```bash
+./venv/bin/python -m codes.train_all --medium --fixed-gamma 0.90 --run-tag medium_fixed_gamma
+```
+
+Opcjonalnie mozna tez zwiekszyc limit pozycji:
+
+```bash
+./venv/bin/python -m codes.train_all --medium --max-position 2 --run-tag medium_maxpos2
+```
+
 Pojedynczy algorytm:
 
 ```bash
@@ -46,6 +76,8 @@ Przydatne override'y:
 
 ```bash
 ./venv/bin/python -m codes.train_all --run-tag custom --seeds 5 --episodes 200 --steps 300 --workers 8
+./venv/bin/python -m codes.train_all --run-tag custom_pos2 --max-position 2
+./venv/bin/python -m codes.train_all --run-tag custom_gamma --fixed-gamma 0.90
 ./venv/bin/python -m codes.main train --algo ppo --agent-id-features --run-tag ppo_agent_id
 ./venv/bin/python -m codes.main train --algo sarsa --eval-new-population --run-tag sarsa_eval_new_pop
 ```
@@ -70,6 +102,15 @@ Tryb `quick`:
 - `ZI baseline = 5`
 - `eval episodes = 10`
 
+Tryb `medium`:
+- `D = [0.0, 0.5, 1.0]`
+- `N = 50`
+- `episodes = 100`
+- `steps = 250`
+- `seeds = 2`
+- `ZI baseline = 10`
+- `eval episodes = 10`
+
 Uwaga:
 - `PPO` ma opcjonalny przełącznik `--agent-id-features`
 - `SignalRule` nie ma treningu, zapisuje tylko wyniki eval
@@ -90,6 +131,15 @@ signal_i = clip((V_t - P_t + noise_i) / signal_scale, -1, 1)
 Heterogenicznosc jest budowana przez:
 - `sigma_i` — jak bardzo zaszumiony jest prywatny sygnal
 - `gamma` — horyzont czasowy agenta
+
+Domyslny benchmark:
+- uzywa `sigma-only`, czyli `sigma_i` jest zroznicowane, ale `gamma` jest stale
+- to daje uczciwsze porownanie z `SignalRule`, ktory i tak nie uzywa `gamma`
+
+Tryb opcjonalny:
+- `--gamma-spread` wlacza wariant `sigma+gamma`
+- `--fixed-gamma 0.90` ustawia wspolna gamme dla wszystkich agentow
+- jesli podasz jednoczesnie `--gamma-spread` i `--fixed-gamma`, to `fixed-gamma` nadpisuje spread gamma
 
 ## Obserwacja i akcje
 
@@ -112,6 +162,11 @@ Przy `max_position = 1`:
 - `BUY` zwieksza pozycje o `+1`
 - `SELL` zmniejsza pozycje o `-1`
 
+Przy `max_position > 1`:
+- `BUY` i `SELL` nadal zmieniaja pozycje tylko o `1` na krok
+- obserwacja dalej uzywa `pos_norm = position / max_position`, wiec maski akcji skaluja sie poprawnie
+- domyslny benchmark zostaje na `max_position = 1`; wyzsze wartosci sa trybem eksperymentalnym
+
 ## Reward i PnL
 
 Reward kroku w srodowisku:
@@ -127,6 +182,8 @@ Czyli reward laczy:
 W logach epizodowych:
 - `trade_accuracy` mierzy udzial zyskownych zamknietych transakcji
 - `mean_total_pnl` oznacza sredni koncowy PnL per agent w epizodzie
+- `mean_total_pnl_gross` oznacza ten sam PnL przed odjeciem kosztow transakcyjnych
+- `mean_transaction_cost` oznacza sredni laczny koszt transakcyjny per agent
 
 ## Wyniki
 

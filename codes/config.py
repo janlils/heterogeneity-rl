@@ -45,6 +45,7 @@ class EnvConfig:
     market_impact:          float = 0.0
     temp_impact:            float = 0.000
     perm_impact:            float = 0.0
+    transaction_cost_per_fill: float = 0.0
     mtm_weight:             float = 0.3
     p_min:                  float = 0.05
     p_max:                  float = 0.95
@@ -161,15 +162,43 @@ class DiversityConfig:
     """
     gamma_spread:        bool = True   # horyzonty czasowe
     sigma_spread:        bool = True   # poziom szumu prywatnego sygnału
+    fixed_gamma:         float | None = None
 
     @classmethod
-    def sentiment_only(cls) -> "DiversityConfig":
+    def sentiment_only(cls, fixed_gamma: float | None = None) -> "DiversityConfig":
         """Kompatybilnosc wsteczna: tylko rozrzut sigma_i bez spreadu gamma."""
-        return cls(gamma_spread=False, sigma_spread=True)
+        return cls(
+            gamma_spread=False,
+            sigma_spread=True,
+            fixed_gamma=normalize_fixed_gamma(fixed_gamma),
+        )
 
     @classmethod
-    def full(cls) -> "DiversityConfig":
-        return cls()
+    def full(cls, fixed_gamma: float | None = None) -> "DiversityConfig":
+        return cls(fixed_gamma=normalize_fixed_gamma(fixed_gamma))
+
+
+def normalize_fixed_gamma(fixed_gamma: float | None) -> float | None:
+    if fixed_gamma is None:
+        return None
+    return max(0.80, min(0.99, float(fixed_gamma)))
+
+
+def build_diversity_config(use_gamma_spread: bool, fixed_gamma: float | None = None) -> DiversityConfig:
+    normalized_gamma = normalize_fixed_gamma(fixed_gamma)
+    return (
+        DiversityConfig.full(normalized_gamma)
+        if use_gamma_spread
+        else DiversityConfig.sentiment_only(normalized_gamma)
+    )
+
+
+def diversity_mode_name(diversity_cfg: DiversityConfig) -> str:
+    if diversity_cfg.fixed_gamma is not None:
+        return "sigma-only" if diversity_cfg.sigma_spread else "homogeneous"
+    if diversity_cfg.gamma_spread:
+        return "sigma+gamma"
+    return "sigma-only"
 
 
 # ---------------------------------------------------------------------------
@@ -287,17 +316,26 @@ class HTMConfig:
     env:       EnvConfig       = field(default_factory=EnvConfig)
     market:    MarketDynamics  = field(default_factory=MarketDynamics.stable)
     sentiment: SentimentConfig = field(default_factory=SentimentConfig)
-    diversity: DiversityConfig = field(default_factory=DiversityConfig)
+    diversity: DiversityConfig = field(default_factory=DiversityConfig.sentiment_only)
     sarsa:     DeepSARSAConfig = field(default_factory=DeepSARSAConfig)
     ppo:       PPOConfig       = field(default_factory=PPOConfig)
     log:       LogConfig       = field(default_factory=LogConfig)
     exp:       ExpConfig       = field(default_factory=ExpConfig)
 
     def summary(self) -> str:
+        gamma_part = (
+            f"fixed_gamma={self.diversity.fixed_gamma:.2f} | "
+            if self.diversity.fixed_gamma is not None
+            else ""
+        )
         return (
             f"HTM-Speculative | N={self.env.n_agents} | "
             f"actions={self.env.n_actions} | "
             f"episode_steps={self.env.episode_steps} | "
+            f"max_pos={self.env.max_position} | "
+            f"hetero={diversity_mode_name(self.diversity)} | "
+            f"{gamma_part}"
+            f"tx_cost={self.env.transaction_cost_per_fill:.5f} | "
             f"market=v2(alpha={self.market.alpha:.3f}, beta={self.market.beta:.3f}, "
             f"crisis_prob={self.market.crisis_prob:.3f})"
         )
@@ -306,22 +344,45 @@ class HTMConfig:
 DEFAULT_DIVERSITY_SCORES = [0.0, 0.5, 1.0]
 DEFAULT_QUICK_DIVERSITY_SCORES = [0.0, 0.5, 1.0]
 DEFAULT_N_AGENTS = 50
+DEFAULT_MAX_POSITION = 1
 DEFAULT_N_EPISODES = 500
 DEFAULT_N_SEEDS = 5
 DEFAULT_EPISODE_STEPS = 500
 DEFAULT_ZI_EPISODES = 30
 DEFAULT_EVAL_EPISODES = 30
+MEDIUM_N_EPISODES = 100
+MEDIUM_N_SEEDS = 2
+MEDIUM_EPISODE_STEPS = 250
+MEDIUM_ZI_EPISODES = 10
+MEDIUM_EVAL_EPISODES = 10
 DEFAULT_LOG_EVERY = 25
 DEFAULT_ROLLING_WINDOW = 30
 DEFAULT_MARKET = MarketDynamics.stable()
 
+def normalize_benchmark_mode(mode: str) -> str:
+    normalized = (mode or "full").strip().lower()
+    if normalized not in {"quick", "medium", "full"}:
+        raise ValueError(f"Nieznany tryb benchmarku: {mode}")
+    return normalized
 
-def build_sarsa_benchmark_settings(quick: bool, default_workers: int) -> dict:
-    if quick:
+
+def build_sarsa_benchmark_settings(
+    mode: str,
+    default_workers: int,
+    use_gamma_spread: bool = False,
+    fixed_gamma: float | None = None,
+) -> dict:
+    mode = normalize_benchmark_mode(mode)
+    diversity_cfg = build_diversity_config(use_gamma_spread, fixed_gamma=fixed_gamma)
+    diversity_mode = diversity_mode_name(diversity_cfg)
+    if mode == "quick":
         return {
             "run_name": "quick",
             "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
             "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
             "n_episodes": 20,
             "episode_steps": 150,
             "n_seeds": 1,
@@ -330,6 +391,7 @@ def build_sarsa_benchmark_settings(quick: bool, default_workers: int) -> dict:
             "log_every": 10,
             "rolling_window": 5,
             "n_workers": 4,
+            "transaction_cost_per_fill": 0.0,
             "market": DEFAULT_MARKET,
             "sarsa_cfg": DeepSARSAConfig(
                 hidden_size=32,
@@ -343,10 +405,43 @@ def build_sarsa_benchmark_settings(quick: bool, default_workers: int) -> dict:
             ),
         }
 
+    if mode == "medium":
+        return {
+            "run_name": "medium",
+            "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
+            "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
+            "n_episodes": MEDIUM_N_EPISODES,
+            "episode_steps": MEDIUM_EPISODE_STEPS,
+            "n_seeds": MEDIUM_N_SEEDS,
+            "zi_episodes": MEDIUM_ZI_EPISODES,
+            "eval_episodes": MEDIUM_EVAL_EPISODES,
+            "log_every": 10,
+            "rolling_window": 10,
+            "n_workers": default_workers,
+            "transaction_cost_per_fill": 0.0,
+            "market": DEFAULT_MARKET,
+            "sarsa_cfg": DeepSARSAConfig(
+                hidden_size=64,
+                lr=1e-3,
+                epsilon_start=0.35,
+                epsilon_end=0.05,
+                epsilon_decay=0.993,
+                grad_clip=1.0,
+                n_step=6,
+                reward_scale=30.0,
+            ),
+        }
+
     return {
         "run_name": "full",
         "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "diversity_cfg": diversity_cfg,
+        "diversity_mode": diversity_mode,
         "n_agents": DEFAULT_N_AGENTS,
+        "max_position": DEFAULT_MAX_POSITION,
         "n_episodes": DEFAULT_N_EPISODES,
         "episode_steps": DEFAULT_EPISODE_STEPS,
         "n_seeds": DEFAULT_N_SEEDS,
@@ -355,6 +450,7 @@ def build_sarsa_benchmark_settings(quick: bool, default_workers: int) -> dict:
         "log_every": DEFAULT_LOG_EVERY,
         "rolling_window": DEFAULT_ROLLING_WINDOW,
         "n_workers": default_workers,
+        "transaction_cost_per_fill": 0.0,
         "market": DEFAULT_MARKET,
         "sarsa_cfg": DeepSARSAConfig(
             hidden_size=64,
@@ -370,15 +466,23 @@ def build_sarsa_benchmark_settings(quick: bool, default_workers: int) -> dict:
 
 
 def build_ppo_benchmark_settings(
-    quick: bool,
+    mode: str,
     use_agent_id_features: bool,
     default_workers: int,
+    use_gamma_spread: bool = False,
+    fixed_gamma: float | None = None,
 ) -> dict:
-    if quick:
+    mode = normalize_benchmark_mode(mode)
+    diversity_cfg = build_diversity_config(use_gamma_spread, fixed_gamma=fixed_gamma)
+    diversity_mode = diversity_mode_name(diversity_cfg)
+    if mode == "quick":
         return {
             "run_name": "quick",
             "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
             "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
             "n_episodes": 20,
             "episode_steps": 150,
             "n_seeds": 1,
@@ -387,6 +491,7 @@ def build_ppo_benchmark_settings(
             "log_every": 1,
             "rolling_window": 2,
             "n_workers": 1,
+            "transaction_cost_per_fill": 0.0,
             "market": DEFAULT_MARKET,
             "ppo_cfg": PPOConfig(
                 hidden_size=32,
@@ -397,10 +502,34 @@ def build_ppo_benchmark_settings(
             ),
         }
 
+    if mode == "medium":
+        return {
+            "run_name": "medium",
+            "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
+            "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
+            "n_episodes": MEDIUM_N_EPISODES,
+            "episode_steps": MEDIUM_EPISODE_STEPS,
+            "n_seeds": MEDIUM_N_SEEDS,
+            "zi_episodes": MEDIUM_ZI_EPISODES,
+            "eval_episodes": MEDIUM_EVAL_EPISODES,
+            "log_every": 10,
+            "rolling_window": 10,
+            "n_workers": default_workers,
+            "transaction_cost_per_fill": 0.0,
+            "market": DEFAULT_MARKET,
+            "ppo_cfg": PPOConfig(use_agent_id_features=use_agent_id_features),
+        }
+
     return {
         "run_name": "full",
         "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "diversity_cfg": diversity_cfg,
+        "diversity_mode": diversity_mode,
         "n_agents": DEFAULT_N_AGENTS,
+        "max_position": DEFAULT_MAX_POSITION,
         "n_episodes": DEFAULT_N_EPISODES,
         "episode_steps": DEFAULT_EPISODE_STEPS,
         "n_seeds": DEFAULT_N_SEEDS,
@@ -409,17 +538,29 @@ def build_ppo_benchmark_settings(
         "log_every": DEFAULT_LOG_EVERY,
         "rolling_window": DEFAULT_ROLLING_WINDOW,
         "n_workers": default_workers,
+        "transaction_cost_per_fill": 0.0,
         "market": DEFAULT_MARKET,
         "ppo_cfg": PPOConfig(use_agent_id_features=use_agent_id_features),
     }
 
 
-def build_ippo_benchmark_settings(quick: bool, default_workers: int) -> dict:
-    if quick:
+def build_ippo_benchmark_settings(
+    mode: str,
+    default_workers: int,
+    use_gamma_spread: bool = False,
+    fixed_gamma: float | None = None,
+) -> dict:
+    mode = normalize_benchmark_mode(mode)
+    diversity_cfg = build_diversity_config(use_gamma_spread, fixed_gamma=fixed_gamma)
+    diversity_mode = diversity_mode_name(diversity_cfg)
+    if mode == "quick":
         return {
             "run_name": "quick",
             "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
             "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
             "n_episodes": 20,
             "episode_steps": 150,
             "n_seeds": 1,
@@ -428,6 +569,7 @@ def build_ippo_benchmark_settings(quick: bool, default_workers: int) -> dict:
             "log_every": 1,
             "rolling_window": 2,
             "n_workers": 1,
+            "transaction_cost_per_fill": 0.0,
             "market": DEFAULT_MARKET,
             "ppo_cfg": PPOConfig(
                 hidden_size=32,
@@ -438,10 +580,40 @@ def build_ippo_benchmark_settings(quick: bool, default_workers: int) -> dict:
             ),
         }
 
+    if mode == "medium":
+        return {
+            "run_name": "medium",
+            "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
+            "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
+            "n_episodes": MEDIUM_N_EPISODES,
+            "episode_steps": MEDIUM_EPISODE_STEPS,
+            "n_seeds": MEDIUM_N_SEEDS,
+            "zi_episodes": MEDIUM_ZI_EPISODES,
+            "eval_episodes": MEDIUM_EVAL_EPISODES,
+            "log_every": 10,
+            "rolling_window": 10,
+            "n_workers": default_workers,
+            "transaction_cost_per_fill": 0.0,
+            "market": DEFAULT_MARKET,
+            "ppo_cfg": PPOConfig(
+                hidden_size=48,
+                update_epochs=4,
+                minibatch_size=256,
+                rollout_episodes=5,
+                use_agent_id_features=False,
+            ),
+        }
+
     return {
         "run_name": "full",
         "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "diversity_cfg": diversity_cfg,
+        "diversity_mode": diversity_mode,
         "n_agents": DEFAULT_N_AGENTS,
+        "max_position": DEFAULT_MAX_POSITION,
         "n_episodes": DEFAULT_N_EPISODES,
         "episode_steps": DEFAULT_EPISODE_STEPS,
         "n_seeds": DEFAULT_N_SEEDS,
@@ -450,6 +622,7 @@ def build_ippo_benchmark_settings(quick: bool, default_workers: int) -> dict:
         "log_every": DEFAULT_LOG_EVERY,
         "rolling_window": DEFAULT_ROLLING_WINDOW,
         "n_workers": default_workers,
+        "transaction_cost_per_fill": 0.0,
         "market": DEFAULT_MARKET,
         "ppo_cfg": PPOConfig(
             hidden_size=48,
@@ -461,12 +634,23 @@ def build_ippo_benchmark_settings(quick: bool, default_workers: int) -> dict:
     }
 
 
-def build_signal_rule_benchmark_settings(quick: bool, default_workers: int) -> dict:
-    if quick:
+def build_signal_rule_benchmark_settings(
+    mode: str,
+    default_workers: int,
+    use_gamma_spread: bool = False,
+    fixed_gamma: float | None = None,
+) -> dict:
+    mode = normalize_benchmark_mode(mode)
+    diversity_cfg = build_diversity_config(use_gamma_spread, fixed_gamma=fixed_gamma)
+    diversity_mode = diversity_mode_name(diversity_cfg)
+    if mode == "quick":
         return {
             "run_name": "quick",
             "diversity_scores": DEFAULT_QUICK_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
             "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
             "n_episodes": 0,
             "episode_steps": 150,
             "n_seeds": 1,
@@ -475,6 +659,28 @@ def build_signal_rule_benchmark_settings(quick: bool, default_workers: int) -> d
             "log_every": 1,
             "rolling_window": 1,
             "n_workers": 1,
+            "transaction_cost_per_fill": 0.0,
+            "market": DEFAULT_MARKET,
+            "rule_threshold": 0.0,
+        }
+
+    if mode == "medium":
+        return {
+            "run_name": "medium",
+            "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+            "diversity_cfg": diversity_cfg,
+            "diversity_mode": diversity_mode,
+            "n_agents": DEFAULT_N_AGENTS,
+            "max_position": DEFAULT_MAX_POSITION,
+            "n_episodes": 0,
+            "episode_steps": MEDIUM_EPISODE_STEPS,
+            "n_seeds": MEDIUM_N_SEEDS,
+            "zi_episodes": MEDIUM_ZI_EPISODES,
+            "eval_episodes": MEDIUM_EVAL_EPISODES,
+            "log_every": 1,
+            "rolling_window": 1,
+            "n_workers": default_workers,
+            "transaction_cost_per_fill": 0.0,
             "market": DEFAULT_MARKET,
             "rule_threshold": 0.0,
         }
@@ -482,7 +688,10 @@ def build_signal_rule_benchmark_settings(quick: bool, default_workers: int) -> d
     return {
         "run_name": "full",
         "diversity_scores": DEFAULT_DIVERSITY_SCORES,
+        "diversity_cfg": diversity_cfg,
+        "diversity_mode": diversity_mode,
         "n_agents": DEFAULT_N_AGENTS,
+        "max_position": DEFAULT_MAX_POSITION,
         "n_episodes": 0,
         "episode_steps": DEFAULT_EPISODE_STEPS,
         "n_seeds": DEFAULT_N_SEEDS,
@@ -491,6 +700,7 @@ def build_signal_rule_benchmark_settings(quick: bool, default_workers: int) -> d
         "log_every": 1,
         "rolling_window": 1,
         "n_workers": default_workers,
+        "transaction_cost_per_fill": 0.0,
         "market": DEFAULT_MARKET,
         "rule_threshold": 0.0,
     }
